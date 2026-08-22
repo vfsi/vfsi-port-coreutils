@@ -17,12 +17,11 @@ use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::cell::RefCell;
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::{
     cell::OnceCell,
     cmp::Reverse,
     ffi::{OsStr, OsString},
-    fs::{self, DirEntry, FileType, Metadata, ReadDir},
+    fs::{self, DirEntry, FileType, Metadata},
     io::{BufWriter, ErrorKind, Stdout, Write, stdout},
     ops::RangeInclusive,
     path::{Path, PathBuf},
@@ -37,7 +36,6 @@ use uucore::{
     error::{UError, UResult, set_exit_code, strip_errno},
     format_usage,
     fs::FileInformation,
-    fsext::metadata_get_time,
     os_str_as_bytes_lossy,
     parser::shortcut_value_parser::ShortcutValueParser,
     show, translate,
@@ -48,17 +46,22 @@ mod colors;
 mod config;
 mod dired;
 mod display;
+mod meta;
 
 pub mod output;
 pub use config::{Config, options};
 pub use display::Format;
 pub use output::{EntryInfo, LsOutput, StreamMode, StreamingOutput};
 
+#[cfg(feature = "vnfs")]
+mod nfs;
+
 use colors::StyleManager;
 use config::options::QUOTING_STYLE;
 use config::{Dereference, Files, Sort};
 use dired::DiredOutput;
 use display::{display_items, display_size, should_display, show_dir_name};
+use meta::{LsDirEntry, LsFileType, LsMeta, LsReadDir};
 
 #[derive(Error, Debug)]
 enum LsError {
@@ -803,8 +806,8 @@ enum PathDataDisplayName<'a> {
 /// to [`EntryInfo`] for programmatic access via the [`LsOutput`] trait.
 pub struct PathData<'a> {
     // Result<MetaData> got from symlink_metadata() or metadata() based on config
-    md: OnceCell<Option<Metadata>>,
-    ft: OnceCell<Option<FileType>>,
+    md: OnceCell<Option<LsMeta>>,
+    ft: OnceCell<Option<LsFileType>>,
     // can be used to avoid reading the filetype. Can be also called d_type:
     // https://www.gnu.org/software/libc/manual/html_node/Directory-Entries.html
     de: RefCell<Option<DirEntry>>,
@@ -869,18 +872,18 @@ impl<'a> PathData<'a> {
 
         // Why prefer to check the DirEntry file_type()?  B/c the call is
         // nearly free compared to a metadata() call on a Path
-        let ft: OnceCell<Option<FileType>> = OnceCell::new();
-        let md: OnceCell<Option<Metadata>> = OnceCell::new();
+        let ft: OnceCell<Option<LsFileType>> = OnceCell::new();
+        let md: OnceCell<Option<LsMeta>> = OnceCell::new();
         let security_context: OnceCell<Box<str>> = OnceCell::new();
 
         let de: RefCell<Option<DirEntry>> = if let Some(de) = dir_entry {
             if must_dereference && let Ok(md_pb) = p_buf.metadata() {
-                ft.get_or_init(|| Some(md_pb.file_type()));
-                md.get_or_init(|| Some(md_pb));
+                ft.get_or_init(|| Some(LsFileType::from_std(&md_pb.file_type())));
+                md.get_or_init(|| Some(LsMeta::Std(md_pb)));
             }
 
             if let Ok(ft_de) = de.file_type() {
-                ft.get_or_init(|| Some(ft_de));
+                ft.get_or_init(|| Some(LsFileType::from_std(&ft_de)));
             }
 
             RefCell::new(Some(de))
@@ -901,13 +904,40 @@ impl<'a> PathData<'a> {
         }
     }
 
-    fn metadata(&self) -> Option<&Metadata> {
+    /// Construct a `PathData` for a directory entry sourced from the
+    /// vectorized backend. When dereferencing is requested the metadata is
+    /// left to be resolved from the local filesystem instead.
+    #[cfg(feature = "vnfs")]
+    fn from_vf(path: PathBuf, name: OsString, attrs: vnfs::VfAttrs, config: &Config) -> Self {
+        let ftype = attrs.ftype;
+        let must_dereference = matches!(&config.dereference, Dereference::All);
+        let md = OnceCell::new();
+        let ft = OnceCell::new();
+        let security_context = OnceCell::new();
+        if !must_dereference {
+            let _ = md.set(Some(LsMeta::Vf(attrs)));
+            let _ = ft.set(Some(LsFileType::from_ftype(ftype)));
+        }
+        Self {
+            md,
+            ft,
+            de: RefCell::new(None),
+            security_context,
+            display_name: PathDataDisplayName::Custom(Cow::Owned(name)),
+            p_buf: Cow::Owned(path),
+            must_dereference,
+            command_line: false,
+            is_dot_dir: false,
+        }
+    }
+
+    fn metadata(&self) -> Option<&LsMeta> {
         self.md
             .get_or_init(|| {
                 if !self.must_dereference
                     && let Some(dir_entry) = RefCell::take(&self.de)
                 {
-                    return dir_entry.metadata().ok();
+                    return dir_entry.metadata().ok().map(LsMeta::Std);
                 }
 
                 match get_metadata_with_deref_opt(self.path(), self.must_dereference) {
@@ -924,7 +954,7 @@ impl<'a> PathData<'a> {
                             && errno == 9i32
                             && let Ok(file) = self.path().read_link()
                         {
-                            return file.symlink_metadata().ok();
+                            return file.symlink_metadata().ok().map(LsMeta::Std);
                         }
                         show!(LsError::IOErrorContext(
                             self.path().to_path_buf(),
@@ -939,9 +969,9 @@ impl<'a> PathData<'a> {
             .as_ref()
     }
 
-    fn file_type(&self) -> Option<&FileType> {
+    fn file_type(&self) -> Option<&LsFileType> {
         self.ft
-            .get_or_init(|| self.metadata().map(Metadata::file_type))
+            .get_or_init(|| self.metadata().map(LsMeta::file_type))
             .as_ref()
     }
 
@@ -952,7 +982,7 @@ impl<'a> PathData<'a> {
 
     #[cfg(unix)]
     fn is_executable_file(&self) -> bool {
-        self.file_type().is_some_and(FileType::is_file)
+        self.file_type().is_some_and(LsFileType::is_file)
             && self.metadata().is_some_and(file_is_executable)
     }
 
@@ -987,10 +1017,13 @@ impl Colorable for PathData<'_> {
         self.display_name().to_os_string()
     }
     fn file_type(&self) -> Option<FileType> {
-        self.file_type().copied()
+        // The vectorized backend cannot reconstruct a `std::fs::FileType`;
+        // coloring is only available for locally-statted entries.
+        self.metadata()
+            .and_then(|m| m.as_std_metadata().map(|md| md.file_type()))
     }
     fn metadata(&self) -> Option<Metadata> {
-        self.metadata().cloned()
+        self.metadata().and_then(|m| m.as_std_metadata().cloned())
     }
     fn path(&self) -> PathBuf {
         self.path().to_path_buf()
@@ -1214,9 +1247,16 @@ pub fn list_with_output<O: LsOutput>(
     let mut entries = Vec::<PathData>::with_capacity(2);
 
     for (pos, path_data) in dirs.iter().enumerate() {
+        // Vectorized recursive fast path: walk the whole subtree in few large
+        // compounds and render it in ls -R order.
+        #[cfg(feature = "vnfs")]
+        if config.recursive && list_recursive_vf(&path_data, config, output, pos, files.is_empty())?
+        {
+            continue;
+        }
         // Do read_dir call here to match GNU semantics by printing
         // read_dir errors before directory headings, names and totals
-        let read_dir = match fs::read_dir(path_data.path()) {
+        let read_dir = match open_dir(path_data.path()) {
             Err(err) => {
                 // flush stdout buffer before the error to preserve formatting and order
                 output.flush()?;
@@ -1279,7 +1319,7 @@ fn collect_directory_entries<O: LsOutput>(
     path_data: &PathData,
     config: &Config,
     output: &mut O,
-    read_dir: &mut ReadDir,
+    read_dir: &mut LsReadDir,
 ) -> UResult<()> {
     entries.clear();
 
@@ -1303,24 +1343,30 @@ fn collect_directory_entries<O: LsOutput>(
     }
 
     for raw_entry in read_dir.by_ref() {
-        let dir_entry = match raw_entry {
-            Ok(path) => path,
+        match raw_entry {
             Err(err) => {
                 output.flush()?;
                 show!(LsError::IOError(err));
                 continue;
             }
-        };
-
-        if should_display(&dir_entry, config) {
-            entries.push(PathData::new(
-                dir_entry.path().into(),
-                Some(dir_entry),
-                None,
-                config,
-                false,
-                false,
-            ));
+            Ok(LsDirEntry::Std(dir_entry)) => {
+                if should_display(dir_entry.file_name().as_os_str(), config) {
+                    entries.push(PathData::new(
+                        dir_entry.path().into(),
+                        Some(dir_entry),
+                        None,
+                        config,
+                        false,
+                        false,
+                    ));
+                }
+            }
+            #[cfg(feature = "vnfs")]
+            Ok(LsDirEntry::Vf { path, name, attrs }) => {
+                if should_display(name.as_os_str(), config) {
+                    entries.push(PathData::from_vf(path, name, attrs, config));
+                }
+            }
         }
     }
 
@@ -1361,9 +1407,98 @@ fn write_directory_entries<O: LsOutput>(
 ///
 /// This avoids deep recursive call chains while preserving GNU-style
 /// directory traversal order and ancestor detection.
+/// Vectorized recursive fast path: walk the subtree with `VecFs::walk` (few
+/// large compounds, directories already in ls -R pre-order) and render each
+/// directory in sequence. Returns `Ok(false)` when the vectorized backend is
+/// not applicable (falls back to the normal path).
+#[cfg(feature = "vnfs")]
+fn list_recursive_vf<O: LsOutput>(
+    root: &PathData,
+    config: &Config,
+    output: &mut O,
+    pos: usize,
+    files_is_empty: bool,
+) -> UResult<bool> {
+    // Time sort has no tie-break in `sort_entries`, so equal timestamps resolve
+    // from the full input array (including "." and ".."); that cannot be
+    // reproduced by the walk, so fall back to the (correct) normal path.
+    if config.sort == Sort::Time {
+        return Ok(false);
+    }
+    let Some(tree) = nfs::try_walk_vf(root.path(), config)? else {
+        return Ok(false);
+    };
+    let root_kernel = root.path();
+    // A directory (and its whole subtree) is skipped when it or any ancestor
+    // below the root is not displayed (e.g. hidden without `-a`). The walk is
+    // pre-ordered, so once one is skipped its descendants follow contiguously.
+    let mut skip_until: Option<usize> = None;
+    let mut entries = Vec::new();
+    for (i, w) in tree.iter().enumerate() {
+        let rel = Path::new(&w.path)
+            .strip_prefix(root_kernel)
+            .unwrap_or(Path::new(&w.path));
+        let depth = rel.components().count();
+        if let Some(skip) = skip_until {
+            if depth > skip {
+                continue;
+            }
+            skip_until = None;
+        }
+        if rel.components().any(|c| !should_display(c.as_os_str(), config)) {
+            skip_until = Some(depth);
+            continue;
+        }
+        let path = PathBuf::from(&w.path);
+        let path_data = PathData::new(path.clone().into(), None, None, config, false, false);
+        output.write_dir_header(&path_data, config, i == 0 && pos == 0 && files_is_empty)?;
+
+        entries.clear();
+        if config.files == Files::All {
+            entries.push(PathData::new(
+                path.clone().into(),
+                None,
+                Some(OsStr::new(".").into()),
+                config,
+                false,
+                true,
+            ));
+            entries.push(PathData::new(
+                dotdot_path(&path).into(),
+                None,
+                Some(OsStr::new("..").into()),
+                config,
+                false,
+                true,
+            ));
+        }
+        for a in &w.entries {
+            let name = a
+                .file
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !should_display(std::ffi::OsStr::new(&name), config) {
+                continue;
+            }
+            entries.push(PathData::from_vf(
+                path.join(&name),
+                name.into(),
+                a.clone(),
+                config,
+            ));
+        }
+        sort_entries(&mut entries, config);
+        write_directory_entries(&entries, config, output)?;
+    }
+    Ok(true)
+}
+
 fn enter_directory<O: LsOutput>(
     path_data: &PathData,
-    read_dir: ReadDir,
+    read_dir: LsReadDir,
     config: &Config,
     listed_ancestors: &mut FxHashSet<FileInformation>,
     output: &mut O,
@@ -1402,7 +1537,7 @@ fn enter_directory<O: LsOutput>(
                 .take()
                 .expect("initial read_dir is present for first entry")
         } else {
-            match fs::read_dir(&entry.path) {
+            match open_dir(&entry.path) {
                 Err(err) => {
                     output.flush()?;
                     show!(LsError::IOErrorContext(
@@ -1422,14 +1557,14 @@ fn enter_directory<O: LsOutput>(
         if config.recursive {
             for child in entries
                 .iter()
-                .filter(|p| p.file_type().is_some_and(FileType::is_dir) && !p.is_dot_dir)
+                .filter(|p| p.file_type().is_some_and(LsFileType::is_dir) && !p.is_dot_dir)
                 .rev()
             {
                 let child_path = child.path().to_path_buf();
                 let child_must_dereference = child.must_dereference;
                 let child_command_line = child.command_line;
 
-                match fs::read_dir(&child_path) {
+                match open_dir(&child_path) {
                     Err(err) => {
                         output.flush()?;
                         show!(LsError::IOErrorContext(
@@ -1475,15 +1610,15 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
         Sort::Time => entries.sort_unstable_by_key(|k| {
             Reverse(
                 k.metadata()
-                    .and_then(|md| metadata_get_time(md, config.time))
+                    .and_then(|md| ls_time(md, config.time))
                     .unwrap_or(UNIX_EPOCH),
             )
         }),
         Sort::Size => {
             entries.sort_unstable_by(|a, b| {
                 b.metadata()
-                    .map_or(0, Metadata::len)
-                    .cmp(&a.metadata().map_or(0, Metadata::len))
+                    .map_or(0, LsMeta::len)
+                    .cmp(&a.metadata().map_or(0, LsMeta::len))
                     .then(a.file_name().cmp(b.file_name()))
             });
         }
@@ -1550,16 +1685,111 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
     }
 }
 
-fn get_metadata_with_deref_opt(p_buf: &Path, dereference: bool) -> std::io::Result<Metadata> {
-    if dereference {
-        p_buf.metadata()
-    } else {
-        p_buf.symlink_metadata()
+#[cfg(feature = "vnfs")]
+/// Sort `vnfs` entry attributes exactly as [`sort_entries`] would sort the
+/// corresponding [`PathData`], so the vectorized recursive walk can order its
+/// output (and thus the sub-directory visit order) identically to the normal
+/// path under any locale and sort mode.
+pub(crate) fn sort_vf_entries(entries: &mut [vnfs::VfAttrs], config: &Config) {
+    use crate::config::Sort;
+    const NF4DIR: u32 = 2;
+    fn name_of(a: &vnfs::VfAttrs) -> &std::ffi::OsStr {
+        a.file
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .unwrap_or_default()
+    }
+    fn ext_of(e: &vnfs::VfAttrs) -> Option<&std::ffi::OsStr> {
+        e.file.path.as_ref().and_then(|p| p.extension())
+    }
+    fn stem_of(e: &vnfs::VfAttrs) -> Option<&std::ffi::OsStr> {
+        e.file.path.as_ref().and_then(|p| p.file_stem())
+    }
+    match config.sort {
+        Sort::Time => entries.sort_unstable_by_key(|k| {
+            Reverse(vf_time(k, config.time).unwrap_or(UNIX_EPOCH))
+        }),
+        Sort::Size => entries.sort_unstable_by(|a, b| {
+            b.size.cmp(&a.size).then(name_of(a).cmp(name_of(b)))
+        }),
+        Sort::Name => {
+            if uucore::i18n::collator::should_use_locale_collation() {
+                entries.sort_unstable_by(|a, b| {
+                    uucore::i18n::collator::locale_cmp(
+                        os_str_as_bytes_lossy(name_of(a)).as_ref(),
+                        os_str_as_bytes_lossy(name_of(b)).as_ref(),
+                    )
+                });
+            } else {
+                entries.sort_unstable_by(|a, b| name_of(a).cmp(name_of(b)));
+            }
+        }
+        Sort::Version => entries.sort_unstable_by(|a, b| {
+            version_cmp(
+                os_str_as_bytes_lossy(name_of(a)).as_ref(),
+                os_str_as_bytes_lossy(name_of(b)).as_ref(),
+            )
+            .then(a.file.path.cmp(&b.file.path))
+        }),
+        Sort::Extension => entries.sort_unstable_by(|a, b| {
+            ext_of(a).cmp(&ext_of(b)).then(stem_of(a).cmp(&stem_of(b)))
+        }),
+        Sort::Width => entries.sort_unstable_by(|a, b| {
+            name_of(a)
+                .len()
+                .cmp(&name_of(b).len())
+                .then(name_of(a).cmp(name_of(b)))
+        }),
+        Sort::None => {}
+    }
+    if config.reverse {
+        entries.reverse();
+    }
+    if config.group_directories_first && config.sort != Sort::None {
+        entries.sort_by_key(|p| p.ftype != NF4DIR);
     }
 }
 
+#[cfg(feature = "vnfs")]
+fn vf_time(a: &vnfs::VfAttrs, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
+    use std::time::Duration;
+    use uucore::fsext::MetadataTimeField;
+    let (sec, nsec) = match field {
+        MetadataTimeField::Modification => (a.mtime_sec, a.mtime_nsec),
+        MetadataTimeField::Access => (a.atime_sec, a.atime_nsec),
+        MetadataTimeField::Change => (a.ctime_sec, a.ctime_nsec),
+        MetadataTimeField::Birth => return None,
+    };
+    Some(UNIX_EPOCH + Duration::new(sec.max(0) as u64, nsec))
+}
+
+fn ls_time(md: &LsMeta, md_time: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
+    use uucore::fsext::MetadataTimeField;
+    match md_time {
+        MetadataTimeField::Change => Some(md.ctime()),
+        MetadataTimeField::Modification => Some(md.mtime()),
+        MetadataTimeField::Access => Some(md.atime()),
+        MetadataTimeField::Birth => md.as_std_metadata().and_then(|m| m.created().ok()),
+    }
+}
+
+/// Open a directory for listing, routing NFS targets through the vectorized
+/// backend when enabled.
+fn open_dir(path: &Path) -> std::io::Result<LsReadDir> {
+    #[cfg(feature = "vnfs")]
+    if let Some(rd) = nfs::try_open_vf(path)? {
+        return Ok(rd);
+    }
+    fs::read_dir(path).map(LsReadDir::from_std)
+}
+
+fn get_metadata_with_deref_opt(p_buf: &Path, dereference: bool) -> std::io::Result<LsMeta> {
+    LsMeta::from_path(p_buf, dereference)
+}
+
 #[allow(unused_variables)]
-fn get_block_size(md: &Metadata, config: &Config) -> u64 {
+fn get_block_size(md: &LsMeta, config: &Config) -> u64 {
     /* GNU ls will display sizes in terms of block size
        md.len() will differ from this value when the file has some holes
     */
@@ -1585,7 +1815,7 @@ fn get_block_size(md: &Metadata, config: &Config) -> u64 {
 }
 
 #[cfg(unix)]
-fn file_is_executable(md: &Metadata) -> bool {
+fn file_is_executable(md: &LsMeta) -> bool {
     // Mode always returns u32, but the flags might not be, based on the platform
     // e.g. linux has u32, mac has u16.
     // S_IXUSR -> user has execute permission

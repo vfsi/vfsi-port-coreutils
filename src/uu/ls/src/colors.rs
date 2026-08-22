@@ -3,6 +3,7 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 use super::PathData;
+use super::meta::LsFileType;
 use lscolors::{Indicator, LsColors, Style};
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
@@ -10,7 +11,6 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 /// ANSI CSI (Control Sequence Introducer)
 const ANSI_CSI: &str = "\x1b[";
@@ -476,7 +476,7 @@ impl<'a> StyleManager<'a> {
     }
 
     #[cfg(unix)]
-    fn indicator_for_special_file(&self, file_type: fs::FileType) -> Option<Indicator> {
+    fn indicator_for_special_file(&self, file_type: LsFileType) -> Option<Indicator> {
         if file_type.is_fifo() && self.has_indicator_style(Indicator::FIFO) {
             return Some(Indicator::FIFO);
         }
@@ -493,7 +493,7 @@ impl<'a> StyleManager<'a> {
     }
 
     #[cfg(not(unix))]
-    fn indicator_for_special_file(&self, _file_type: fs::FileType) -> Option<Indicator> {
+    fn indicator_for_special_file(&self, _file_type: LsFileType) -> Option<Indicator> {
         None
     }
 
@@ -540,7 +540,7 @@ pub(crate) fn color_name(
     }
 
     if target_symlink.is_none()
-        && path.file_type().is_some_and(fs::FileType::is_symlink)
+        && path.file_type().is_some_and(LsFileType::is_symlink)
         && let Some(colored) = style_manager.color_symlink_name(path, name.clone(), wrap)
     {
         return colored;
@@ -561,6 +561,7 @@ pub(crate) fn color_name(
 
     let md_option: Option<Metadata> = path
         .metadata()
+        .and_then(|m| m.as_std_metadata())
         .cloned()
         .or_else(|| path.p_buf.symlink_metadata().ok());
 

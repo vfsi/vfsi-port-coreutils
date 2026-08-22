@@ -11,7 +11,8 @@ use std::cell::LazyCell;
 #[cfg(unix)]
 use std::fmt::Display;
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+#[cfg(windows)]
+use std::fs::Metadata;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::sync::LazyLock;
@@ -21,10 +22,11 @@ use std::{borrow::Cow, iter};
 use std::{
     ffi::{OsStr, OsString},
     fmt::Write as FmtWrite,
-    fs::{self, DirEntry, FileType, Metadata},
+    fs::{self},
     io::{BufWriter, Stdout, Write},
 };
 
+use crate::meta::{LsFileType, LsMeta};
 use ansi_width::ansi_width;
 use glob::MatchOptions;
 #[cfg(unix)]
@@ -40,8 +42,8 @@ use uucore::libc::{dev_t, major, minor};
 use uucore::{
     error::UResult,
     format::human::human_readable,
-    fs::display_permissions,
-    fsext::metadata_get_time,
+    fs::display_permissions_unix,
+    fsext::MetadataTimeField,
     i18n::{UEncoding, get_ctype_encoding},
     os_str_as_bytes_lossy,
     quoting_style::{QuotingStyle, locale_aware_escape_dir_name, locale_aware_escape_name},
@@ -272,9 +274,9 @@ fn push_basic_escape(buf: &mut String, byte: u8) {
     }
 }
 
-pub fn should_display(entry: &DirEntry, config: &Config) -> bool {
+pub fn should_display(file_name: &OsStr, config: &Config) -> bool {
     // check if hidden
-    if config.files == Files::Normal && is_hidden(entry) {
+    if config.files == Files::Normal && is_hidden(file_name) {
         return false;
     }
 
@@ -286,7 +288,6 @@ pub fn should_display(entry: &DirEntry, config: &Config) -> bool {
         case_sensitive: true,
     };
 
-    let file_name = entry.file_name();
     // If the decoding fails, still match best we can
     // FIXME: use OsStrings or Paths once we have a glob crate that supports it:
     // https://github.com/rust-lang/glob/issues/23
@@ -634,7 +635,7 @@ fn display_additional_leading_info(
 // a posix-compliant attribute this can be updated...
 #[cfg(unix)]
 fn display_uname<'a>(
-    metadata: &Metadata,
+    metadata: &LsMeta,
     config: &Config,
     uid_cache: &'a mut FxHashMap<u32, String>,
 ) -> &'a String {
@@ -651,7 +652,7 @@ fn display_uname<'a>(
 
 #[cfg(unix)]
 fn display_group<'a>(
-    metadata: &Metadata,
+    metadata: &LsMeta,
     config: &Config,
     gid_cache: &'a mut FxHashMap<u32, String>,
 ) -> &'a String {
@@ -666,7 +667,7 @@ fn display_group<'a>(
 }
 
 #[cfg(not(unix))]
-fn display_uname(_metadata: &Metadata, config: &Config, _uid_cache: &mut ()) -> &'static str {
+fn display_uname(_metadata: &LsMeta, config: &Config, _uid_cache: &mut ()) -> &'static str {
     // No uid to report on this platform; with `-n` fall back to "0" so the
     // output still looks numeric, matching the intent of --numeric-uid-gid.
     if config.long.numeric_uid_gid {
@@ -677,20 +678,30 @@ fn display_uname(_metadata: &Metadata, config: &Config, _uid_cache: &mut ()) -> 
 }
 
 #[cfg(not(unix))]
-fn display_group(_metadata: &Metadata, config: &Config, _gid_cache: &mut ()) -> &'static str {
+fn display_group(_metadata: &LsMeta, config: &Config, _gid_cache: &mut ()) -> &'static str {
     if config.long.numeric_uid_gid {
         return "0";
     }
     "somegroup"
 }
 
+/// Like `uucore::fsext::metadata_get_time` but for `LsMeta`.
+fn lsmeta_get_time(meta: &LsMeta, md_time: MetadataTimeField) -> Option<SystemTime> {
+    match md_time {
+        MetadataTimeField::Change => Some(meta.ctime()),
+        MetadataTimeField::Modification => Some(meta.mtime()),
+        MetadataTimeField::Access => Some(meta.atime()),
+        MetadataTimeField::Birth => meta.as_std_metadata().and_then(|m| m.created().ok()),
+    }
+}
+
 fn display_date(
-    metadata: &Metadata,
+    metadata: &LsMeta,
     config: &Config,
     recent_time_range: &RangeInclusive<SystemTime>,
     out: &mut Vec<u8>,
 ) -> UResult<()> {
-    let Some(time) = metadata_get_time(metadata, config.time) else {
+    let Some(time) = lsmeta_get_time(metadata, config.time) else {
         out.extend(b"???");
         return Ok(());
     };
@@ -705,7 +716,7 @@ fn display_date(
     format_system_time(out, time, fmt, FormatSystemTimeFallback::Integer)
 }
 
-fn display_len_or_rdev(metadata: &Metadata, config: &Config) -> SizeOrDeviceId {
+fn display_len_or_rdev(metadata: &LsMeta, config: &Config) -> SizeOrDeviceId {
     #[cfg(unix)]
     {
         let ft = metadata.file_type();
@@ -777,7 +788,7 @@ fn display_item_name(
     }
 
     let is_long_symlink = config.format == Format::Long
-        && path.file_type().is_some_and(FileType::is_symlink)
+        && path.file_type().is_some_and(LsFileType::is_symlink)
         && !path.must_dereference;
 
     if !is_long_symlink && let Some(c) = indicator_char(path, config.indicator_style) {
@@ -833,7 +844,7 @@ fn display_item_name(
 
                             let target_display = if let Some(style_manager) = style_manager {
                                 let md = match target_data.metadata() {
-                                    Some(md) => Some(Cow::Borrowed(md)),
+                                    Some(md) => md.as_std_metadata().map(Cow::Borrowed),
                                     None => {
                                         target_data.p_buf.symlink_metadata().ok().map(Cow::Owned)
                                     }
@@ -971,7 +982,7 @@ fn display_item_long(
         let is_acl_set = has_acl(item.path());
         state
             .display_buf
-            .extend(display_permissions(md, true).as_bytes());
+            .extend(display_permissions_unix(md.mode(), true).as_bytes());
         if padding.permissions > PERMISSIONS_WIDTH {
             state
                 .display_buf
@@ -1278,16 +1289,14 @@ fn create_hyperlink(name: &OsStr, path: &PathData) -> OsString {
     ret
 }
 
-fn is_hidden(file_path: &DirEntry) -> bool {
+fn is_hidden(file_name: &OsStr) -> bool {
     #[cfg(windows)]
     {
-        let metadata = file_path.metadata().unwrap();
-        let attr = metadata.file_attributes();
-        (attr & 0x2) > 0
+        file_name.as_encoded_bytes().starts_with(b".")
     }
     #[cfg(not(windows))]
     {
-        file_path.file_name().as_encoded_bytes().starts_with(b".")
+        file_name.as_encoded_bytes().starts_with(b".")
     }
 }
 
@@ -1302,12 +1311,12 @@ fn update_dired_for_item(
 }
 
 #[cfg(unix)]
-fn display_symlink_count(metadata: &Metadata) -> String {
+fn display_symlink_count(metadata: &LsMeta) -> String {
     metadata.nlink().to_string()
 }
 
 #[cfg(unix)]
-fn display_inode(metadata: &Metadata) -> impl Display {
+fn display_inode(metadata: &LsMeta) -> impl Display {
     metadata.ino().to_string()
 }
 
@@ -1391,7 +1400,7 @@ fn calculate_padding_collection(
 }
 
 #[cfg(not(unix))]
-fn display_symlink_count(_metadata: &Metadata) -> String {
+fn display_symlink_count(_metadata: &LsMeta) -> String {
     // Currently not sure of how to get this on Windows, so I'm punting.
     // Git Bash looks like it may do the same thing.
     String::from("1")
