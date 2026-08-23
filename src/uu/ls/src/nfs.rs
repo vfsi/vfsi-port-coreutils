@@ -104,6 +104,15 @@ impl Drop for VfContext {
                     bytes
                 );
             }
+            let (calls, us) = vnfs::compound::rpc_stats();
+            if calls > 0 {
+                eprintln!(
+                    "[vnfs] rpc_calls={} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
+                    calls,
+                    us as f64 / calls as f64 / 1000.0,
+                    us as f64 / 1000.0
+                );
+            }
         }
     }
 }
@@ -158,7 +167,11 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
         if ctx.is_none() {
+            let t0 = std::time::Instant::now();
             *ctx = Some(make_ctx(&mountpoint)?);
+            if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+                eprintln!("[profile] connect_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
+            }
         }
         let ctx = ctx.as_mut().unwrap();
 
@@ -202,7 +215,11 @@ pub fn try_walk_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
         if ctx.is_none() {
+            let t0 = std::time::Instant::now();
             *ctx = Some(make_ctx(&mountpoint)?);
+            if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+                eprintln!("[profile] connect_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
+            }
         }
         let ctx = ctx.as_mut().unwrap();
 
@@ -211,10 +228,14 @@ pub fn try_walk_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         let sort = |_dir: &str, attrs: &mut Vec<VfAttrs>| {
             crate::sort_vf_entries(attrs, config);
         };
+        let t0 = std::time::Instant::now();
         let tree = ctx
             .backend
             .walk(&vpath, full_mask(config), &sort)
             .map_err(|e| io::Error::other(e.to_string()))?;
+        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+            eprintln!("[profile] walk_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
+        }
 
         let mut out = Vec::with_capacity(tree.len());
         for mut w in tree {

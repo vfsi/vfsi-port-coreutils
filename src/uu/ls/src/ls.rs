@@ -1428,6 +1428,7 @@ fn list_recursive_vf<O: LsOutput>(
     let Some(tree) = nfs::try_walk_vf(root.path(), config)? else {
         return Ok(false);
     };
+    let t0 = std::time::Instant::now();
     let root_kernel = root.path();
     // A directory (and its whole subtree) is skipped when it or any ancestor
     // below the root is not displayed (e.g. hidden without `-a`). The walk is
@@ -1492,6 +1493,12 @@ fn list_recursive_vf<O: LsOutput>(
         }
         sort_entries(&mut entries, config);
         write_directory_entries(&entries, config, output)?;
+        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") && i < 3 {
+            eprintln!("[profile]   dir{} {} entries={} sofar_ms={:.1}", i, w.path, w.entries.len(), t0.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+        eprintln!("[profile] render_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
     }
     Ok(true)
 }
