@@ -1256,7 +1256,7 @@ pub fn list_with_output<O: LsOutput>(
         }
         // Do read_dir call here to match GNU semantics by printing
         // read_dir errors before directory headings, names and totals
-        let read_dir = match open_dir(path_data.path()) {
+        let read_dir = match open_dir(path_data.path(), config) {
             Err(err) => {
                 // flush stdout buffer before the error to preserve formatting and order
                 output.flush()?;
@@ -1537,7 +1537,7 @@ fn enter_directory<O: LsOutput>(
                 .take()
                 .expect("initial read_dir is present for first entry")
         } else {
-            match open_dir(&entry.path) {
+            match open_dir(&entry.path, config) {
                 Err(err) => {
                     output.flush()?;
                     show!(LsError::IOErrorContext(
@@ -1564,7 +1564,7 @@ fn enter_directory<O: LsOutput>(
                 let child_must_dereference = child.must_dereference;
                 let child_command_line = child.command_line;
 
-                match open_dir(&child_path) {
+                match open_dir(&child_path, config) {
                     Err(err) => {
                         output.flush()?;
                         show!(LsError::IOErrorContext(
@@ -1776,9 +1776,9 @@ fn ls_time(md: &LsMeta, md_time: uucore::fsext::MetadataTimeField) -> Option<Sys
 
 /// Open a directory for listing, routing NFS targets through the vectorized
 /// backend when enabled.
-fn open_dir(path: &Path) -> std::io::Result<LsReadDir> {
+fn open_dir(path: &Path, config: &Config) -> std::io::Result<LsReadDir> {
     #[cfg(feature = "vnfs")]
-    if let Some(rd) = nfs::try_open_vf(path)? {
+    if let Some(rd) = nfs::try_open_vf(path, config)? {
         return Ok(rd);
     }
     fs::read_dir(path).map(LsReadDir::from_std)

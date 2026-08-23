@@ -979,7 +979,13 @@ fn display_item_long(
         // TODO: See how Mac should work here
         let is_acl_set = false;
         #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
-        let is_acl_set = has_acl(item.path());
+        // Vf-backed entries carry the per-object FATTR4_NAMED_ATTR boolean
+        // fetched inline in the READDIR, so use it instead of probing the
+        // mount one xattr RPC per file.
+        let is_acl_set = match item.metadata() {
+            Some(LsMeta::Vf(a)) => a.has_named_attr,
+            _ => has_acl(item.path()),
+        };
         state
             .display_buf
             .extend(display_permissions_unix(md.mode(), true).as_bytes());
@@ -1376,7 +1382,10 @@ fn calculate_padding_collection(
                 // TODO: See how Mac should work here
                 let is_acl_set = false;
                 #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
-                let is_acl_set = has_acl(item.path());
+                let is_acl_set = match item.metadata() {
+                    Some(LsMeta::Vf(a)) => a.has_named_attr,
+                    _ => has_acl(item.path()),
+                };
                 if context_len > 1 || is_acl_set {
                     padding_collections.permissions = PERMISSIONS_WIDTH + 1;
                 }

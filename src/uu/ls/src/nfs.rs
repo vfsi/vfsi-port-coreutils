@@ -28,8 +28,11 @@ fn impl_choice() -> Option<&'static str> {
     }
 }
 
-/// Attributes requested for every entry (all supported fields).
-fn full_mask() -> vnfs::AttrMask {
+/// Attributes requested for every entry (all supported fields). The
+/// FATTR4_NAMED_ATTR boolean is only needed by the long format (for the `+`
+/// access-indicator), and costs the server a per-entry xattr enumeration, so
+/// it is only requested then.
+fn full_mask(config: &crate::config::Config) -> vnfs::AttrMask {
     use vnfs::AttrMask;
     AttrMask {
         has_mode: true,
@@ -43,6 +46,7 @@ fn full_mask() -> vnfs::AttrMask {
         has_atime: true,
         has_mtime: true,
         has_ctime: true,
+        has_named_attr: config.format == crate::display::Format::Long,
     }
 }
 
@@ -144,7 +148,7 @@ fn make_ctx(mountpoint: &Path) -> io::Result<VfContext> {
 
 /// Open `path` for listing through the vectorized backend when applicable.
 /// Returns `Ok(None)` when the path is not NFS-mounted or the backend is off.
-pub fn try_open_vf(path: &Path) -> io::Result<Option<LsReadDir>> {
+pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Option<LsReadDir>> {
     if impl_choice().is_none() {
         return Ok(None);
     }
@@ -162,7 +166,7 @@ pub fn try_open_vf(path: &Path) -> io::Result<Option<LsReadDir>> {
         let vpath = format!("/{}", rel.to_string_lossy());
         let attrs = ctx
             .backend
-            .listdir(&vpath, full_mask(), 0, false)
+            .listdir(&vpath, full_mask(config), 0, false)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         let mut out = Vec::with_capacity(attrs.len());
@@ -209,7 +213,7 @@ pub fn try_walk_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         };
         let tree = ctx
             .backend
-            .walk(&vpath, full_mask(), &sort)
+            .walk(&vpath, full_mask(config), &sort)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         let mut out = Vec::with_capacity(tree.len());
