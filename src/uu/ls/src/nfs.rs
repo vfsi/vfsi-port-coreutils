@@ -170,7 +170,10 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
             let t0 = std::time::Instant::now();
             *ctx = Some(make_ctx(&mountpoint)?);
             if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-                eprintln!("[profile] connect_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[profile] connect_ms={:.1}",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
         }
         let ctx = ctx.as_mut().unwrap();
@@ -186,8 +189,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         for a in attrs {
             let name = a
                 .file
-                .path
-                .as_ref()
+                .path()
                 .and_then(|p| p.file_name())
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default();
@@ -206,7 +208,11 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
 /// list them (via [`sort_entries`] semantics, so it is correct under any
 /// locale and sort mode). Paths in the result are mapped back to kernel paths
 /// (under the mountpoint).
-pub fn try_walk_vf(path: &Path, config: &crate::config::Config) -> io::Result<Option<Vec<vnfs::WalkEntry>>> {    if impl_choice().is_none() {
+pub fn try_walk_vf(
+    path: &Path,
+    config: &crate::config::Config,
+) -> io::Result<Option<Vec<vnfs::WalkEntry>>> {
+    if impl_choice().is_none() {
         return Ok(None);
     }
     let Some(mountpoint) = nfs_mountpoint(path) else {
@@ -218,7 +224,10 @@ pub fn try_walk_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
             let t0 = std::time::Instant::now();
             *ctx = Some(make_ctx(&mountpoint)?);
             if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-                eprintln!("[profile] connect_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[profile] connect_ms={:.1}",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
         }
         let ctx = ctx.as_mut().unwrap();
@@ -234,7 +243,10 @@ pub fn try_walk_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
             .walk(&vpath, full_mask(config), &sort)
             .map_err(|e| io::Error::other(e.to_string()))?;
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-            eprintln!("[profile] walk_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[profile] walk_ms={:.1}",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         let mut out = Vec::with_capacity(tree.len());

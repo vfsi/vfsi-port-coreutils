@@ -909,7 +909,7 @@ impl<'a> PathData<'a> {
     /// left to be resolved from the local filesystem instead.
     #[cfg(feature = "vnfs")]
     fn from_vf(path: PathBuf, name: OsString, attrs: vnfs::VfAttrs, config: &Config) -> Self {
-        let ftype = attrs.ftype;
+        let ftype = attrs.ftype.as_nfs();
         let must_dereference = matches!(&config.dereference, Dereference::All);
         let md = OnceCell::new();
         let ft = OnceCell::new();
@@ -1446,7 +1446,10 @@ fn list_recursive_vf<O: LsOutput>(
             }
             skip_until = None;
         }
-        if rel.components().any(|c| !should_display(c.as_os_str(), config)) {
+        if rel
+            .components()
+            .any(|c| !should_display(c.as_os_str(), config))
+        {
             skip_until = Some(depth);
             continue;
         }
@@ -1476,8 +1479,7 @@ fn list_recursive_vf<O: LsOutput>(
         for a in &w.entries {
             let name = a
                 .file
-                .path
-                .as_ref()
+                .path()
                 .and_then(|p| p.file_name())
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default();
@@ -1494,11 +1496,20 @@ fn list_recursive_vf<O: LsOutput>(
         sort_entries(&mut entries, config);
         write_directory_entries(&entries, config, output)?;
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") && i < 3 {
-            eprintln!("[profile]   dir{} {} entries={} sofar_ms={:.1}", i, w.path, w.entries.len(), t0.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[profile]   dir{} {} entries={} sofar_ms={:.1}",
+                i,
+                w.path,
+                w.entries.len(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
     }
     if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-        eprintln!("[profile] render_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "[profile] render_ms={:.1}",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
     }
     Ok(true)
 }
@@ -1699,27 +1710,25 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
 /// path under any locale and sort mode.
 pub(crate) fn sort_vf_entries(entries: &mut [vnfs::VfAttrs], config: &Config) {
     use crate::config::Sort;
-    const NF4DIR: u32 = 2;
     fn name_of(a: &vnfs::VfAttrs) -> &std::ffi::OsStr {
         a.file
-            .path
-            .as_ref()
+            .path()
             .and_then(|p| p.file_name())
             .unwrap_or_default()
     }
     fn ext_of(e: &vnfs::VfAttrs) -> Option<&std::ffi::OsStr> {
-        e.file.path.as_ref().and_then(|p| p.extension())
+        e.file.path().and_then(|p| p.extension())
     }
     fn stem_of(e: &vnfs::VfAttrs) -> Option<&std::ffi::OsStr> {
-        e.file.path.as_ref().and_then(|p| p.file_stem())
+        e.file.path().and_then(|p| p.file_stem())
     }
     match config.sort {
-        Sort::Time => entries.sort_unstable_by_key(|k| {
-            Reverse(vf_time(k, config.time).unwrap_or(UNIX_EPOCH))
-        }),
-        Sort::Size => entries.sort_unstable_by(|a, b| {
-            b.size.cmp(&a.size).then(name_of(a).cmp(name_of(b)))
-        }),
+        Sort::Time => {
+            entries.sort_unstable_by_key(|k| Reverse(vf_time(k, config.time).unwrap_or(UNIX_EPOCH)))
+        }
+        Sort::Size => {
+            entries.sort_unstable_by(|a, b| b.size.cmp(&a.size).then(name_of(a).cmp(name_of(b))))
+        }
         Sort::Name => {
             if uucore::i18n::collator::should_use_locale_collation() {
                 entries.sort_unstable_by(|a, b| {
@@ -1737,11 +1746,10 @@ pub(crate) fn sort_vf_entries(entries: &mut [vnfs::VfAttrs], config: &Config) {
                 os_str_as_bytes_lossy(name_of(a)).as_ref(),
                 os_str_as_bytes_lossy(name_of(b)).as_ref(),
             )
-            .then(a.file.path.cmp(&b.file.path))
+            .then(a.file.path().cmp(&b.file.path()))
         }),
-        Sort::Extension => entries.sort_unstable_by(|a, b| {
-            ext_of(a).cmp(&ext_of(b)).then(stem_of(a).cmp(&stem_of(b)))
-        }),
+        Sort::Extension => entries
+            .sort_unstable_by(|a, b| ext_of(a).cmp(&ext_of(b)).then(stem_of(a).cmp(&stem_of(b)))),
         Sort::Width => entries.sort_unstable_by(|a, b| {
             name_of(a)
                 .len()
@@ -1754,7 +1762,7 @@ pub(crate) fn sort_vf_entries(entries: &mut [vnfs::VfAttrs], config: &Config) {
         entries.reverse();
     }
     if config.group_directories_first && config.sort != Sort::None {
-        entries.sort_by_key(|p| p.ftype != NF4DIR);
+        entries.sort_by_key(|p| p.ftype != vnfs::VfType::Directory);
     }
 }
 

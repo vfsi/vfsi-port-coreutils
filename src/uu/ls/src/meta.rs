@@ -176,7 +176,7 @@ impl LsMeta {
         match self {
             LsMeta::Std(m) => LsFileType::from_std(&m.file_type()),
             #[cfg(feature = "vnfs")]
-            LsMeta::Vf(v) => LsFileType::from_ftype(v.ftype),
+            LsMeta::Vf(v) => LsFileType::from_ftype(v.ftype.as_nfs()),
         }
     }
 

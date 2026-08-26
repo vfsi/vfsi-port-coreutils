@@ -1864,6 +1864,8 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libntirpc-sys"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f719f8c070ca6037c59998f69e0107a54c23a86cfafa9fb8dbf7489d10bf23f0"
 dependencies = [
  "bindgen",
 ]
@@ -1996,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "nfsv41-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bindgen",
  "libntirpc-sys",
@@ -4695,7 +4697,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vnfs"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "libc",
  "libntirpc-sys",
