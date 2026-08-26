@@ -34,20 +34,21 @@ fn impl_choice() -> Option<&'static str> {
 /// it is only requested then.
 fn full_mask(config: &crate::config::Config) -> vnfs::AttrMask {
     use vnfs::AttrMask;
-    AttrMask {
-        has_mode: true,
-        has_size: true,
-        has_nlink: true,
-        has_fileid: true,
-        has_blocks: true,
-        has_uid: true,
-        has_gid: true,
-        has_rdev: true,
-        has_atime: true,
-        has_mtime: true,
-        has_ctime: true,
-        has_named_attr: config.format == crate::display::Format::Long,
+    let mut mask = AttrMask::MODE
+        | AttrMask::SIZE
+        | AttrMask::NLINK
+        | AttrMask::FILEID
+        | AttrMask::BLOCKS
+        | AttrMask::UID
+        | AttrMask::GID
+        | AttrMask::RDEV
+        | AttrMask::ATIME
+        | AttrMask::MTIME
+        | AttrMask::CTIME;
+    if config.format == crate::display::Format::Long {
+        mask |= AttrMask::NAMED_ATTR;
     }
+    mask
 }
 
 /// A concrete vectorized backend. (`VecFs` is not object-safe, so dispatch is
