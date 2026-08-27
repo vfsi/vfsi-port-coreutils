@@ -76,7 +76,7 @@ impl Backend {
         &mut self,
         root: &str,
         masks: vnfs::AttrMask,
-        sort: &dyn Fn(&str, &mut Vec<VfAttrs>),
+        sort: &mut dyn FnMut(&str, &mut Vec<VfAttrs>),
     ) -> vnfs::VfResult<Vec<vnfs::WalkEntry>> {
         match self {
             Self::Dummy(f) => f.walk(root, masks, sort),
@@ -235,13 +235,13 @@ pub fn try_walk_vf(
 
         let rel = path.strip_prefix(&ctx.mountpoint).unwrap_or(path);
         let vpath = format!("/{}", rel.to_string_lossy());
-        let sort = |_dir: &str, attrs: &mut Vec<VfAttrs>| {
+        let mut sort = |_dir: &str, attrs: &mut Vec<VfAttrs>| {
             crate::sort_vf_entries(attrs, config);
         };
         let t0 = std::time::Instant::now();
         let tree = ctx
             .backend
-            .walk(&vpath, full_mask(config), &sort)
+            .walk(&vpath, full_mask(config), &mut sort)
             .map_err(|e| io::Error::other(e.to_string()))?;
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             eprintln!(
