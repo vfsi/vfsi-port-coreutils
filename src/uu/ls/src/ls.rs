@@ -1246,6 +1246,24 @@ pub fn list_with_output<O: LsOutput>(
 
     let mut entries = Vec::<PathData>::with_capacity(2);
 
+    // Batch-open multiple directory operands on NFS in one vectorized call
+    // (the vnfs backend lists many directories in a few compounds).
+    let mut batched_many: Option<Vec<Option<LsReadDir>>> = {
+        #[cfg(feature = "vnfs")]
+        {
+            if !config.recursive && dirs.len() >= 2 {
+                let paths: Vec<&Path> = dirs.iter().map(|d| d.path()).collect();
+                nfs::try_open_many_vf(&paths, config).unwrap_or(None)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "vnfs"))]
+        {
+            None
+        }
+    };
+
     for (pos, path_data) in dirs.iter().enumerate() {
         // Vectorized recursive fast path: walk the whole subtree in few large
         // compounds and render it in ls -R order.
@@ -1256,7 +1274,15 @@ pub fn list_with_output<O: LsOutput>(
         }
         // Do read_dir call here to match GNU semantics by printing
         // read_dir errors before directory headings, names and totals
-        let read_dir = match open_dir(path_data.path(), config) {
+        let read_dir = if let Some(b) = batched_many.as_mut() {
+            match b.get_mut(pos).and_then(Option::take) {
+                Some(rd) => Ok(rd),
+                None => open_dir(path_data.path(), config),
+            }
+        } else {
+            open_dir(path_data.path(), config)
+        };
+        let read_dir = match read_dir {
             Err(err) => {
                 // flush stdout buffer before the error to preserve formatting and order
                 output.flush()?;

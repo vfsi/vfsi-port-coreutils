@@ -103,6 +103,20 @@ impl Backend {
             Self::Nfs(f) => f.walk(root, masks, sort),
         }
     }
+
+    fn listdirv(
+        &mut self,
+        dirs: &[&str],
+        masks: vnfs::AttrMask,
+        max_entries: usize,
+        recursive: bool,
+        cb: &mut dyn FnMut(&VfAttrs, &str) -> bool,
+    ) -> vnfs::VfRes {
+        match self {
+            Self::Dummy(f) => f.listdirv(dirs, masks, max_entries, recursive, cb),
+            Self::Nfs(f) => f.listdirv(dirs, masks, max_entries, recursive, cb),
+        }
+    }
 }
 
 struct VfContext {
@@ -222,6 +236,100 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
     })
 }
 
+/// List several directories in one vectorized batch and map the entries back
+/// to kernel paths. On a mid-batch failure the directories before the failing
+/// index are returned (the entries were already collected by the callback);
+/// the failing directory and everything after it come back as `None` so the
+/// caller can fall back to per-directory opens (preserving `ls`'s
+/// print-errors-before-headings ordering).
+fn ctx_open_many(
+    ctx: &mut VfContext,
+    kernel_dirs: &[&Path],
+    masks: vnfs::AttrMask,
+) -> io::Result<Vec<Option<LsReadDir>>> {
+    let vpaths: Vec<String> = kernel_dirs
+        .iter()
+        .map(|d| {
+            let rel = d.strip_prefix(&ctx.mountpoint).unwrap_or(d);
+            format!("/{}", rel.to_string_lossy())
+        })
+        .collect();
+    let refs: Vec<&str> = vpaths.iter().map(String::as_str).collect();
+    let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, v) in vpaths.iter().enumerate() {
+        slot.insert(v.clone(), i);
+    }
+    let mut entries: Vec<Vec<VfAttrs>> = vec![Vec::new(); refs.len()];
+    let mut cb = |a: &VfAttrs, dir: &str| {
+        if let Some(&i) = slot.get(dir) {
+            entries[i].push(a.clone());
+        }
+        true
+    };
+    let mut available = vec![true; refs.len()];
+    if let Err(e) = ctx.backend.listdirv(&refs, masks, 0, false, &mut cb) {
+        // The prefix before the failing index was collected; the failing
+        // directory and the rest fall back to per-directory opens.
+        let i = e.index().min(available.len().saturating_sub(1));
+        for a in available.iter_mut().skip(i) {
+            *a = false;
+        }
+    }
+    let mut out = Vec::with_capacity(refs.len());
+    for (i, listed) in available.iter().enumerate() {
+        if !listed {
+            out.push(None);
+            continue;
+        }
+        let mut list = Vec::with_capacity(entries[i].len());
+        for attrs in &entries[i] {
+            let name = attrs
+                .file
+                .path()
+                .and_then(|p| p.file_name())
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            list.push(LsDirEntry::Vf {
+                path: kernel_dirs[i].join(&name),
+                name: name.into(),
+                attrs: attrs.clone(),
+            });
+        }
+        out.push(Some(LsReadDir::from_vf(list)));
+    }
+    Ok(out)
+}
+
+/// Open several directory operands in one vectorized batch when they all live
+/// on the same NFS mount (and the backend is enabled). Returns `Ok(None)`
+/// when the batch path does not apply, and a per-directory result vector
+/// otherwise (entries, or `None` where the caller must fall back).
+pub fn try_open_many_vf(
+    dirs: &[&Path],
+    config: &crate::config::Config,
+) -> io::Result<Option<Vec<Option<LsReadDir>>>> {
+    if impl_choice().is_none() || dirs.len() < 2 {
+        return Ok(None);
+    }
+    let Some(mountpoint) = nfs_mountpoint(dirs[0]) else {
+        return Ok(None);
+    };
+    if dirs[1..]
+        .iter()
+        .any(|d| nfs_mountpoint(d) != Some(mountpoint.clone()))
+    {
+        return Ok(None);
+    }
+    CTX.with(|c| {
+        let mut ctx = c.borrow_mut();
+        if ctx.is_none() {
+            *ctx = Some(make_ctx(&mountpoint)?);
+        }
+        let ctx = ctx.as_mut().unwrap();
+        Ok(Some(ctx_open_many(ctx, dirs, full_mask(config))?))
+    })
+}
+
 /// Walk the whole subtree rooted at `path` through the vectorized backend,
 /// returning each directory with its entries, ordered exactly as `ls` would
 /// list them (via [`sort_entries`] semantics, so it is correct under any
@@ -280,4 +388,71 @@ pub fn try_walk_vf(
         }
         Ok(Some(out))
     })
+}
+
+#[cfg(all(test, feature = "vnfs"))]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn dummy_ctx(root: &Path) -> VfContext {
+        VfContext {
+            backend: Backend::Dummy(DummyVecFs::new(root.to_path_buf())),
+            mountpoint: root.to_path_buf(),
+        }
+    }
+
+    fn names(rd: Option<&mut LsReadDir>) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(rd) = rd {
+            for e in rd {
+                if let Ok(LsDirEntry::Vf { name, .. }) = e {
+                    out.push(name.to_string_lossy().into_owned());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn open_many_lists_all_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        for d in ["d1", "d2"] {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+            std::fs::write(root.path().join(d).join("f.txt"), b"x").unwrap();
+        }
+        let mut ctx = dummy_ctx(root.path());
+        let dirs = [root.path().join("d1"), root.path().join("d2")];
+        let paths: Vec<&Path> = dirs.iter().map(|d| d.as_path()).collect();
+        let masks = vnfs::AttrMask::MODE | vnfs::AttrMask::SIZE;
+        let mut out = ctx_open_many(&mut ctx, &paths, masks).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(Option::is_some));
+        assert_eq!(names(out[0].as_mut()), vec!["f.txt"]);
+        assert_eq!(names(out[1].as_mut()), vec!["f.txt"]);
+    }
+
+    #[test]
+    fn open_many_falls_back_after_failing_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("d0")).unwrap();
+        std::fs::write(root.path().join("d0/a.txt"), b"a").unwrap();
+        // d1 does not exist.
+        std::fs::create_dir_all(root.path().join("d2")).unwrap();
+        std::fs::write(root.path().join("d2/b.txt"), b"b").unwrap();
+        let mut ctx = dummy_ctx(root.path());
+        let dirs = [
+            root.path().join("d0"),
+            root.path().join("d1"),
+            root.path().join("d2"),
+        ];
+        let paths: Vec<&Path> = dirs.iter().map(|d| d.as_path()).collect();
+        let masks = vnfs::AttrMask::MODE | vnfs::AttrMask::SIZE;
+        let mut out = ctx_open_many(&mut ctx, &paths, masks).unwrap();
+        assert!(out[0].is_some(), "prefix dir listed before the failure");
+        assert!(out[1].is_none(), "failing dir falls back to per-dir open");
+        assert!(out[2].is_none(), "later dirs also fall back");
+        assert_eq!(names(out[0].as_mut()), vec!["a.txt"]);
+    }
 }
