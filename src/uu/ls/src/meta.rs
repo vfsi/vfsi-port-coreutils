@@ -113,6 +113,7 @@ impl LsMeta {
             LsMeta::Std(m) => m.len(),
             #[cfg(feature = "vnfs")]
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::SIZE) => v.size,
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => 0,
         }
     }
@@ -122,6 +123,7 @@ impl LsMeta {
             LsMeta::Std(m) => m.nlink(),
             #[cfg(feature = "vnfs")]
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::NLINK) => v.nlink as u64,
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => 1,
         }
     }
@@ -131,6 +133,7 @@ impl LsMeta {
             LsMeta::Std(m) => m.uid(),
             #[cfg(feature = "vnfs")]
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::UID) => v.uid,
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => 0,
         }
     }
@@ -140,6 +143,7 @@ impl LsMeta {
             LsMeta::Std(m) => m.gid(),
             #[cfg(feature = "vnfs")]
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::GID) => v.gid,
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => 0,
         }
     }
@@ -149,6 +153,7 @@ impl LsMeta {
             LsMeta::Std(m) => m.rdev(),
             #[cfg(feature = "vnfs")]
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::RDEV) => v.rdev,
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => 0,
         }
     }
@@ -158,6 +163,7 @@ impl LsMeta {
             LsMeta::Std(m) => m.ino(),
             #[cfg(feature = "vnfs")]
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::FILEID) => v.fileid,
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => 0,
         }
     }
@@ -167,6 +173,7 @@ impl LsMeta {
             LsMeta::Std(m) => m.blocks(),
             #[cfg(feature = "vnfs")]
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::BLOCKS) => v.blocks,
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => 0,
         }
     }
@@ -176,6 +183,7 @@ impl LsMeta {
             LsMeta::Std(m) => m.mode(),
             #[cfg(feature = "vnfs")]
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::MODE) => v.mode,
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => 0,
         }
     }
@@ -199,6 +207,7 @@ impl LsMeta {
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::MTIME) => {
                 Self::secs_nsecs(v.mtime_sec, v.mtime_nsec)
             }
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => UNIX_EPOCH,
         }
     }
@@ -210,6 +219,7 @@ impl LsMeta {
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::ATIME) => {
                 Self::secs_nsecs(v.atime_sec, v.atime_nsec)
             }
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => UNIX_EPOCH,
         }
     }
@@ -221,6 +231,7 @@ impl LsMeta {
             LsMeta::Vf(v) if v.returned.contains(vnfs::AttrMask::CTIME) => {
                 Self::secs_nsecs(v.ctime_sec, v.ctime_nsec)
             }
+            #[cfg(feature = "vnfs")]
             LsMeta::Vf(_) => UNIX_EPOCH,
         }
     }

@@ -984,6 +984,7 @@ fn display_item_long(
         // mount one xattr RPC per file. Only trust it when it was actually
         // requested and returned; otherwise probe locally.
         let is_acl_set = match item.metadata() {
+            #[cfg(feature = "vnfs")]
             Some(LsMeta::Vf(a)) if a.returned.contains(vnfs::AttrMask::NAMED_ATTR) => {
                 a.has_named_attr
             }
@@ -1386,6 +1387,7 @@ fn calculate_padding_collection(
                 let is_acl_set = false;
                 #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
                 let is_acl_set = match item.metadata() {
+                    #[cfg(feature = "vnfs")]
                     Some(LsMeta::Vf(a)) if a.returned.contains(vnfs::AttrMask::NAMED_ATTR) => {
                         a.has_named_attr
                     }
