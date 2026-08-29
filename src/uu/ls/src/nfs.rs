@@ -28,6 +28,26 @@ fn impl_choice() -> Option<&'static str> {
     }
 }
 
+/// Map a vectorized error to an `io::Error`, choosing an `ErrorKind` from the
+/// typed [`vnfs::VfError`] (transport vs. filesystem status) and keeping the
+/// operation index in the message.
+fn vf_io_error(e: vnfs::VfError) -> io::Error {
+    let kind = match &e {
+        vnfs::VfError::Transport { .. } => io::ErrorKind::ConnectionRefused,
+        vnfs::VfError::Op { err_no, .. } => match *err_no {
+            vnfs::ERR_NOENT => io::ErrorKind::NotFound,
+            vnfs::ERR_ACCES => io::ErrorKind::PermissionDenied,
+            vnfs::ERR_EXIST => io::ErrorKind::AlreadyExists,
+            vnfs::ERR_INVAL => io::ErrorKind::InvalidInput,
+            vnfs::ERR_NOTDIR => io::ErrorKind::NotADirectory,
+            vnfs::ERR_ISDIR => io::ErrorKind::IsADirectory,
+            _ => io::ErrorKind::Other,
+        },
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, e)
+}
+
 /// Attributes requested for every entry (all supported fields). The
 /// FATTR4_NAMED_ATTR boolean is only needed by the long format (for the `+`
 /// access-indicator), and costs the server a per-entry xattr enumeration, so
@@ -145,9 +165,7 @@ fn nfs_mountpoint(path: &Path) -> Option<PathBuf> {
 fn make_ctx(mountpoint: &Path) -> io::Result<VfContext> {
     let backend = match impl_choice() {
         Some("dummy") => Backend::Dummy(DummyVecFs::new(mountpoint.to_path_buf())),
-        Some("nfs") => Backend::Nfs(
-            NfsVecFs::connect("127.0.0.1").map_err(|e| io::Error::other(e.to_string()))?,
-        ),
+        Some("nfs") => Backend::Nfs(NfsVecFs::connect("127.0.0.1").map_err(vf_io_error)?),
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
     Ok(VfContext {
@@ -184,7 +202,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         let attrs = ctx
             .backend
             .listdir(&vpath, full_mask(config), 0, false)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            .map_err(vf_io_error)?;
 
         let mut out = Vec::with_capacity(attrs.len());
         for a in attrs {
@@ -242,7 +260,7 @@ pub fn try_walk_vf(
         let tree = ctx
             .backend
             .walk(&vpath, full_mask(config), &mut sort)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            .map_err(vf_io_error)?;
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             eprintln!(
                 "[profile] walk_ms={:.1}",

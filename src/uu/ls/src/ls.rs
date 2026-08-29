@@ -1770,6 +1770,17 @@ pub(crate) fn sort_vf_entries(entries: &mut [vnfs::VfAttrs], config: &Config) {
 fn vf_time(a: &vnfs::VfAttrs, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
     use std::time::Duration;
     use uucore::fsext::MetadataTimeField;
+    // Only trust a time field the backend actually returned; `walk` falls
+    // back to the epoch for missing ones.
+    let returned = match field {
+        MetadataTimeField::Modification => vnfs::AttrMask::MTIME,
+        MetadataTimeField::Access => vnfs::AttrMask::ATIME,
+        MetadataTimeField::Change => vnfs::AttrMask::CTIME,
+        MetadataTimeField::Birth => return None,
+    };
+    if !a.returned.contains(returned) {
+        return None;
+    }
     let (sec, nsec) = match field {
         MetadataTimeField::Modification => (a.mtime_sec, a.mtime_nsec),
         MetadataTimeField::Access => (a.atime_sec, a.atime_nsec),

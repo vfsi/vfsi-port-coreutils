@@ -981,9 +981,12 @@ fn display_item_long(
         #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
         // Vf-backed entries carry the per-object FATTR4_NAMED_ATTR boolean
         // fetched inline in the READDIR, so use it instead of probing the
-        // mount one xattr RPC per file.
+        // mount one xattr RPC per file. Only trust it when it was actually
+        // requested and returned; otherwise probe locally.
         let is_acl_set = match item.metadata() {
-            Some(LsMeta::Vf(a)) => a.has_named_attr,
+            Some(LsMeta::Vf(a)) if a.returned.contains(vnfs::AttrMask::NAMED_ATTR) => {
+                a.has_named_attr
+            }
             _ => has_acl(item.path()),
         };
         state
@@ -1383,7 +1386,9 @@ fn calculate_padding_collection(
                 let is_acl_set = false;
                 #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
                 let is_acl_set = match item.metadata() {
-                    Some(LsMeta::Vf(a)) => a.has_named_attr,
+                    Some(LsMeta::Vf(a)) if a.returned.contains(vnfs::AttrMask::NAMED_ATTR) => {
+                        a.has_named_attr
+                    }
                     _ => has_acl(item.path()),
                 };
                 if context_len > 1 || is_acl_set {
