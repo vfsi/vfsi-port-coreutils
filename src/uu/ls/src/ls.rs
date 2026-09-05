@@ -1507,17 +1507,12 @@ fn list_recursive_vf<O: LsOutput>(
                 .file
                 .path()
                 .and_then(|p| p.file_name())
-                .map(|f| f.to_string_lossy().into_owned())
+                .map(|f| f.to_os_string())
                 .unwrap_or_default();
-            if !should_display(std::ffi::OsStr::new(&name), config) {
+            if !should_display(&name, config) {
                 continue;
             }
-            entries.push(PathData::from_vf(
-                path.join(&name),
-                name.into(),
-                a.clone(),
-                config,
-            ));
+            entries.push(PathData::from_vf(path.join(&name), name, a.clone(), config));
         }
         sort_entries(&mut entries, config);
         write_directory_entries(&entries, config, output)?;
@@ -1525,7 +1520,7 @@ fn list_recursive_vf<O: LsOutput>(
             eprintln!(
                 "[profile]   dir{} {} entries={} sofar_ms={:.1}",
                 i,
-                w.path,
+                w.path.display(),
                 w.entries.len(),
                 t0.elapsed().as_secs_f64() * 1000.0
             );

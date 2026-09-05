@@ -81,7 +81,7 @@ enum Backend {
 impl Backend {
     fn listdir(
         &mut self,
-        dir: &str,
+        dir: &Path,
         masks: vnfs::AttrMask,
         max_count: usize,
         recursive: bool,
@@ -94,9 +94,9 @@ impl Backend {
 
     fn walk(
         &mut self,
-        root: &str,
+        root: &Path,
         masks: vnfs::AttrMask,
-        sort: &mut dyn FnMut(&str, &mut Vec<VfAttrs>),
+        sort: &mut dyn FnMut(&Path, &mut Vec<VfAttrs>),
     ) -> vnfs::VfResult<Vec<vnfs::WalkEntry>> {
         match self {
             Self::Dummy(f) => f.walk(root, masks, sort),
@@ -106,11 +106,11 @@ impl Backend {
 
     fn listdirv(
         &mut self,
-        dirs: &[&str],
+        dirs: &[&Path],
         masks: vnfs::AttrMask,
         max_entries: usize,
         recursive: bool,
-        cb: &mut dyn FnMut(&VfAttrs, &str) -> bool,
+        cb: &mut dyn FnMut(&VfAttrs, &Path) -> bool,
     ) -> vnfs::VfRes {
         match self {
             Self::Dummy(f) => f.listdirv(dirs, masks, max_entries, recursive, cb),
@@ -212,7 +212,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         let ctx = ctx.as_mut().unwrap();
 
         let rel = path.strip_prefix(&ctx.mountpoint).unwrap_or(path);
-        let vpath = format!("/{}", rel.to_string_lossy());
+        let vpath = Path::new("/").join(rel);
         let attrs = ctx
             .backend
             .listdir(&vpath, full_mask(config), 0, false)
@@ -224,11 +224,11 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
                 .file
                 .path()
                 .and_then(|p| p.file_name())
-                .map(|f| f.to_string_lossy().into_owned())
+                .map(|f| f.to_os_string())
                 .unwrap_or_default();
             out.push(LsDirEntry::Vf {
                 path: path.join(&name),
-                name: name.into(),
+                name,
                 attrs: a,
             });
         }
@@ -247,20 +247,20 @@ fn ctx_open_many(
     kernel_dirs: &[&Path],
     masks: vnfs::AttrMask,
 ) -> io::Result<Vec<Option<LsReadDir>>> {
-    let vpaths: Vec<String> = kernel_dirs
+    let vpaths: Vec<PathBuf> = kernel_dirs
         .iter()
         .map(|d| {
             let rel = d.strip_prefix(&ctx.mountpoint).unwrap_or(d);
-            format!("/{}", rel.to_string_lossy())
+            Path::new("/").join(rel)
         })
         .collect();
-    let refs: Vec<&str> = vpaths.iter().map(String::as_str).collect();
-    let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, v) in vpaths.iter().enumerate() {
-        slot.insert(v.clone(), i);
+    let refs: Vec<&Path> = vpaths.iter().map(PathBuf::as_path).collect();
+    let mut slot: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+    for (i, v) in refs.iter().enumerate() {
+        slot.insert(v.to_path_buf(), i);
     }
     let mut entries: Vec<Vec<VfAttrs>> = vec![Vec::new(); refs.len()];
-    let mut cb = |a: &VfAttrs, dir: &str| {
+    let mut cb = |a: &VfAttrs, dir: &Path| {
         if let Some(&i) = slot.get(dir) {
             entries[i].push(a.clone());
         }
@@ -287,11 +287,11 @@ fn ctx_open_many(
                 .file
                 .path()
                 .and_then(|p| p.file_name())
-                .map(|f| f.to_string_lossy().into_owned())
+                .map(|f| f.to_os_string())
                 .unwrap_or_default();
             list.push(LsDirEntry::Vf {
                 path: kernel_dirs[i].join(&name),
-                name: name.into(),
+                name,
                 attrs: attrs.clone(),
             });
         }
@@ -360,8 +360,8 @@ pub fn try_walk_vf(
         let ctx = ctx.as_mut().unwrap();
 
         let rel = path.strip_prefix(&ctx.mountpoint).unwrap_or(path);
-        let vpath = format!("/{}", rel.to_string_lossy());
-        let mut sort = |_dir: &str, attrs: &mut Vec<VfAttrs>| {
+        let vpath = Path::new("/").join(rel);
+        let mut sort = |_dir: &Path, attrs: &mut Vec<VfAttrs>| {
             crate::sort_vf_entries(attrs, config);
         };
         let t0 = std::time::Instant::now();
@@ -379,11 +379,8 @@ pub fn try_walk_vf(
         let mut out = Vec::with_capacity(tree.len());
         for mut w in tree {
             // Rewrite root-relative vnfs paths back to kernel paths.
-            w.path = ctx
-                .mountpoint
-                .join(w.path.trim_start_matches('/'))
-                .to_string_lossy()
-                .into_owned();
+            let rel = w.path.strip_prefix("/").unwrap_or(&w.path);
+            w.path = ctx.mountpoint.join(rel);
             out.push(w);
         }
         Ok(Some(out))
