@@ -1,6 +1,7 @@
 //! Optional VFSI data path for regular-file sources on an NFS mount.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -98,11 +99,19 @@ impl Backend {
             Self::Nfs(fs) => fs.readv(reads),
         }
     }
+
+    fn read_allv(&mut self, files: &[VfFile]) -> vnfs::VfResult<Vec<Vec<u8>>> {
+        match self {
+            Self::Dummy(fs) => fs.read_allv(files),
+            Self::Nfs(fs) => fs.read_allv(files),
+        }
+    }
 }
 
 struct Context {
     mount: Mount,
     backend: Backend,
+    prefetched: HashMap<PathBuf, Vec<u8>>,
 }
 
 thread_local! {
@@ -115,7 +124,105 @@ fn make_context(mount: Mount) -> io::Result<Context> {
         Some("nfs") => Backend::Nfs(NfsVecFs::connect(&mount.server).map_err(vf_io_error)?),
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
-    Ok(Context { mount, backend })
+    Ok(Context {
+        mount,
+        backend,
+        prefetched: HashMap::new(),
+    })
+}
+
+fn source_vf_path(source: &Path, mountpoint: &Path) -> io::Result<PathBuf> {
+    let absolute = source.canonicalize()?;
+    let relative = absolute
+        .strip_prefix(mountpoint)
+        .map_err(|_| io::Error::other("source is outside VFSI mount"))?;
+    Ok(Path::new("/").join(relative))
+}
+
+/// Prefetch a bounded group of command-line sources in a vectorized read.
+/// Large files stay on the streaming path so batching cannot consume
+/// unbounded memory.
+pub fn prepare_batch(sources: &[PathBuf]) -> io::Result<()> {
+    const DEFAULT_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_BATCH_FILES: usize = 4096;
+
+    if impl_choice().is_none() || sources.len() < 2 {
+        return Ok(());
+    }
+    let max_bytes = std::env::var("VNFS_CP_BATCH_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BATCH_BYTES);
+    if max_bytes == 0 {
+        return Ok(());
+    }
+
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    let mut selected_mount = None;
+    for source in sources {
+        if !seen.insert(source.clone()) {
+            continue;
+        }
+        let Ok(metadata) = source.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > max_bytes.saturating_sub(total) {
+            continue;
+        }
+        let Some(mount) = nfs_mount(source) else {
+            continue;
+        };
+        if selected_mount
+            .as_ref()
+            .is_some_and(|chosen| chosen != &mount)
+        {
+            continue;
+        }
+        selected_mount.get_or_insert_with(|| mount.clone());
+        total += metadata.len();
+        selected.push(source.clone());
+        if selected.len() == MAX_BATCH_FILES || total == max_bytes {
+            break;
+        }
+    }
+    if selected.len() < 2 {
+        return Ok(());
+    }
+    let mount = selected_mount.expect("selected VFSI sources have a mount");
+
+    CTX.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_none_or(|ctx| ctx.mount != mount) {
+            let Ok(context) = make_context(mount.clone()) else {
+                return Ok(());
+            };
+            *slot = Some(context);
+        }
+        let ctx = slot.as_mut().expect("VFSI context initialized");
+        let Ok(files): io::Result<Vec<VfFile>> = selected
+            .iter()
+            .map(|source| {
+                source_vf_path(source, &ctx.mount.point).map(|p| VfFile::from_os_path(&p))
+            })
+            .collect()
+        else {
+            return Ok(());
+        };
+        let Ok(contents) = ctx.backend.read_allv(&files) else {
+            return Ok(());
+        };
+        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+            eprintln!(
+                "[profile] cp_prefetch_files={} cp_prefetch_bytes={}",
+                selected.len(),
+                contents.iter().map(Vec::len).sum::<usize>()
+            );
+        }
+        ctx.prefetched.extend(selected.into_iter().zip(contents));
+        Ok(())
+    })
 }
 
 /// Read a regular file through VFSI and write it through the kernel. Keeping
@@ -134,8 +241,17 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<bool> {
             *slot = Some(make_context(source_mount.clone())?);
         }
         let ctx = slot.as_mut().expect("VFSI context initialized");
-        let source_rel = source.strip_prefix(&ctx.mount.point).unwrap_or(source);
-        let source_path = Path::new("/").join(source_rel);
+        if let Some(contents) = ctx.prefetched.remove(source) {
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(dest)?;
+            output.write_all(&contents)?;
+            return Ok(true);
+        }
+        let source_path = source_vf_path(source, &ctx.mount.point)?;
         let source_file = ctx
             .backend
             .open_readonly(&source_path)

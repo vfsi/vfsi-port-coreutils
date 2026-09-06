@@ -1447,6 +1447,16 @@ pub fn copy(sources: &[PathBuf], target: &Path, options: &Options) -> CopyResult
         None
     };
 
+    #[cfg(all(feature = "vnfs", unix))]
+    if !options.attributes_only
+        && matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
+        && options.reflink_mode != ReflinkMode::Always
+        && options.sparse_mode != SparseMode::Always
+        && options.dereference(true)
+    {
+        vfsi::prepare_batch(sources)?;
+    }
+
     for source in sources {
         let normalized_source = normalize_path(source);
         if options.backup == BackupMode::None && seen_sources.contains(&normalized_source) {
