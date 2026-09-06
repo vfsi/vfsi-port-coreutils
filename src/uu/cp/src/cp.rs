@@ -1454,7 +1454,7 @@ pub fn copy(sources: &[PathBuf], target: &Path, options: &Options) -> CopyResult
         && options.sparse_mode != SparseMode::Always
         && options.dereference(true)
     {
-        vfsi::prepare_batch(sources)?;
+        vfsi::prepare_batch(sources, target)?;
     }
 
     for source in sources {
@@ -2903,15 +2903,19 @@ fn copy_helper(
         #[cfg(unix)]
         let nofollow = !options.dereference(source_in_command_line);
         #[cfg(all(feature = "vnfs", unix))]
-        let copied_with_vfsi = !options.attributes_only
+        let vfsi_method = if !options.attributes_only
             && options.reflink_mode != ReflinkMode::Always
             && options.sparse_mode != SparseMode::Always
             && !nofollow
-            && vfsi::try_copy(source, dest)?;
+        {
+            vfsi::try_copy(source, dest)?
+        } else {
+            None
+        };
         #[cfg(not(all(feature = "vnfs", unix)))]
-        let copied_with_vfsi = false;
+        let vfsi_method: Option<&str> = None;
 
-        let copy_debug = if copied_with_vfsi {
+        let copy_debug = if vfsi_method.is_some() {
             None
         } else {
             Some(copy_on_write(
@@ -2931,8 +2935,8 @@ fn copy_helper(
             if let Some(copy_debug) = copy_debug {
                 show_debug(&copy_debug)
                     .map_err(|e| CpError::IoErrContext(e, translate!("cp-error-write")))?;
-            } else {
-                println!("copy offload: vfsi");
+            } else if let Some(method) = vfsi_method {
+                println!("copy offload: {method}");
             }
         }
     }
