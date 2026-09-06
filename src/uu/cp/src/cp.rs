@@ -49,6 +49,8 @@ use crate::copydir::copy_directory;
 
 mod copydir;
 mod platform;
+#[cfg(all(feature = "vnfs", unix))]
+mod vfsi;
 
 #[derive(Debug, Error)]
 pub enum CpError {
@@ -2890,21 +2892,38 @@ fn copy_helper(
         // applying O_NOFOLLOW here only with `-P`.
         #[cfg(unix)]
         let nofollow = !options.dereference(source_in_command_line);
-        let copy_debug = copy_on_write(
-            source,
-            dest,
-            options.reflink_mode,
-            options.sparse_mode,
-            context,
-            #[cfg(unix)]
-            is_stream(source_metadata),
-            #[cfg(unix)]
-            nofollow,
-        )?;
+        #[cfg(all(feature = "vnfs", unix))]
+        let copied_with_vfsi = !options.attributes_only
+            && options.reflink_mode != ReflinkMode::Always
+            && options.sparse_mode != SparseMode::Always
+            && !nofollow
+            && vfsi::try_copy(source, dest)?;
+        #[cfg(not(all(feature = "vnfs", unix)))]
+        let copied_with_vfsi = false;
+
+        let copy_debug = if copied_with_vfsi {
+            None
+        } else {
+            Some(copy_on_write(
+                source,
+                dest,
+                options.reflink_mode,
+                options.sparse_mode,
+                context,
+                #[cfg(unix)]
+                is_stream(source_metadata),
+                #[cfg(unix)]
+                nofollow,
+            )?)
+        };
 
         if !options.attributes_only && options.debug {
-            show_debug(&copy_debug)
-                .map_err(|e| CpError::IoErrContext(e, translate!("cp-error-write")))?;
+            if let Some(copy_debug) = copy_debug {
+                show_debug(&copy_debug)
+                    .map_err(|e| CpError::IoErrContext(e, translate!("cp-error-write")))?;
+            } else {
+                println!("copy offload: vfsi");
+            }
         }
     }
 

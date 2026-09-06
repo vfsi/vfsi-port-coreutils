@@ -36,6 +36,7 @@ indicatif = { workspace = true }
 thiserror = { workspace = true }
 fluent = { workspace = true }
 rustix = { workspace = true }
+vnfs = { path = "/home/ubuntu/vnfs/vnfs", optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 selinux = { workspace = true, optional = true }
@@ -67,6 +68,7 @@ harness = false
 
 [features]
 feat_selinux = ["selinux", "uucore/selinux"]
+vnfs = ["dep:vnfs"]
 
 [lints]
 workspace = true
