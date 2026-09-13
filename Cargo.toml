@@ -78,6 +78,8 @@ feat_vnfs = [
   "cp?/vnfs",
   "dir?/vnfs",
   "ls?/vnfs",
+  "rm?/vnfs",
+  "rmdir?/vnfs",
   "vdir?/vnfs",
 ]
 ## Optional feature for stdbuf

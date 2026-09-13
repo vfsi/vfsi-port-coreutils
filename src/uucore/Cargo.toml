@@ -44,6 +44,7 @@ rustix = { workspace = true, features = ["fs", "net", "pipe", "process"] }
 unicode-width = { workspace = true }
 unit-prefix = { workspace = true, optional = true }
 uucore_procs = { workspace = true }
+vnfs = { workspace = true, optional = true }
 z85 = { workspace = true, optional = true }
 
 # Benchmark dependencies (optional)
@@ -218,6 +219,7 @@ update-control = ["parser"]
 utf8 = []
 utmpx = ["time", "time/macros", "libc", "dns-lookup"]
 version-cmp = []
+vnfs = ["dep:vnfs"]
 wide = []
 tty = []
 time = ["jiff"]

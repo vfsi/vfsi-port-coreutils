@@ -22,6 +22,9 @@ uucore = { workspace = true, features = ["fs"] }
 libc = { workspace = true }
 fluent = { workspace = true }
 
+[features]
+vnfs = ["uucore/vnfs"]
+
 [lints]
 workspace = true
 

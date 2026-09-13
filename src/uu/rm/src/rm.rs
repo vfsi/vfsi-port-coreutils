@@ -679,6 +679,11 @@ fn remove_dir_recursive(
         return false;
     }
 
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+    if vnfs_removal_allowed(options) && uucore::vnfs::try_remove(path, true) {
+        return false;
+    }
+
     // Use secure traversal on Unix (except Redox) for all recursive directory removals
     #[cfg(all(unix, not(target_os = "redox")))]
     {
@@ -839,6 +844,11 @@ fn remove_dir(path: &Path, options: &Options, progress_bar: Option<&ProgressBar>
         return true;
     }
 
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+    if vnfs_removal_allowed(options) && uucore::vnfs::try_remove(path, false) {
+        return false;
+    }
+
     // Use safe traversal on Unix (except Redox) for empty directory removal
     #[cfg(all(unix, not(target_os = "redox")))]
     {
@@ -858,6 +868,11 @@ fn remove_dir(path: &Path, options: &Options, progress_bar: Option<&ProgressBar>
 
 fn remove_file(path: &Path, options: &Options, progress_bar: Option<&ProgressBar>) -> bool {
     if prompt_file(path, options) {
+        #[cfg(all(feature = "vnfs", target_os = "linux"))]
+        if vnfs_removal_allowed(options) && uucore::vnfs::try_remove(path, false) {
+            return false;
+        }
+
         // Update progress bar before removing the file
         if let Some(pb) = progress_bar {
             pb.inc(1);
@@ -892,6 +907,15 @@ fn remove_file(path: &Path, options: &Options, progress_bar: Option<&ProgressBar
     }
 
     false
+}
+
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+fn vnfs_removal_allowed(options: &Options) -> bool {
+    options.interactive == InteractiveMode::Never
+        && !options.one_fs
+        && !options.preserve_root_all
+        && !options.verbose
+        && !options.progress
 }
 
 fn prompt_dir(path: &Path, options: &Options) -> bool {
@@ -1122,6 +1146,30 @@ fn is_symlink_dir(metadata: &Metadata) -> bool {
 }
 
 mod tests {
+
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+    #[test]
+    fn test_vnfs_removal_requires_simple_non_interactive_mode() {
+        use crate::{InteractiveMode, Options, vnfs_removal_allowed};
+
+        let mut options = Options::default();
+        assert!(!vnfs_removal_allowed(&options));
+
+        options.interactive = InteractiveMode::Never;
+        assert!(vnfs_removal_allowed(&options));
+
+        options.one_fs = true;
+        assert!(!vnfs_removal_allowed(&options));
+        options.one_fs = false;
+        options.preserve_root_all = true;
+        assert!(!vnfs_removal_allowed(&options));
+        options.preserve_root_all = false;
+        options.verbose = true;
+        assert!(!vnfs_removal_allowed(&options));
+        options.verbose = false;
+        options.progress = true;
+        assert!(!vnfs_removal_allowed(&options));
+    }
 
     #[test]
     // Testing whether path the `/////` collapses to `/`

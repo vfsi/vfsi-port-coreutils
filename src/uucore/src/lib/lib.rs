@@ -122,6 +122,8 @@ pub use crate::features::signals;
     feature = "utmpx"
 ))]
 pub use crate::features::utmpx;
+#[cfg(all(target_os = "linux", feature = "vnfs"))]
+pub use crate::features::vnfs;
 // ** windows-only
 #[cfg(all(windows, feature = "wide"))]
 pub use crate::features::wide;

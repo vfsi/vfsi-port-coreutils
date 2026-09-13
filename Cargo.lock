@@ -4645,6 +4645,7 @@ dependencies = [
  "unit-prefix",
  "utmp-classic",
  "uucore_procs",
+ "vnfs",
  "walkdir",
  "wild",
  "winapi-util",

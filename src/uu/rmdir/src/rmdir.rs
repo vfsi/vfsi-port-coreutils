@@ -117,6 +117,17 @@ fn remove_single(path: &Path, opts: Opts) -> Result<(), Error<'_>> {
             translate!("rmdir-verbose-removing-directory", "util_name" => "rmdir", "path" => path.quote())
         );
     }
+
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+    if !uucore::fs::path_ends_with_terminator(path)
+        && path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
+        && uucore::vnfs::try_remove(path, false)
+    {
+        return Ok(());
+    }
+
     remove_dir(path).map_err(|error| Error { error, path })
 }
 

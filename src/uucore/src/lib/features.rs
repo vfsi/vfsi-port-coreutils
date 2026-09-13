@@ -92,6 +92,8 @@ pub mod safe_copy;
 pub mod safe_traversal;
 #[cfg(all(target_os = "linux", feature = "tty"))]
 pub mod tty;
+#[cfg(all(target_os = "linux", feature = "vnfs"))]
+pub mod vnfs;
 
 #[cfg(all(unix, feature = "fsxattr"))]
 pub mod fsxattr;
