@@ -21,6 +21,9 @@ clap = { workspace = true, features = ["env"] }
 uucore = { workspace = true, features = ["entries", "fs", "quoting-style"] }
 uu_ls = { workspace = true }
 
+[features]
+vnfs = ["uu_ls/vnfs"]
+
 [lints]
 workspace = true
 

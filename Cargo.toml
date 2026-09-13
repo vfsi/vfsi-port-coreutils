@@ -71,6 +71,15 @@ uudoc = [
 # crate declares is there for building that crate on its own, and is
 # deliberately not listed here.
 feat_diagnostics = ["uucore/diagnostics"]
+# Enable vectorized NFS paths in the filesystem utilities that provide them.
+# The conditional dependency syntax keeps this feature from selecting utilities
+# that were otherwise omitted from a custom multicall build.
+feat_vnfs = [
+  "cp?/vnfs",
+  "dir?/vnfs",
+  "ls?/vnfs",
+  "vdir?/vnfs",
+]
 ## Optional feature for stdbuf
 # "feat_external_libstdbuf" == use an external libstdbuf.so for stdbuf instead of embedding it
 feat_external_libstdbuf = ["stdbuf/feat_external_libstdbuf"]
