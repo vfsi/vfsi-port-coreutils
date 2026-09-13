@@ -25,7 +25,7 @@ lscolors = { workspace = true }
 rustc-hash = { workspace = true }
 terminal_size = { workspace = true }
 thiserror = { workspace = true }
-vnfs = { path = "/home/ubuntu/vnfs/vnfs", optional = true }
+vnfs = { workspace = true, optional = true }
 uucore = { workspace = true, features = [
   "colors",
   "entries",
