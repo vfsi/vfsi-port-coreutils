@@ -62,6 +62,9 @@ skip = [
   { name = "thiserror", version = "1.0.69" },
   # thiserror
   { name = "thiserror-impl", version = "1.0.69" },
+  # libntirpc-sys (vnfs)
+  { name = "bindgen", version = "0.72.1" },
+  { name = "prettyplease", version = "0.2.37" },
   # bindgen
   { name = "itertools", version = "0.13.0" },
   # codspeed-divan-compat-macros
