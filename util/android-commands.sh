@@ -551,15 +551,19 @@ sync_host() {
     repo="$1"
     cache_home="${HOME}/${cache_dir_name}"
     cache_dest="$dev_home_dir/${cache_dir_name}"
+    repo_dest="$dev_home_dir/coreutils"
 
-    reinit_ssh_connection
+    reinit_ssh_connection || return
 
     echo "Running sync host -> image: ${repo}"
 
-    # run_command_via_ssh "mkdir $dev_home_dir/coreutils"
-
-    copy_file_or_dir_to_device_via_ssh "$repo" "$dev_home_dir"
-    [[ -e "$cache_home" ]] && copy_file_or_dir_to_device_via_ssh "$cache_home" "$cache_dest"
+    # Keep the on-device checkout name stable even when the GitHub repository
+    # is named something other than upstream's `coreutils`.
+    run_command_via_ssh "rm -rf '$repo_dest'" || return
+    copy_file_or_dir_to_device_via_ssh "$repo" "$repo_dest" || return
+    if [[ -e "$cache_home" ]]; then
+        copy_file_or_dir_to_device_via_ssh "$cache_home" "$cache_dest" || return
+    fi
 
     echo "Finished sync host -> image: ${repo}"
 }
