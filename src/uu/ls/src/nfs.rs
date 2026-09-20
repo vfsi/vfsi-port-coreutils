@@ -13,8 +13,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::meta::{LsDirEntry, LsReadDir};
-use vnfs::dummy_vecfs::DummyVecFs;
-use vnfs::nfs::NfsVecFs;
+use vnfs::DummyVecFs;
+use vnfs::NfsVecFs;
 use vnfs::{VecFs, VfAttrs};
 
 /// Runtime backend selection. `VNFS_IMPL=off` (or unset) uses `std::fs`;
@@ -128,7 +128,7 @@ struct VfContext {
 impl Drop for VfContext {
     fn drop(&mut self) {
         if std::env::var("VNFS_STATS").as_deref() == Ok("1") {
-            let (n, ops, bytes, max) = vnfs::compound::compound_stats();
+            let (n, ops, bytes, max) = vnfs::legacy::compound::compound_stats();
             if n > 0 {
                 eprintln!(
                     "[vnfs] compounds={} avg_ops={:.2} max_ops={} avg_bytes={:.0} total_bytes={}",
@@ -139,7 +139,7 @@ impl Drop for VfContext {
                     bytes
                 );
             }
-            let (calls, us) = vnfs::compound::rpc_stats();
+            let (calls, us) = vnfs::legacy::compound::rpc_stats();
             if calls > 0 {
                 eprintln!(
                     "[vnfs] rpc_calls={} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
@@ -270,7 +270,10 @@ fn ctx_open_many(
     if let Err(e) = ctx.backend.listdirv(&refs, masks, 0, false, &mut cb) {
         // The prefix before the failing index was collected; the failing
         // directory and the rest fall back to per-directory opens.
-        let i = e.index().min(available.len().saturating_sub(1));
+        let i = e
+            .index_opt()
+            .unwrap_or(0)
+            .min(available.len().saturating_sub(1));
         for a in available.iter_mut().skip(i) {
             *a = false;
         }

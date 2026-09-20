@@ -511,7 +511,7 @@ unicode-width = "0.2.0"
 unit-prefix = "0.5"
 utmp-classic = "0.1.6"
 uutils_term_grid = "0.8"
-vnfs = "=0.0.11"
+vnfs = { version = "=0.0.13", features = ["dummy"] }
 walkdir = "2.5"
 wild = "2.2.1"
 winapi-util = "0.1.8"

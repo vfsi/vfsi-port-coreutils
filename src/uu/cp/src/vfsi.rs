@@ -7,8 +7,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use vnfs::dummy_vecfs::DummyVecFs;
-use vnfs::nfs::NfsVecFs;
+use vnfs::DummyVecFs;
+use vnfs::NfsVecFs;
 use vnfs::{ExtentPair, ReadOp, VecFs, VfFile, VfPathBase};
 
 const READ_ALL_FILES_PER_BATCH: usize = 8;
