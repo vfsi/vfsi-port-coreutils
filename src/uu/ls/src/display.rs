@@ -13,6 +13,8 @@ use std::fmt::Display;
 #[cfg(unix)]
 #[cfg(windows)]
 use std::fs::Metadata;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 /// Show the directory name in the case where several arguments are given to ls
@@ -20,7 +22,7 @@ use std::{borrow::Cow, iter};
 use std::{
     ffi::{OsStr, OsString},
     fmt::Write as FmtWrite,
-    fs::{self},
+    fs::{self, DirEntry},
     io::{BufWriter, Stdout, Write},
 };
 
@@ -312,6 +314,21 @@ pub fn should_display(file_name: &OsStr, config: &Config) -> bool {
         .ignore_patterns
         .iter()
         .any(|p| p.matches_with(&file_name, options))
+}
+
+/// Apply the platform's native hidden-file rules before the common
+/// filename and ignore-pattern filtering.
+pub fn should_display_dir_entry(entry: &DirEntry, config: &Config) -> bool {
+    #[cfg(windows)]
+    if config.files == Files::Normal
+        && entry
+            .metadata()
+            .is_ok_and(|metadata| metadata.file_attributes() & 0x2 != 0)
+    {
+        return false;
+    }
+
+    should_display(entry.file_name().as_os_str(), config)
 }
 
 fn display_dir_entry_size(

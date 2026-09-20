@@ -60,7 +60,7 @@ use colors::StyleManager;
 use config::options::QUOTING_STYLE;
 use config::{Dereference, Files, Sort};
 use dired::DiredOutput;
-use display::{display_items, display_size, should_display, show_dir_name};
+use display::{display_items, display_size, should_display_dir_entry, show_dir_name};
 use meta::{LsDirEntry, LsFileType, LsMeta, LsReadDir};
 
 #[derive(Error, Debug)]
@@ -1386,7 +1386,7 @@ fn collect_directory_entries<O: LsOutput>(
                 show!(LsError::IOError(err));
             }
             Ok(LsDirEntry::Std(dir_entry)) => {
-                if should_display(dir_entry.file_name().as_os_str(), config) {
+                if should_display_dir_entry(&dir_entry, config) {
                     entries.push(PathData::new(
                         dir_entry.path().into(),
                         Some(dir_entry),
@@ -1399,7 +1399,7 @@ fn collect_directory_entries<O: LsOutput>(
             }
             #[cfg(feature = "vnfs")]
             Ok(LsDirEntry::Vf { path, name, attrs }) => {
-                if should_display(name.as_os_str(), config) {
+                if display::should_display(name.as_os_str(), config) {
                     entries.push(PathData::from_vf(path, name, attrs, config));
                 }
             }
@@ -1484,7 +1484,7 @@ fn list_recursive_vf<O: LsOutput>(
         }
         if rel
             .components()
-            .any(|c| !should_display(c.as_os_str(), config))
+            .any(|c| !display::should_display(c.as_os_str(), config))
         {
             skip_until = Some(depth);
             continue;
@@ -1519,7 +1519,7 @@ fn list_recursive_vf<O: LsOutput>(
                 .and_then(|p| p.file_name())
                 .map(OsStr::to_os_string)
                 .unwrap_or_default();
-            if !should_display(&name, config) {
+            if !display::should_display(&name, config) {
                 continue;
             }
             entries.push(PathData::from_vf(path.join(&name), name, a.clone(), config));
