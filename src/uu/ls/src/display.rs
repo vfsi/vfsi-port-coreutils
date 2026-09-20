@@ -45,7 +45,7 @@ use uucore::libc::{dev_t, major, minor};
 use uucore::{
     error::UResult,
     format::human::human_readable,
-    fs::display_permissions_unix,
+    fs::{display_permissions, display_permissions_unix},
     fsext::MetadataTimeField,
     i18n::{UEncoding, get_ctype_encoding},
     os_str_as_bytes_lossy,
@@ -686,9 +686,9 @@ fn display_group(_metadata: &LsMeta, config: &Config, _gid_cache: &mut ()) -> &'
 /// Like `uucore::fsext::metadata_get_time` but for `LsMeta`.
 fn lsmeta_get_time(meta: &LsMeta, md_time: MetadataTimeField) -> Option<SystemTime> {
     match md_time {
-        MetadataTimeField::Change => Some(meta.ctime()),
-        MetadataTimeField::Modification => Some(meta.mtime()),
-        MetadataTimeField::Access => Some(meta.atime()),
+        MetadataTimeField::Change => meta.ctime(),
+        MetadataTimeField::Modification => meta.mtime(),
+        MetadataTimeField::Access => meta.atime(),
         MetadataTimeField::Birth => meta.as_std_metadata().and_then(|m| m.created().ok()),
     }
 }
@@ -1022,9 +1022,12 @@ fn display_item_long(
             }
             _ => has_acl(item.path(), item.must_dereference),
         };
-        state
-            .display_buf
-            .extend(display_permissions_unix(md.mode(), true).as_bytes());
+        let permissions = match md {
+            LsMeta::Std(metadata) => display_permissions(metadata, true),
+            #[cfg(feature = "vnfs")]
+            LsMeta::Vf(_) => display_permissions_unix(md.mode(), true),
+        };
+        state.display_buf.extend(permissions.as_bytes());
         if padding.permissions > PERMISSIONS_WIDTH {
             state
                 .display_buf

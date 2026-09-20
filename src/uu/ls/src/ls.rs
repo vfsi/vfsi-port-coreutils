@@ -1832,9 +1832,9 @@ fn vf_time(a: &vnfs::VfAttrs, field: uucore::fsext::MetadataTimeField) -> Option
 fn ls_time(md: &LsMeta, md_time: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
     use uucore::fsext::MetadataTimeField;
     match md_time {
-        MetadataTimeField::Change => Some(md.ctime()),
-        MetadataTimeField::Modification => Some(md.mtime()),
-        MetadataTimeField::Access => Some(md.atime()),
+        MetadataTimeField::Change => md.ctime(),
+        MetadataTimeField::Modification => md.mtime(),
+        MetadataTimeField::Access => md.atime(),
         MetadataTimeField::Birth => md.as_std_metadata().and_then(|m| m.created().ok()),
     }
 }

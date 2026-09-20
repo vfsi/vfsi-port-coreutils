@@ -21,6 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 #[cfg(unix)]
 fn is_block_device(file_type: std::fs::FileType) -> bool {
@@ -67,7 +69,12 @@ fn std_nlink(metadata: &std::fs::Metadata) -> u64 {
     metadata.nlink()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn std_nlink(metadata: &std::fs::Metadata) -> u64 {
+    metadata.number_of_links().unwrap_or(1).into()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn std_nlink(_: &std::fs::Metadata) -> u64 {
     1
 }
@@ -107,7 +114,12 @@ fn std_ino(metadata: &std::fs::Metadata) -> u64 {
     metadata.ino()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn std_ino(metadata: &std::fs::Metadata) -> u64 {
+    metadata.file_index().unwrap_or(0)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn std_ino(_: &std::fs::Metadata) -> u64 {
     0
 }
@@ -133,13 +145,17 @@ fn std_mode(_: &std::fs::Metadata) -> u32 {
 }
 
 #[cfg(unix)]
-fn std_ctime(metadata: &std::fs::Metadata) -> SystemTime {
-    LsMeta::secs_nsecs(metadata.ctime(), metadata.ctime_nsec() as u32)
+#[allow(clippy::unnecessary_wraps)]
+fn std_ctime(metadata: &std::fs::Metadata) -> Option<SystemTime> {
+    Some(LsMeta::secs_nsecs(
+        metadata.ctime(),
+        metadata.ctime_nsec() as u32,
+    ))
 }
 
 #[cfg(not(unix))]
-fn std_ctime(metadata: &std::fs::Metadata) -> SystemTime {
-    metadata.created().unwrap_or(UNIX_EPOCH)
+fn std_ctime(_: &std::fs::Metadata) -> Option<SystemTime> {
+    None
 }
 
 /// A coarse file type, derived from `std::fs::FileType` or an NFSv4 type code.
@@ -326,39 +342,39 @@ impl LsMeta {
         self.file_type().is_dir()
     }
 
-    pub fn mtime(&self) -> SystemTime {
+    pub fn mtime(&self) -> Option<SystemTime> {
         match self {
-            Self::Std(m) => m.modified().unwrap_or(UNIX_EPOCH),
+            Self::Std(m) => m.modified().ok(),
             #[cfg(feature = "vnfs")]
             Self::Vf(v) if v.returned.contains(vnfs::AttrMask::MTIME) => {
-                Self::secs_nsecs(v.mtime_sec, v.mtime_nsec)
+                Some(Self::secs_nsecs(v.mtime_sec, v.mtime_nsec))
             }
             #[cfg(feature = "vnfs")]
-            Self::Vf(_) => UNIX_EPOCH,
+            Self::Vf(_) => None,
         }
     }
 
-    pub fn atime(&self) -> SystemTime {
+    pub fn atime(&self) -> Option<SystemTime> {
         match self {
-            Self::Std(m) => m.accessed().unwrap_or(UNIX_EPOCH),
+            Self::Std(m) => m.accessed().ok(),
             #[cfg(feature = "vnfs")]
             Self::Vf(v) if v.returned.contains(vnfs::AttrMask::ATIME) => {
-                Self::secs_nsecs(v.atime_sec, v.atime_nsec)
+                Some(Self::secs_nsecs(v.atime_sec, v.atime_nsec))
             }
             #[cfg(feature = "vnfs")]
-            Self::Vf(_) => UNIX_EPOCH,
+            Self::Vf(_) => None,
         }
     }
 
-    pub fn ctime(&self) -> SystemTime {
+    pub fn ctime(&self) -> Option<SystemTime> {
         match self {
             Self::Std(m) => std_ctime(m),
             #[cfg(feature = "vnfs")]
             Self::Vf(v) if v.returned.contains(vnfs::AttrMask::CTIME) => {
-                Self::secs_nsecs(v.ctime_sec, v.ctime_nsec)
+                Some(Self::secs_nsecs(v.ctime_sec, v.ctime_nsec))
             }
             #[cfg(feature = "vnfs")]
-            Self::Vf(_) => UNIX_EPOCH,
+            Self::Vf(_) => None,
         }
     }
 
