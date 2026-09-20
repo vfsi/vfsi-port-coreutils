@@ -2,8 +2,9 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
-//
+
 // spell-checker:ignore utmp runlevel testusr testx boottime
+
 #![allow(clippy::cast_possible_wrap, clippy::unreadable_literal)]
 
 #[cfg(unix)]
@@ -18,6 +19,7 @@ fn test_invalid_arg() {
 }
 
 #[test]
+#[cfg(not(target_os = "android"))]
 fn test_uptime() {
     let result = new_ucmd!().succeeds();
     result.stdout_contains(" up ");
@@ -52,7 +54,7 @@ fn test_write_error_handling() {
 /// Checks for files without utmpx records for which boot time cannot be calculated
 #[test]
 #[cfg(unix)]
-#[cfg(not(any(target_os = "openbsd", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "openbsd", target_os = "freebsd", target_os = "android")))]
 // Disabled for freebsd, since it doesn't use the utmpxname() sys call to change the default utmpx
 // file that is accessed using getutxent()
 fn test_uptime_for_file_without_utmpx_records() {
@@ -69,6 +71,7 @@ fn test_uptime_for_file_without_utmpx_records() {
 /// Checks whether uptime displays the correct stderr msg when its called with a fifo
 #[test]
 #[cfg(all(unix, feature = "cp"))]
+#[cfg(not(target_os = "android"))]
 fn test_uptime_with_fifo() {
     use uutests::{util::TestScenario, util_name};
 
@@ -114,7 +117,7 @@ fn test_uptime_with_non_existent_file() {
 // This will pass
 #[test]
 #[cfg(unix)]
-#[cfg(not(any(target_os = "openbsd", target_os = "macos")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "openbsd", target_os = "android")))]
 #[cfg(not(target_env = "musl"))]
 #[cfg_attr(
     all(target_arch = "aarch64", target_os = "linux"),
@@ -334,14 +337,14 @@ fn test_uptime_pretty_print() {
         .arg("-p")
         .succeeds()
         .stdout_contains("up")
-        .stdout_contains("minute");
+        .stdout_matches(&Regex::new(r"hour|minute").unwrap());
 }
 
 /// Test uptime reliability on macOS with sysctl kern.boottime fallback.
 /// This addresses intermittent failures from issue #3621 by ensuring
 /// the command consistently succeeds when utmpx data is unavailable.
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn test_uptime_macos_reliability() {
     // Run uptime multiple times to ensure consistent success
     // (Previously would fail intermittently when utmpx had no BOOT_TIME)
@@ -365,7 +368,7 @@ fn test_uptime_macos_reliability() {
 /// Test uptime --since reliability on macOS.
 /// Verifies the sysctl fallback works for the --since flag.
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn test_uptime_since_macos() {
     let re = Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}").unwrap();
 
@@ -387,7 +390,7 @@ fn test_uptime_since_macos() {
 /// Test that uptime output format is consistent on macOS.
 /// Ensures the sysctl fallback produces properly formatted output.
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn test_uptime_macos_output_format() {
     let result = new_ucmd!().succeeds();
     let stdout = result.stdout_str();

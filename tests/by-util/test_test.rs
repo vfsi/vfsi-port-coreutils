@@ -464,6 +464,8 @@ fn test_file_is_itself() {
 
 #[test]
 #[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
+// Disabled for android, since the temp dir doesn't allow creating hard links
+#[cfg(not(target_os = "android"))]
 fn test_hard_link_is_same_file() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.hard_link("regular_file", "hard_link");
@@ -683,6 +685,26 @@ fn test_file_is_executable_windows() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.touch("PROGRAM.EXE");
     ucmd.args(&["-x", "PROGRAM.EXE"]).succeeds();
+}
+
+#[test]
+#[cfg(windows)]
+fn test_file_is_executable_from_pathext_windows() {
+    let scenario = TestScenario::new(util_name!());
+    scenario.fixtures.touch("script.Py");
+    scenario.fixtures.touch("program.exe");
+
+    scenario
+        .ucmd()
+        .env("PATHEXT", ".PY")
+        .args(&["-x", "script.Py"])
+        .succeeds();
+
+    scenario
+        .ucmd()
+        .env("PATHEXT", ".PY")
+        .args(&["!", "-x", "program.exe"])
+        .succeeds();
 }
 
 #[test]
@@ -1138,9 +1160,38 @@ fn test_filename_or_with_equal() {
 }
 
 #[test]
-#[ignore = "GNU considers this an error"]
 fn test_string_length_and_nothing() {
     new_ucmd!().args(&["-n", "a", "-a"]).fails_with_code(2);
+}
+
+#[test]
+fn test_boolop_without_right_operand() {
+    for op in ["-a", "-o"] {
+        new_ucmd!()
+            .args(&["x", op])
+            .fails_with_code(2)
+            .stderr_is(format!("test: missing argument after '{op}'\n"));
+
+        // An empty left operand is still an operand.
+        new_ucmd!().args(&["", op]).fails_with_code(2);
+
+        // Whatever precedes it, the trailing BOOLOP has nothing to join to.
+        new_ucmd!().args(&["x", "-a", "y", op]).fails_with_code(2);
+        new_ucmd!().args(&["(", "x", ")", op]).fails_with_code(2);
+        new_ucmd!().args(&["!", "x", op]).fails_with_code(2);
+    }
+}
+
+#[test]
+fn test_lone_boolop_is_a_string() {
+    // With no operand on either side, -a and -o are ordinary strings.
+    for op in ["-a", "-o"] {
+        new_ucmd!().arg(op).succeeds();
+        new_ucmd!().args(&["!", op]).fails_with_code(1);
+    }
+
+    // A unary operator still takes the BOOLOP as its operand.
+    new_ucmd!().args(&["-n", "-a"]).succeeds();
 }
 
 #[test]

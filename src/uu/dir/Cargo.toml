@@ -23,6 +23,7 @@ uu_ls = { workspace = true }
 
 [features]
 vnfs = ["uu_ls/vnfs"]
+diagnostics = ["uucore/diagnostics"]
 
 [lints]
 workspace = true

@@ -2,7 +2,9 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore lowre punct aabbaa aabbcc aabc abbb abbbcddd abcc abcdefabcdef abcdefghijk abcdefghijklmn abcdefghijklmnop ABCDEFGHIJKLMNOPQRS abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFZZ abcxyz ABCXYZ abcxyzabcxyz ABCXYZABCXYZ acbdef alnum amzamz AMZXAMZ bbbd cclass cefgm cntrl compl dabcdef dncase fooclass Gzabcdefg PQRST upcase wxyzz xdigit XXXYYY xycde xyyye xyyz xyzzzzxyzzzz ZABCDEF Zamz Cdefghijkl Cdefghijklmn asdfqqwweerr qwerr asdfqwer qwer aassddffqwer asdfqwer
+
 use uutests::at_and_ucmd;
 use uutests::new_ucmd;
 
@@ -729,7 +731,7 @@ fn tr_delete_xdigit_all() {
         .args(&["-d", "[:xdigit:]"])
         .pipe_in("0123456789acbdefABCDEF")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -747,7 +749,7 @@ fn tr_delete_digit_all() {
         .args(&["-d", "[:digit:]"])
         .pipe_in("0123456789")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -765,7 +767,7 @@ fn tr_delete_lower_all() {
         .args(&["-d", "[:lower:]"])
         .pipe_in("abcdefghijklmnopqrstuvwxyz")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -774,7 +776,7 @@ fn tr_delete_upper_all() {
         .args(&["-d", "[:upper:]"])
         .pipe_in("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -783,7 +785,7 @@ fn tr_delete_alpha_all() {
         .args(&["-d", "[:lower:][:upper:]"])
         .pipe_in("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -792,7 +794,7 @@ fn tr_delete_alnum_all() {
         .args(&["-d", "[:alpha:]"])
         .pipe_in("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -801,7 +803,7 @@ fn tr_delete_space_class() {
         .args(&["-d", "[:alnum:]"])
         .pipe_in("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -1081,7 +1083,7 @@ fn tr_ross_translate_complement_squeeze() {
         .args(&["-cs", "[:upper:][:digit:]", "[Z*]"])
         .pipe_in("")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -1108,7 +1110,7 @@ fn tr_ross_translate_overlong() {
         .args(&["-dcs", "[:alnum:]", "[:digit:]"])
         .pipe_in("")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -1117,7 +1119,7 @@ fn tr_ross_translate_squeeze_overlong() {
         .args(&["-dc", "[:lower:]"])
         .pipe_in("")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -1126,7 +1128,7 @@ fn tr_ross_translate_squeeze_delete() {
         .args(&["-dc", "[:upper:]"])
         .pipe_in("")
         .succeeds()
-        .stdout_is("");
+        .no_output();
 }
 
 #[test]
@@ -1586,19 +1588,26 @@ fn test_broken_pipe_no_error() {
 #[cfg(unix)]
 #[test]
 fn test_stdin_is_socket() {
+    use std::fs::File;
     use std::io::Write as _;
 
-    let (fd1, fd2) = rustix::net::socketpair(
-        rustix::net::AddressFamily::UNIX,
-        rustix::net::SocketType::STREAM,
-        rustix::net::SocketFlags::empty(),
-        None,
-    )
+    let (mut writer, reader): (File, File) = {
+        rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::empty(),
+            None,
+        )
+        .map(|(fd0, fd1)| (fd0.into(), fd1.into()))
+    }
     .unwrap();
-    std::fs::File::from(fd1).write_all(b"::").unwrap();
+
+    writer.write_all(b"::").unwrap();
+    drop(writer);
+
     new_ucmd!()
         .args(&[":", ";"])
-        .set_stdin(fd2)
+        .set_stdin(reader)
         .succeeds()
         .stdout_is(";;");
 }
