@@ -33,6 +33,8 @@ use term_grid::{DEFAULT_SEPARATOR_SIZE, Direction, Filling, Grid, GridOptions};
 
 #[cfg(unix)]
 use uucore::entries;
+#[cfg(feature = "vnfs")]
+use uucore::fs::display_permissions_unix;
 #[cfg(any(
     target_os = "freebsd",
     target_os = "hurd",
@@ -45,7 +47,7 @@ use uucore::libc::{dev_t, major, minor};
 use uucore::{
     error::UResult,
     format::human::human_readable,
-    fs::{display_permissions, display_permissions_unix},
+    fs::display_permissions,
     fsext::MetadataTimeField,
     i18n::{UEncoding, get_ctype_encoding},
     os_str_as_bytes_lossy,
