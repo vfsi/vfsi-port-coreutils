@@ -13,8 +13,6 @@ use std::fmt::Display;
 #[cfg(unix)]
 #[cfg(windows)]
 use std::fs::Metadata;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 /// Show the directory name in the case where several arguments are given to ls

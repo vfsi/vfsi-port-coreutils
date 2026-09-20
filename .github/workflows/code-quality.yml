@@ -72,7 +72,9 @@ jobs:
       matrix:
         job:
           - { os: ubuntu-latest  , features: all             , workspace: true }
-          - { os: macos-latest   , features: all             , workspace: true }
+          # The VFSI/NFS backend is Linux-only; exercise the portable Unix
+          # feature set on macOS and reserve --all-features for Linux.
+          - { os: macos-latest   , features: feat_os_unix    , workspace: true }
           - { os: windows-latest , features: feat_os_windows }
           - { os: ubuntu-latest  , features: feat_wasm , target: wasm32-wasip1 }
           - { os: ubuntu-latest  , features: feat_wasm , target: wasm32-wasip2 }
@@ -116,7 +118,7 @@ jobs:
           ubuntu-*)
             sudo apt-get -y update
             # selinux and systemd headers needed to enable all features
-            sudo apt-get -y install libselinux1-dev libsystemd-dev
+            sudo apt-get -y install libntirpc-dev libselinux1-dev libsystemd-dev
           ;;
         esac
     - name: "`cargo clippy` lint testing"
