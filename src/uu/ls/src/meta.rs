@@ -17,12 +17,12 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(any(unix, feature = "vnfs"))]
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+#[cfg(any(unix, feature = "vnfs"))]
+use std::time::UNIX_EPOCH;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 
 #[cfg(unix)]
 fn is_block_device(file_type: std::fs::FileType) -> bool {
@@ -69,12 +69,7 @@ fn std_nlink(metadata: &std::fs::Metadata) -> u64 {
     metadata.nlink()
 }
 
-#[cfg(windows)]
-fn std_nlink(metadata: &std::fs::Metadata) -> u64 {
-    metadata.number_of_links().unwrap_or(1).into()
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn std_nlink(_: &std::fs::Metadata) -> u64 {
     1
 }
@@ -114,12 +109,7 @@ fn std_ino(metadata: &std::fs::Metadata) -> u64 {
     metadata.ino()
 }
 
-#[cfg(windows)]
-fn std_ino(metadata: &std::fs::Metadata) -> u64 {
-    metadata.file_index().unwrap_or(0)
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn std_ino(_: &std::fs::Metadata) -> u64 {
     0
 }
