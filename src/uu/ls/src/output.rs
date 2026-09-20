@@ -76,17 +76,23 @@ pub struct EntryInfo {
 impl EntryInfo {
     /// Returns true if this entry represents a directory
     pub fn is_dir(&self) -> bool {
-        self.file_type.as_ref().is_some_and(LsFileType::is_dir)
+        self.file_type
+            .as_ref()
+            .is_some_and(|file_type| file_type.is_dir())
     }
 
     /// Returns true if this entry represents a regular file
     pub fn is_file(&self) -> bool {
-        self.file_type.as_ref().is_some_and(LsFileType::is_file)
+        self.file_type
+            .as_ref()
+            .is_some_and(|file_type| file_type.is_file())
     }
 
     /// Returns true if this entry represents a symbolic link
     pub fn is_symlink(&self) -> bool {
-        self.file_type.as_ref().is_some_and(LsFileType::is_symlink)
+        self.file_type
+            .as_ref()
+            .is_some_and(|file_type| file_type.is_symlink())
     }
 
     /// Returns the file size in bytes, if metadata is available

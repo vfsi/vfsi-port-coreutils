@@ -26,7 +26,7 @@ use std::{
     io::{BufWriter, Stdout, Write},
 };
 
-use crate::meta::{LsFileType, LsMeta};
+use crate::meta::LsMeta;
 use ansi_width::ansi_width;
 use glob::MatchOptions;
 #[cfg(unix)]
@@ -795,7 +795,9 @@ fn display_item_name(
     }
 
     let is_long_symlink = config.format == Format::Long
-        && path.file_type().is_some_and(LsFileType::is_symlink)
+        && path
+            .file_type()
+            .is_some_and(|file_type| file_type.is_symlink())
         && !path.must_dereference;
 
     if !is_long_symlink && let Some(c) = indicator_char(path, config.indicator_style) {

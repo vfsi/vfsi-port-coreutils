@@ -18,7 +18,6 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 #[cfg(feature = "vnfs")]
 use std::cmp::Reverse;
-#[cfg(unix)]
 use std::{
     cell::OnceCell,
     ffi::{OsStr, OsString},
@@ -885,12 +884,12 @@ impl<'a> PathData<'a> {
 
         let de: RefCell<Option<DirEntry>> = if let Some(de) = dir_entry {
             if must_dereference && let Ok(md_pb) = p_buf.metadata() {
-                ft.get_or_init(|| Some(LsFileType::from_std(&md_pb.file_type())));
+                ft.get_or_init(|| Some(LsFileType::from_std(md_pb.file_type())));
                 md.get_or_init(|| Some(LsMeta::Std(md_pb)));
             }
 
             if let Ok(ft_de) = de.file_type() {
-                ft.get_or_init(|| Some(LsFileType::from_std(&ft_de)));
+                ft.get_or_init(|| Some(LsFileType::from_std(ft_de)));
             }
 
             RefCell::new(Some(de))
@@ -994,7 +993,8 @@ impl<'a> PathData<'a> {
 
     #[cfg(unix)]
     fn is_executable_file(&self) -> bool {
-        self.file_type().is_some_and(LsFileType::is_file)
+        self.file_type()
+            .is_some_and(|file_type| file_type.is_file())
             && self.metadata().is_some_and(file_is_executable)
     }
 
@@ -1032,7 +1032,7 @@ impl Colorable for PathData<'_> {
         // The vectorized backend cannot reconstruct a `std::fs::FileType`;
         // coloring is only available for locally-statted entries.
         self.metadata()
-            .and_then(|m| m.as_std_metadata().map(|md| md.file_type()))
+            .and_then(|m| m.as_std_metadata().map(Metadata::file_type))
     }
     fn metadata(&self) -> Option<Metadata> {
         self.metadata().and_then(|m| m.as_std_metadata().cloned())
@@ -1263,7 +1263,7 @@ pub fn list_with_output<O: LsOutput>(
         #[cfg(feature = "vnfs")]
         {
             if !config.recursive && dirs.len() >= 2 {
-                let paths: Vec<&Path> = dirs.iter().map(|d| d.path()).collect();
+                let paths: Vec<&Path> = dirs.iter().map(PathData::path).collect();
                 nfs::try_open_many_vf(&paths, config).unwrap_or(None)
             } else {
                 None
@@ -1279,7 +1279,7 @@ pub fn list_with_output<O: LsOutput>(
         // Vectorized recursive fast path: walk the whole subtree in few large
         // compounds and render it in ls -R order.
         #[cfg(feature = "vnfs")]
-        if config.recursive && list_recursive_vf(&path_data, config, output, pos, files.is_empty())?
+        if config.recursive && list_recursive_vf(path_data, config, output, pos, files.is_empty())?
         {
             continue;
         }
@@ -1384,7 +1384,6 @@ fn collect_directory_entries<O: LsOutput>(
             Err(err) => {
                 output.flush()?;
                 show!(LsError::IOError(err));
-                continue;
             }
             Ok(LsDirEntry::Std(dir_entry)) => {
                 if should_display(dir_entry.file_name().as_os_str(), config) {
@@ -1518,7 +1517,7 @@ fn list_recursive_vf<O: LsOutput>(
                 .file
                 .path()
                 .and_then(|p| p.file_name())
-                .map(|f| f.to_os_string())
+                .map(OsStr::to_os_string)
                 .unwrap_or_default();
             if !should_display(&name, config) {
                 continue;
@@ -1529,8 +1528,7 @@ fn list_recursive_vf<O: LsOutput>(
         write_directory_entries(&entries, config, output)?;
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") && i < 3 {
             eprintln!(
-                "[profile]   dir{} {} entries={} sofar_ms={:.1}",
-                i,
+                "[profile]   dir{i} {} entries={} sofar_ms={:.1}",
                 w.path.display(),
                 w.entries.len(),
                 t0.elapsed().as_secs_f64() * 1000.0
@@ -1607,7 +1605,9 @@ fn enter_directory<O: LsOutput>(
         if config.recursive {
             for child in entries
                 .iter()
-                .filter(|p| p.file_type().is_some_and(LsFileType::is_dir) && !p.is_dot_dir)
+                .filter(|p| {
+                    p.file_type().is_some_and(|file_type| file_type.is_dir()) && !p.is_dot_dir
+                })
                 .rev()
             {
                 let child_path = child.path().to_path_buf();
@@ -1748,24 +1748,25 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
 /// path under any locale and sort mode.
 pub(crate) fn sort_vf_entries(entries: &mut [vnfs::VfAttrs], config: &Config) {
     use crate::config::Sort;
-    fn name_of(a: &vnfs::VfAttrs) -> &std::ffi::OsStr {
+    fn name_of(a: &vnfs::VfAttrs) -> &OsStr {
         a.file
             .path()
             .and_then(|p| p.file_name())
             .unwrap_or_default()
     }
-    fn ext_of(e: &vnfs::VfAttrs) -> Option<&std::ffi::OsStr> {
+    fn ext_of(e: &vnfs::VfAttrs) -> Option<&OsStr> {
         e.file.path().and_then(|p| p.extension())
     }
-    fn stem_of(e: &vnfs::VfAttrs) -> Option<&std::ffi::OsStr> {
+    fn stem_of(e: &vnfs::VfAttrs) -> Option<&OsStr> {
         e.file.path().and_then(|p| p.file_stem())
     }
     match config.sort {
         Sort::Time => {
-            entries.sort_unstable_by_key(|k| Reverse(vf_time(k, config.time).unwrap_or(UNIX_EPOCH)))
+            entries
+                .sort_unstable_by_key(|k| Reverse(vf_time(k, config.time).unwrap_or(UNIX_EPOCH)));
         }
         Sort::Size => {
-            entries.sort_unstable_by(|a, b| b.size.cmp(&a.size).then(name_of(a).cmp(name_of(b))))
+            entries.sort_unstable_by(|a, b| b.size.cmp(&a.size).then(name_of(a).cmp(name_of(b))));
         }
         Sort::Name => {
             if uucore::i18n::collator::should_use_locale_collation() {
@@ -1840,6 +1841,7 @@ fn ls_time(md: &LsMeta, md_time: uucore::fsext::MetadataTimeField) -> Option<Sys
 
 /// Open a directory for listing, routing NFS targets through the vectorized
 /// backend when enabled.
+#[cfg_attr(not(feature = "vnfs"), allow(unused_variables))]
 fn open_dir(path: &Path, config: &Config) -> std::io::Result<LsReadDir> {
     #[cfg(feature = "vnfs")]
     if let Some(rd) = nfs::try_open_vf(path, config)? {

@@ -11,8 +11,6 @@ use std::borrow::Cow;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
-#[cfg(unix)]
-
 /// ANSI CSI (Control Sequence Introducer)
 const ANSI_CSI: &str = "\x1b[";
 const ANSI_SGR_END: &str = "m";
@@ -558,7 +556,9 @@ pub(crate) fn color_name(
     }
 
     if target_symlink.is_none()
-        && path.file_type().is_some_and(LsFileType::is_symlink)
+        && path
+            .file_type()
+            .is_some_and(|file_type| file_type.is_symlink())
         && let Some(colored) = style_manager.color_symlink_name(path, name.clone(), wrap)
     {
         return colored;

@@ -84,7 +84,10 @@ fn nfs_mount(path: &Path) -> Option<Mount> {
 
 enum Backend {
     Dummy(DummyVecFs),
-    Nfs { fs: NfsVecFs, supports_copy: bool },
+    Nfs {
+        fs: Box<NfsVecFs>,
+        supports_copy: bool,
+    },
 }
 
 impl Backend {
@@ -156,11 +159,11 @@ fn make_context(mount: Mount) -> io::Result<Context> {
         Some("dummy") => Backend::Dummy(DummyVecFs::new(mount.point.clone())),
         Some("nfs") => match NfsVecFs::connect_minor(&mount.server, 2) {
             Ok(fs) => Backend::Nfs {
-                fs,
+                fs: Box::new(fs),
                 supports_copy: true,
             },
             Err(_) => Backend::Nfs {
-                fs: NfsVecFs::connect(&mount.server).map_err(vf_io_error)?,
+                fs: Box::new(NfsVecFs::connect(&mount.server).map_err(vf_io_error)?),
                 supports_copy: false,
             },
         },

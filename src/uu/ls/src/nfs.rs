@@ -75,7 +75,7 @@ fn full_mask(config: &crate::config::Config) -> vnfs::AttrMask {
 /// done here by matching on the enum.)
 enum Backend {
     Dummy(DummyVecFs),
-    Nfs(NfsVecFs),
+    Nfs(Box<NfsVecFs>),
 }
 
 impl Backend {
@@ -87,8 +87,8 @@ impl Backend {
         recursive: bool,
     ) -> vnfs::VfResult<Vec<VfAttrs>> {
         match self {
-            Backend::Dummy(f) => f.listdir(dir, masks, max_count, recursive),
-            Backend::Nfs(f) => f.listdir(dir, masks, max_count, recursive),
+            Self::Dummy(f) => f.listdir(dir, masks, max_count, recursive),
+            Self::Nfs(f) => f.listdir(dir, masks, max_count, recursive),
         }
     }
 
@@ -131,19 +131,15 @@ impl Drop for VfContext {
             let (n, ops, bytes, max) = vnfs::legacy::compound::compound_stats();
             if n > 0 {
                 eprintln!(
-                    "[vnfs] compounds={} avg_ops={:.2} max_ops={} avg_bytes={:.0} total_bytes={}",
-                    n,
+                    "[vnfs] compounds={n} avg_ops={:.2} max_ops={max} avg_bytes={:.0} total_bytes={bytes}",
                     ops as f64 / n as f64,
-                    max,
-                    bytes as f64 / n as f64,
-                    bytes
+                    bytes as f64 / n as f64
                 );
             }
             let (calls, us) = vnfs::legacy::compound::rpc_stats();
             if calls > 0 {
                 eprintln!(
-                    "[vnfs] rpc_calls={} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
-                    calls,
+                    "[vnfs] rpc_calls={calls} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
                     us as f64 / calls as f64 / 1000.0,
                     us as f64 / 1000.0
                 );
@@ -179,7 +175,9 @@ fn nfs_mountpoint(path: &Path) -> Option<PathBuf> {
 fn make_ctx(mountpoint: &Path) -> io::Result<VfContext> {
     let backend = match impl_choice() {
         Some("dummy") => Backend::Dummy(DummyVecFs::new(mountpoint.to_path_buf())),
-        Some("nfs") => Backend::Nfs(NfsVecFs::connect("127.0.0.1").map_err(vf_io_error)?),
+        Some("nfs") => Backend::Nfs(Box::new(
+            NfsVecFs::connect("127.0.0.1").map_err(vf_io_error)?,
+        )),
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
     Ok(VfContext {
@@ -224,7 +222,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
                 .file
                 .path()
                 .and_then(|p| p.file_name())
-                .map(|f| f.to_os_string())
+                .map(std::ffi::OsStr::to_os_string)
                 .unwrap_or_default();
             out.push(LsDirEntry::Vf {
                 path: path.join(&name),
@@ -246,7 +244,7 @@ fn ctx_open_many(
     ctx: &mut VfContext,
     kernel_dirs: &[&Path],
     masks: vnfs::AttrMask,
-) -> io::Result<Vec<Option<LsReadDir>>> {
+) -> Vec<Option<LsReadDir>> {
     let vpaths: Vec<PathBuf> = kernel_dirs
         .iter()
         .map(|d| {
@@ -290,7 +288,7 @@ fn ctx_open_many(
                 .file
                 .path()
                 .and_then(|p| p.file_name())
-                .map(|f| f.to_os_string())
+                .map(std::ffi::OsStr::to_os_string)
                 .unwrap_or_default();
             list.push(LsDirEntry::Vf {
                 path: kernel_dirs[i].join(&name),
@@ -300,7 +298,7 @@ fn ctx_open_many(
         }
         out.push(Some(LsReadDir::from_vf(list)));
     }
-    Ok(out)
+    out
 }
 
 /// Open several directory operands in one vectorized batch when they all live
@@ -329,7 +327,7 @@ pub fn try_open_many_vf(
             *ctx = Some(make_ctx(&mountpoint)?);
         }
         let ctx = ctx.as_mut().unwrap();
-        Ok(Some(ctx_open_many(ctx, dirs, full_mask(config))?))
+        Ok(Some(ctx_open_many(ctx, dirs, full_mask(config))))
     })
 }
 
@@ -393,7 +391,7 @@ pub fn try_walk_vf(
 #[cfg(all(test, feature = "vnfs"))]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     fn dummy_ctx(root: &Path) -> VfContext {
         VfContext {
@@ -424,9 +422,9 @@ mod tests {
         }
         let mut ctx = dummy_ctx(root.path());
         let dirs = [root.path().join("d1"), root.path().join("d2")];
-        let paths: Vec<&Path> = dirs.iter().map(|d| d.as_path()).collect();
+        let paths: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
         let masks = vnfs::AttrMask::MODE | vnfs::AttrMask::SIZE;
-        let mut out = ctx_open_many(&mut ctx, &paths, masks).unwrap();
+        let mut out = ctx_open_many(&mut ctx, &paths, masks);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(Option::is_some));
         assert_eq!(names(out[0].as_mut()), vec!["f.txt"]);
@@ -447,9 +445,9 @@ mod tests {
             root.path().join("d1"),
             root.path().join("d2"),
         ];
-        let paths: Vec<&Path> = dirs.iter().map(|d| d.as_path()).collect();
+        let paths: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
         let masks = vnfs::AttrMask::MODE | vnfs::AttrMask::SIZE;
-        let mut out = ctx_open_many(&mut ctx, &paths, masks).unwrap();
+        let mut out = ctx_open_many(&mut ctx, &paths, masks);
         assert!(out[0].is_some(), "prefix dir listed before the failure");
         assert!(out[1].is_none(), "failing dir falls back to per-dir open");
         assert!(out[2].is_none(), "later dirs also fall back");
