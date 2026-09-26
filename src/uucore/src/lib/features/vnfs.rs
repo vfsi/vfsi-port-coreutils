@@ -16,6 +16,29 @@ struct Mount {
     point: PathBuf,
 }
 
+/// An NFS mount that contains a path: the server, the exported path, and the
+/// local mountpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NfsMount {
+    pub server: String,
+    pub export: PathBuf,
+    pub point: PathBuf,
+}
+
+/// Find the longest NFS mount (if any) that contains `path`.
+///
+/// The path is canonicalized first so that relative operands and symlinked
+/// directories resolve to the same mount a kernel traversal would see.
+pub fn nfs_mount(path: &Path) -> Option<NfsMount> {
+    let resolved = path.canonicalize().ok()?;
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    find_mount(&resolved, &mounts).map(|mount| NfsMount {
+        server: mount.server,
+        export: mount.export,
+        point: mount.point,
+    })
+}
+
 enum Backend {
     Dummy(DummyVecFs),
     Nfs(Box<NfsVecFs>),

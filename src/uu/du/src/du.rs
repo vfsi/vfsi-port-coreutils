@@ -77,6 +77,9 @@ mod options {
     pub const FILE: &str = "FILE";
 }
 
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+mod vnfs;
+
 struct TraversalOptions {
     all: bool,
     separate_dirs: bool,
@@ -130,6 +133,29 @@ struct Stat {
     inode: Option<FileInfo>,
     metadata: Metadata,
     latest_time: Option<SystemTime>,
+}
+
+/// The subset of a [`Stat`] needed to print a result. This is what the
+/// printer consumes, so a traversal that never materializes a full
+/// `std::fs::Metadata` (the VFSI/NFS path) can still drive the same output.
+struct Usage {
+    path: PathBuf,
+    size: u64,
+    blocks: u64,
+    inodes: u64,
+    latest_time: Option<SystemTime>,
+}
+
+impl Stat {
+    fn usage(&self) -> Usage {
+        Usage {
+            path: self.path.clone(),
+            size: self.size,
+            blocks: self.blocks,
+            inodes: self.inodes,
+            latest_time: self.latest_time,
+        }
+    }
 }
 
 impl Stat {
@@ -577,7 +603,7 @@ fn safe_du(
                 }
             }
             print_tx.send(Ok(StatPrintInfo {
-                stat: this_stat,
+                usage: this_stat.usage(),
                 depth: depth + 1,
             }))?;
         } else {
@@ -591,7 +617,7 @@ fn safe_du(
             };
             if options.all {
                 print_tx.send(Ok(StatPrintInfo {
-                    stat: this_stat,
+                    usage: this_stat.usage(),
                     depth: depth + 1,
                 }))?;
             }
@@ -745,7 +771,7 @@ fn du_regular(
                                         };
                                 }
                                 print_tx.send(Ok(StatPrintInfo {
-                                    stat: this_stat,
+                                    usage: this_stat.usage(),
                                     depth: depth + 1,
                                 }))?;
                             } else {
@@ -760,7 +786,7 @@ fn du_regular(
                                     };
                                 if options.all {
                                     print_tx.send(Ok(StatPrintInfo {
-                                        stat: this_stat,
+                                        usage: this_stat.usage(),
                                         depth: depth + 1,
                                     }))?;
                                 }
@@ -847,20 +873,20 @@ fn build_exclude_patterns(matches: &ArgMatches) -> UResult<Vec<Pattern>> {
 }
 
 struct StatPrintInfo {
-    stat: Stat,
+    usage: Usage,
     depth: usize,
 }
 
 impl StatPrinter {
-    fn choose_size(&self, stat: &Stat) -> u64 {
+    fn choose_size(&self, usage: &Usage) -> u64 {
         if self.inodes {
-            stat.inodes
+            usage.inodes
         } else if self.apparent_size {
-            stat.size
+            usage.size
         } else {
             // The st_blocks field indicates the number of blocks allocated to the file, 512-byte units.
             // See: http://linux.die.net/man/2/stat
-            stat.blocks * 512
+            usage.blocks * 512
         }
     }
 
@@ -869,7 +895,7 @@ impl StatPrinter {
         while let Ok(received) = rx.recv() {
             match received {
                 Ok(stat_info) => {
-                    let size = self.choose_size(&stat_info.stat);
+                    let size = self.choose_size(&stat_info.usage);
 
                     if stat_info.depth == 0 {
                         grand_total += size;
@@ -883,7 +909,7 @@ impl StatPrinter {
                             .is_none_or(|max_depth| stat_info.depth <= max_depth)
                         && (!self.summarize || stat_info.depth == 0)
                     {
-                        self.print_stat(&stat_info.stat, size)?;
+                        self.print_stat(&stat_info.usage, size)?;
                     }
                 }
                 Err(e) => show!(e),
@@ -924,11 +950,11 @@ impl StatPrinter {
         }
     }
 
-    fn print_stat(&self, stat: &Stat, size: u64) -> UResult<()> {
+    fn print_stat(&self, usage: &Usage, size: u64) -> UResult<()> {
         write!(stdout(), "{}\t", self.convert_size(size))?;
 
         if self.time.is_some() {
-            if let Some(time) = stat.latest_time {
+            if let Some(time) = usage.latest_time {
                 format_system_time(
                     &mut stdout(),
                     time,
@@ -941,7 +967,7 @@ impl StatPrinter {
             }
         }
 
-        print_verbatim(&stat.path)?;
+        print_verbatim(&usage.path)?;
         write!(stdout(), "{}", self.line_ending)?;
 
         Ok(())
@@ -1211,6 +1237,17 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
             seen_inodes.insert(inode);
         }
 
+        #[cfg(all(feature = "vnfs", target_os = "linux"))]
+        if vnfs::is_enabled()
+            && vnfs::supports(&traversal_options)
+            && let Ok(Some(usage)) = vnfs::try_du(&path, &traversal_options, &print_tx)
+        {
+            print_tx
+                .send(Ok(StatPrintInfo { usage, depth: 0 }))
+                .map_err(|e| USimpleError::new(1, e.to_string()))?;
+            continue 'loop_file;
+        }
+
         if use_safe_traversal {
             // Use safe traversal (Unix except Redox, when not using -L)
             #[cfg(all(unix, not(target_os = "redox")))]
@@ -1226,7 +1263,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                 ) {
                     Ok(stat) => {
                         print_tx
-                            .send(Ok(StatPrintInfo { stat, depth: 0 }))
+                            .send(Ok(StatPrintInfo {
+                                usage: stat.usage(),
+                                depth: 0,
+                            }))
                             .map_err(|e| USimpleError::new(1, e.to_string()))?;
                     }
                     Err(e) => {
@@ -1256,7 +1296,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                 .map_err(|e| USimpleError::new(1, e.to_string()))?;
 
                 print_tx
-                    .send(Ok(StatPrintInfo { stat, depth: 0 }))
+                    .send(Ok(StatPrintInfo {
+                        usage: stat.usage(),
+                        depth: 0,
+                    }))
                     .map_err(|e| USimpleError::new(1, e.to_string()))?;
             } else {
                 #[cfg(unix)]

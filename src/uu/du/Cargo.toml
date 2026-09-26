@@ -30,6 +30,7 @@ uucore = { workspace = true, features = [
 rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 fluent = { workspace = true }
+vnfs = { workspace = true, optional = true }
 
 [target.'cfg(all(unix, not(any(target_os = "aix", target_os = "hurd", target_os = "redox"))))'.dependencies]
 uucore = { workspace = true, features = ["safe-traversal"] }
@@ -51,6 +52,7 @@ uucore = { workspace = true, features = ["benchmark"] }
 
 [features]
 diagnostics = ["uucore/diagnostics"]
+vnfs = ["dep:vnfs", "uucore/vnfs"]
 
 [lints]
 workspace = true

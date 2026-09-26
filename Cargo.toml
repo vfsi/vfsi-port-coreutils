@@ -76,6 +76,7 @@ feat_diagnostics = ["uucore/diagnostics"]
 feat_vnfs = [
   "cp?/vnfs",
   "dir?/vnfs",
+  "du?/vnfs",
   "ls?/vnfs",
   "rm?/vnfs",
   "rmdir?/vnfs",
