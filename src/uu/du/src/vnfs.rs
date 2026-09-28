@@ -278,13 +278,13 @@ pub fn try_du(
     // Path inside the export namespace the backend resolves against.
     let vroot = Path::new("/").join(relative);
 
-    let mut backend = match std::env::var("VNFS_IMPL").as_deref() {
+    let backend = match std::env::var("VNFS_IMPL").as_deref() {
         Ok("dummy") => Backend::Dummy(Mounted::new(&mount.point).map_err(io::Error::other)?),
         Ok("nfs") => Backend::Nfs(Nfs::connect(&mount.server).map_err(io::Error::other)?),
         _ => return Ok(None),
     };
 
-    let result = traverse(&mut backend, path, &vroot, options, print_tx);
+    let result = traverse(&backend, path, &vroot, options, print_tx);
     print_stats();
     if std::env::var("VNFS_PROFILE").as_deref() == Ok("1")
         && let Err(error) = &result
@@ -294,12 +294,18 @@ pub fn try_du(
     result.map(Some)
 }
 
-/// Emit per-connection compound/RPC counts when `VNFS_STATS=1`.
+/// Emit process-wide compound/RPC counts when `VNFS_STATS=1`.
 fn print_stats() {
     if std::env::var("VNFS_STATS").as_deref() != Ok("1") {
         return;
     }
-    let (compounds, ops, bytes, max_ops) = vnfs::backend::compound::compound_stats();
+    let stats = vnfs::diagnostics::snapshot();
+    let (compounds, ops, bytes, max_ops) = (
+        stats.compounds,
+        stats.operations,
+        stats.compound_bytes,
+        stats.max_operations,
+    );
     if compounds > 0 {
         eprintln!(
             "[vnfs] compounds={compounds} avg_ops={:.2} max_ops={max_ops} avg_bytes={:.0} total_bytes={bytes}",
@@ -307,7 +313,7 @@ fn print_stats() {
             bytes as f64 / compounds as f64
         );
     }
-    let (calls, micros) = vnfs::backend::compound::rpc_stats();
+    let (calls, micros) = (stats.rpc_calls, stats.rpc_micros);
     if calls > 0 {
         eprintln!(
             "[vnfs] rpc_calls={calls} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
@@ -339,9 +345,9 @@ mod tests {
     /// `(path, size, inodes, depth)` for every emitted entry plus the root
     /// total.
     fn run(root: &Path, options: &TraversalOptions) -> (Vec<(PathBuf, u64, u64, usize)>, Usage) {
-        let mut backend = Backend::Dummy(Mounted::new(root).expect("dummy root"));
+        let backend = Backend::Dummy(Mounted::new(root).expect("dummy root"));
         let (tx, rx) = mpsc::channel();
-        let total = traverse(&mut backend, root, Path::new("/"), options, &tx).expect("traverse");
+        let total = traverse(&backend, root, Path::new("/"), options, &tx).expect("traverse");
         drop(tx);
         let mut emitted = Vec::new();
         for info in &rx {
