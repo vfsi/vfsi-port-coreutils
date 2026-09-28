@@ -7,7 +7,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use ::vnfs::{DummyVecFs, NfsVecFs, VecFs, VfRes};
+use vnfs::{Mounted, Nfs, NfsClient, VfResult};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Mount {
@@ -40,21 +40,17 @@ pub fn nfs_mount(path: &Path) -> Option<NfsMount> {
 }
 
 enum Backend {
-    Dummy(DummyVecFs),
-    Nfs(Box<NfsVecFs>),
+    Dummy(Mounted),
+    Nfs(NfsClient),
 }
 
 impl Backend {
-    fn remove(&mut self, path: &Path, recursive: bool) -> VfRes {
+    fn remove(&self, path: &Path, recursive: bool) -> VfResult<()> {
         match self {
-            Self::Dummy(fs) => remove_with_fs(fs, path, recursive),
-            Self::Nfs(fs) => remove_with_fs(fs.as_mut(), path, recursive),
+            Self::Dummy(fs) => fs.remove_paths(&[path], recursive),
+            Self::Nfs(fs) => fs.remove_paths(&[path], recursive),
         }
     }
-}
-
-fn remove_with_fs(fs: &mut impl VecFs, path: &Path, recursive: bool) -> VfRes {
-    fs.rm(&[path], recursive)
 }
 
 fn find_mount(path: &Path, mounts: &str) -> Option<Mount> {
@@ -78,7 +74,7 @@ fn find_mount(path: &Path, mounts: &str) -> Option<Mount> {
         .max_by_key(|mount| mount.point.as_os_str().len())
 }
 
-fn remove_paths(path: &Path) -> Option<(Mount, PathBuf, PathBuf)> {
+fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
     let Component::Normal(name) = path.components().next_back()? else {
         return None;
     };
@@ -97,8 +93,7 @@ fn remove_paths(path: &Path) -> Option<(Mount, PathBuf, PathBuf)> {
 
     let relative = absolute.strip_prefix(&mount.point).ok()?;
     let dummy_path = Path::new("/").join(relative);
-    let nfs_path = mount.export.join(relative);
-    Some((mount, dummy_path, nfs_path))
+    Some((mount, dummy_path))
 }
 
 /// Try to remove `path` through VNFS.
@@ -107,22 +102,27 @@ fn remove_paths(path: &Path) -> Option<(Mount, PathBuf, PathBuf)> {
 /// paths, connection failures, and filesystem errors return `false`, allowing
 /// the caller to preserve its normal platform-specific behavior as a fallback.
 pub fn try_remove(path: &Path, recursive: bool) -> bool {
-    let Some((mount, dummy_path, nfs_path)) = remove_paths(path) else {
+    let Some((mount, relative_path)) = remove_paths(path) else {
         return false;
     };
 
-    let (mut backend, path) = match std::env::var("VNFS_IMPL").as_deref() {
-        Ok("dummy") => (Backend::Dummy(DummyVecFs::new(mount.point)), dummy_path),
-        Ok("nfs") => {
-            let Ok(fs) = NfsVecFs::connect(&mount.server) else {
+    let backend = match std::env::var("VNFS_IMPL").as_deref() {
+        Ok("dummy") => {
+            let Ok(client) = Mounted::new(&mount.point) else {
                 return false;
             };
-            (Backend::Nfs(Box::new(fs)), nfs_path)
+            Backend::Dummy(client)
+        }
+        Ok("nfs") => {
+            let Ok(client) = Nfs::builder(&mount.server).root(&mount.export).connect() else {
+                return false;
+            };
+            Backend::Nfs(client)
         }
         _ => return false,
     };
 
-    backend.remove(&path, recursive).is_ok()
+    backend.remove(&relative_path, recursive).is_ok()
 }
 
 #[cfg(test)]
@@ -142,9 +142,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let empty = root.path().join("empty");
         std::fs::create_dir(&empty).unwrap();
-        let mut fs = DummyVecFs::new(root.path().to_path_buf());
+        let fs = Mounted::new(root.path()).unwrap();
 
-        remove_with_fs(&mut fs, Path::new("/empty"), false).unwrap();
+        fs.remove_paths(&["/empty"], false).unwrap();
 
         assert!(!empty.exists());
     }
@@ -155,9 +155,9 @@ mod tests {
         let tree = root.path().join("tree");
         std::fs::create_dir_all(tree.join("child")).unwrap();
         std::fs::write(tree.join("child/file"), b"data").unwrap();
-        let mut fs = DummyVecFs::new(root.path().to_path_buf());
+        let fs = Mounted::new(root.path()).unwrap();
 
-        remove_with_fs(&mut fs, Path::new("/tree"), true).unwrap();
+        fs.remove_paths(&["/tree"], true).unwrap();
 
         assert!(!tree.exists());
     }
@@ -168,9 +168,9 @@ mod tests {
         let dir = root.path().join("dir");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("file"), b"data").unwrap();
-        let mut fs = DummyVecFs::new(root.path().to_path_buf());
+        let fs = Mounted::new(root.path()).unwrap();
 
-        assert!(remove_with_fs(&mut fs, Path::new("/dir"), false).is_err());
+        assert!(fs.remove_paths(&["/dir"], false).is_err());
         assert!(dir.exists());
     }
 }

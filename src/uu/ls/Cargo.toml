@@ -69,7 +69,7 @@ harness = false
 diagnostics = ["uucore/diagnostics"]
 selinux = ["dep:selinux", "uucore/selinux"]
 smack = ["uucore/smack"]
-vnfs = ["dep:vnfs"]
+vnfs = ["dep:vnfs", "uucore/vnfs"]
 
 [lints]
 workspace = true

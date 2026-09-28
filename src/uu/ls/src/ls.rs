@@ -16,7 +16,7 @@ use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::cell::RefCell;
-#[cfg(feature = "vnfs")]
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
 use std::cmp::Reverse;
 use std::{
     cell::OnceCell,
@@ -28,6 +28,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+use vnfs::backend as vfsi_sync;
 
 #[cfg(unix)]
 use uucore::libc::{S_IXGRP, S_IXOTH, S_IXUSR};
@@ -53,7 +55,7 @@ pub use config::{Config, options};
 pub use display::Format;
 pub use output::{EntryInfo, LsOutput, StreamMode, StreamingOutput};
 
-#[cfg(feature = "vnfs")]
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
 mod nfs;
 
 use colors::StyleManager;
@@ -913,8 +915,8 @@ impl<'a> PathData<'a> {
     /// Construct a `PathData` for a directory entry sourced from the
     /// vectorized backend. When dereferencing is requested the metadata is
     /// left to be resolved from the local filesystem instead.
-    #[cfg(feature = "vnfs")]
-    fn from_vf(path: PathBuf, name: OsString, attrs: vnfs::VfAttrs, config: &Config) -> Self {
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+    fn from_vf(path: PathBuf, name: OsString, attrs: vfsi_sync::VfAttrs, config: &Config) -> Self {
         let ftype = attrs.ftype.as_nfs();
         let must_dereference = matches!(&config.dereference, Dereference::All);
         let md = OnceCell::new();
@@ -1260,7 +1262,7 @@ pub fn list_with_output<O: LsOutput>(
     // Batch-open multiple directory operands on NFS in one vectorized call
     // (the vnfs backend lists many directories in a few compounds).
     let mut batched_many: Option<Vec<Option<LsReadDir>>> = {
-        #[cfg(feature = "vnfs")]
+        #[cfg(all(feature = "vnfs", target_os = "linux"))]
         {
             if !config.recursive && dirs.len() >= 2 {
                 let paths: Vec<&Path> = dirs.iter().map(PathData::path).collect();
@@ -1269,7 +1271,7 @@ pub fn list_with_output<O: LsOutput>(
                 None
             }
         }
-        #[cfg(not(feature = "vnfs"))]
+        #[cfg(not(all(feature = "vnfs", target_os = "linux")))]
         {
             None
         }
@@ -1278,7 +1280,7 @@ pub fn list_with_output<O: LsOutput>(
     for (pos, path_data) in dirs.iter().enumerate() {
         // Vectorized recursive fast path: walk the whole subtree in few large
         // compounds and render it in ls -R order.
-        #[cfg(feature = "vnfs")]
+        #[cfg(all(feature = "vnfs", target_os = "linux"))]
         if config.recursive && list_recursive_vf(path_data, config, output, pos, files.is_empty())?
         {
             continue;
@@ -1397,7 +1399,7 @@ fn collect_directory_entries<O: LsOutput>(
                     ));
                 }
             }
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Ok(LsDirEntry::Vf { path, name, attrs }) => {
                 if display::should_display(name.as_os_str(), config) {
                     entries.push(PathData::from_vf(path, name, attrs, config));
@@ -1443,11 +1445,11 @@ fn write_directory_entries<O: LsOutput>(
 ///
 /// This avoids deep recursive call chains while preserving GNU-style
 /// directory traversal order and ancestor detection.
-/// Vectorized recursive fast path: walk the subtree with `VecFs::walk` (few
+/// Vectorized recursive fast path: walk the subtree with `vnfs` (few
 /// large compounds, directories already in ls -R pre-order) and render each
 /// directory in sequence. Returns `Ok(false)` when the vectorized backend is
 /// not applicable (falls back to the normal path).
-#[cfg(feature = "vnfs")]
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
 fn list_recursive_vf<O: LsOutput>(
     root: &PathData,
     config: &Config,
@@ -1741,23 +1743,23 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
     }
 }
 
-#[cfg(feature = "vnfs")]
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
 /// Sort `vnfs` entry attributes exactly as [`sort_entries`] would sort the
 /// corresponding [`PathData`], so the vectorized recursive walk can order its
 /// output (and thus the sub-directory visit order) identically to the normal
 /// path under any locale and sort mode.
-pub(crate) fn sort_vf_entries(entries: &mut [vnfs::VfAttrs], config: &Config) {
+pub(crate) fn sort_vf_entries(entries: &mut [vfsi_sync::VfAttrs], config: &Config) {
     use crate::config::Sort;
-    fn name_of(a: &vnfs::VfAttrs) -> &OsStr {
+    fn name_of(a: &vfsi_sync::VfAttrs) -> &OsStr {
         a.file
             .path()
             .and_then(|p| p.file_name())
             .unwrap_or_default()
     }
-    fn ext_of(e: &vnfs::VfAttrs) -> Option<&OsStr> {
+    fn ext_of(e: &vfsi_sync::VfAttrs) -> Option<&OsStr> {
         e.file.path().and_then(|p| p.extension())
     }
-    fn stem_of(e: &vnfs::VfAttrs) -> Option<&OsStr> {
+    fn stem_of(e: &vfsi_sync::VfAttrs) -> Option<&OsStr> {
         e.file.path().and_then(|p| p.file_stem())
     }
     match config.sort {
@@ -1801,20 +1803,20 @@ pub(crate) fn sort_vf_entries(entries: &mut [vnfs::VfAttrs], config: &Config) {
         entries.reverse();
     }
     if config.group_directories_first && config.sort != Sort::None {
-        entries.sort_by_key(|p| p.ftype != vnfs::VfType::Directory);
+        entries.sort_by_key(|p| p.ftype != vfsi_sync::VfType::Directory);
     }
 }
 
-#[cfg(feature = "vnfs")]
-fn vf_time(a: &vnfs::VfAttrs, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+fn vf_time(a: &vfsi_sync::VfAttrs, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
     use std::time::Duration;
     use uucore::fsext::MetadataTimeField;
     // Only trust a time field the backend actually returned; `walk` falls
     // back to the epoch for missing ones.
     let returned = match field {
-        MetadataTimeField::Modification => vnfs::AttrMask::MTIME,
-        MetadataTimeField::Access => vnfs::AttrMask::ATIME,
-        MetadataTimeField::Change => vnfs::AttrMask::CTIME,
+        MetadataTimeField::Modification => vfsi_sync::AttrMask::MTIME,
+        MetadataTimeField::Access => vfsi_sync::AttrMask::ATIME,
+        MetadataTimeField::Change => vfsi_sync::AttrMask::CTIME,
         MetadataTimeField::Birth => return None,
     };
     if !a.returned.contains(returned) {
@@ -1841,9 +1843,12 @@ fn ls_time(md: &LsMeta, md_time: uucore::fsext::MetadataTimeField) -> Option<Sys
 
 /// Open a directory for listing, routing NFS targets through the vectorized
 /// backend when enabled.
-#[cfg_attr(not(feature = "vnfs"), allow(unused_variables))]
+#[cfg_attr(
+    not(all(feature = "vnfs", target_os = "linux")),
+    allow(unused_variables)
+)]
 fn open_dir(path: &Path, config: &Config) -> std::io::Result<LsReadDir> {
-    #[cfg(feature = "vnfs")]
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
     if let Some(rd) = nfs::try_open_vf(path, config)? {
         return Ok(rd);
     }

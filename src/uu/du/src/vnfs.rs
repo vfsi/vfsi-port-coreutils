@@ -6,7 +6,7 @@
 //! Opt-in VFSI-backed traversal for `du` on Linux NFS mounts.
 //!
 //! When `VNFS_IMPL=dummy|nfs` and the operand lies on an NFS mount, the whole
-//! subtree is enumerated and stat'd through the `vnfs` `VecFs` API. That API
+//! subtree is enumerated and stat'd through the high-level `vnfs` API. It
 //! asks the server for file attributes in the `READDIR` reply and batches
 //! `READDIR`/`GETATTR` into NFS compounds, instead of issuing one kernel
 //! `lstat` per entry. Enabling it does not change the output: this module
@@ -27,41 +27,35 @@ use uucore::error::UResult;
 use uucore::fsext::MetadataTimeField;
 use uucore::translate;
 
-use ::vnfs::{AttrMask, DummyVecFs, Metadata, NfsVecFs, VecFs, VfAttrs, VfFile, VfType};
+use vnfs::{
+    DirEntry, DirectoryListing, Metadata, MetadataFields, Mounted, Nfs, NfsClient, VfType,
+    WalkOptions,
+};
 
 use crate::{Deref, FileInfo, StatPrintInfo, TraversalOptions, Usage};
 
 enum Backend {
-    Dummy(DummyVecFs),
-    Nfs(Box<NfsVecFs>),
+    Dummy(Mounted),
+    Nfs(NfsClient),
 }
 
 impl Backend {
     /// No-follow attributes for one path (the operand or a single file).
-    fn lstat(&mut self, file: VfFile, masks: AttrMask) -> ::vnfs::VfResult<VfAttrs> {
-        let mut attrs = VfAttrs {
-            file,
-            masks,
-            ..VfAttrs::default()
-        };
+    fn lstat(&self, path: &Path, fields: MetadataFields) -> vnfs::VfResult<Metadata> {
         match self {
-            Self::Dummy(fs) => fs.lgetattrsv(std::slice::from_mut(&mut attrs))?,
-            Self::Nfs(fs) => fs.lgetattrsv(std::slice::from_mut(&mut attrs))?,
+            Self::Dummy(fs) => fs.symlink_metadata_with_fields(path, fields),
+            Self::Nfs(fs) => fs.symlink_metadata_with_fields(path, fields),
         }
-        Ok(attrs)
     }
 
-    /// Enumerate `dir` and everything below it, returning a flat entry list.
-    ///
-    /// This uses the per-directory recursive walk rather than a many-directory
-    /// batch: each `READDIR` still returns file attributes, which is what
-    /// avoids the per-entry `GETATTR` calls the kernel path issues, while a
-    /// batch of many large directories can exceed a server's compound
-    /// resource limits.
-    fn listdir_recursive(&mut self, dir: &Path, masks: AttrMask) -> ::vnfs::VfResult<Vec<VfAttrs>> {
+    /// Enumerate the subtree with attributes delivered in READDIR replies.
+    /// A tree beyond the default resource limits falls back to the kernel
+    /// walker, which can process arbitrarily large trees without materializing
+    /// every entry here.
+    fn walk(&self, dir: &Path, fields: MetadataFields) -> vnfs::VfResult<Vec<DirectoryListing>> {
         match self {
-            Self::Dummy(fs) => fs.listdir(dir, masks, 0, true),
-            Self::Nfs(fs) => fs.listdir(dir, masks, 0, true),
+            Self::Dummy(fs) => fs.walk_with_options(dir, fields, WalkOptions::default()),
+            Self::Nfs(fs) => fs.walk_with_options(dir, fields, WalkOptions::default()),
         }
     }
 }
@@ -79,17 +73,19 @@ pub fn supports(options: &TraversalOptions) -> bool {
     matches!(options.dereference, Deref::None)
 }
 
-fn attr_mask(options: &TraversalOptions) -> AttrMask {
-    let mut masks =
-        AttrMask::MODE | AttrMask::SIZE | AttrMask::NLINK | AttrMask::FILEID | AttrMask::BLOCKS;
+fn attr_mask(options: &TraversalOptions) -> MetadataFields {
+    let mut masks = MetadataFields::MODE
+        | MetadataFields::SIZE
+        | MetadataFields::NLINK
+        | MetadataFields::FILEID
+        | MetadataFields::BLOCKS;
     if options.time.is_some() {
-        masks |= AttrMask::MTIME | AttrMask::ATIME | AttrMask::CTIME;
+        masks |= MetadataFields::MTIME | MetadataFields::ATIME | MetadataFields::CTIME;
     }
     masks
 }
 
-fn entry_time(attrs: &VfAttrs, field: MetadataTimeField) -> Option<SystemTime> {
-    let metadata = Metadata::from(attrs.clone());
+fn entry_time(metadata: &Metadata, field: MetadataTimeField) -> Option<SystemTime> {
     match field {
         MetadataTimeField::Modification => metadata.modified(),
         MetadataTimeField::Access => metadata.accessed(),
@@ -99,24 +95,24 @@ fn entry_time(attrs: &VfAttrs, field: MetadataTimeField) -> Option<SystemTime> {
     }
 }
 
-fn usage_from_attrs(path: &Path, attrs: &VfAttrs, options: &TraversalOptions) -> Usage {
+fn usage_from_attrs(path: &Path, attrs: &Metadata, options: &TraversalOptions) -> Usage {
     Usage {
         path: path.to_path_buf(),
         // Directories report zero apparent size, like `Stat::new`.
-        size: if attrs.ftype == VfType::Directory {
+        size: if attrs.file_type() == VfType::Directory {
             0
         } else {
-            attrs.size
+            attrs.len()
         },
-        blocks: attrs.blocks,
+        blocks: attrs.blocks().unwrap_or_default(),
         inodes: 1,
         latest_time: options.time.and_then(|field| entry_time(attrs, field)),
     }
 }
 
-fn file_info(attrs: &VfAttrs) -> Option<FileInfo> {
-    (attrs.fileid != 0).then_some(FileInfo {
-        file_id: u128::from(attrs.fileid),
+fn file_info(attrs: &Metadata) -> Option<FileInfo> {
+    attrs.file_id().filter(|id| *id != 0).map(|id| FileInfo {
+        file_id: u128::from(id),
         // A single NFS export is one device; `-x` cannot cross it here.
         dev_id: 0,
     })
@@ -146,8 +142,8 @@ fn send(
 fn compute_dir(
     dir: &Path,
     depth: usize,
-    dir_attrs: &VfAttrs,
-    children: &HashMap<PathBuf, Vec<VfAttrs>>,
+    dir_attrs: &Metadata,
+    children: &HashMap<PathBuf, Vec<DirEntry>>,
     options: &TraversalOptions,
     print_path: &dyn Fn(&Path) -> PathBuf,
     print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
@@ -157,9 +153,8 @@ fn compute_dir(
     total.inodes = 1;
 
     for entry in children.get(dir).map_or(&[][..], Vec::as_slice) {
-        let Some(entry_path) = entry.file.path() else {
-            continue;
-        };
+        let entry_path = entry.path();
+        let metadata = entry.metadata();
         let rendered = print_path(entry_path);
 
         let name = rendered.file_name().map(|n| n.to_string_lossy());
@@ -177,11 +172,11 @@ fn compute_dir(
             continue;
         }
 
-        if entry.ftype == VfType::Directory {
+        if metadata.file_type() == VfType::Directory {
             let child = compute_dir(
                 entry_path,
                 depth + 1,
-                entry,
+                metadata,
                 children,
                 options,
                 print_path,
@@ -196,13 +191,13 @@ fn compute_dir(
             }
             send(print_tx, child, depth + 1)?;
         } else {
-            if let Some(info) = file_info(entry) {
+            if let Some(info) = file_info(metadata) {
                 if seen.contains(&info) && !options.count_links {
                     continue;
                 }
                 seen.insert(info);
             }
-            let usage = usage_from_attrs(&rendered, entry, options);
+            let usage = usage_from_attrs(&rendered, metadata, options);
             total.size += usage.size;
             total.blocks += usage.blocks;
             total.inodes += 1;
@@ -220,7 +215,7 @@ fn compute_dir(
 /// accumulated usage. `vroot` is the operand's path inside the backend
 /// namespace; emitted paths are mapped back onto `path` as the user typed it.
 fn traverse(
-    backend: &mut Backend,
+    backend: &Backend,
     path: &Path,
     vroot: &Path,
     options: &TraversalOptions,
@@ -235,28 +230,19 @@ fn traverse(
     };
 
     let masks = attr_mask(options);
-    let root_attrs = backend
-        .lstat(VfFile::from_os_path(vroot), masks)
-        .map_err(io::Error::other)?;
+    let root_attrs = backend.lstat(vroot, masks).map_err(io::Error::other)?;
 
-    if root_attrs.ftype != VfType::Directory {
+    if root_attrs.file_type() != VfType::Directory {
         return Ok(usage_from_attrs(path, &root_attrs, options));
     }
 
-    let entries = backend
-        .listdir_recursive(vroot, masks)
-        .map_err(io::Error::other)?;
+    let directories = backend.walk(vroot, masks).map_err(io::Error::other)?;
 
     // Group entries under their parent directory, preserving each directory's
     // enumeration order. The root itself is not in `entries`.
-    let mut children: HashMap<PathBuf, Vec<VfAttrs>> = HashMap::new();
-    for entry in entries {
-        if let Some(parent) = entry.file.path().and_then(Path::parent) {
-            children
-                .entry(parent.to_path_buf())
-                .or_default()
-                .push(entry);
-        }
+    let mut children: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
+    for directory in directories {
+        children.insert(directory.path, directory.entries);
     }
 
     let mut seen: HashSet<FileInfo> = HashSet::default();
@@ -293,12 +279,8 @@ pub fn try_du(
     let vroot = Path::new("/").join(relative);
 
     let mut backend = match std::env::var("VNFS_IMPL").as_deref() {
-        Ok("dummy") => {
-            Backend::Dummy(DummyVecFs::try_new(mount.point.clone()).map_err(io::Error::other)?)
-        }
-        Ok("nfs") => Backend::Nfs(Box::new(
-            NfsVecFs::connect(&mount.server).map_err(io::Error::other)?,
-        )),
+        Ok("dummy") => Backend::Dummy(Mounted::new(&mount.point).map_err(io::Error::other)?),
+        Ok("nfs") => Backend::Nfs(Nfs::connect(&mount.server).map_err(io::Error::other)?),
         _ => return Ok(None),
     };
 
@@ -317,7 +299,7 @@ fn print_stats() {
     if std::env::var("VNFS_STATS").as_deref() != Ok("1") {
         return;
     }
-    let (compounds, ops, bytes, max_ops) = ::vnfs::legacy::compound::compound_stats();
+    let (compounds, ops, bytes, max_ops) = vnfs::backend::compound::compound_stats();
     if compounds > 0 {
         eprintln!(
             "[vnfs] compounds={compounds} avg_ops={:.2} max_ops={max_ops} avg_bytes={:.0} total_bytes={bytes}",
@@ -325,7 +307,7 @@ fn print_stats() {
             bytes as f64 / compounds as f64
         );
     }
-    let (calls, micros) = ::vnfs::legacy::compound::rpc_stats();
+    let (calls, micros) = vnfs::backend::compound::rpc_stats();
     if calls > 0 {
         eprintln!(
             "[vnfs] rpc_calls={calls} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
@@ -357,8 +339,7 @@ mod tests {
     /// `(path, size, inodes, depth)` for every emitted entry plus the root
     /// total.
     fn run(root: &Path, options: &TraversalOptions) -> (Vec<(PathBuf, u64, u64, usize)>, Usage) {
-        let mut backend =
-            Backend::Dummy(DummyVecFs::try_new(root.to_path_buf()).expect("dummy root"));
+        let mut backend = Backend::Dummy(Mounted::new(root).expect("dummy root"));
         let (tx, rx) = mpsc::channel();
         let total = traverse(&mut backend, root, Path::new("/"), options, &tx).expect("traverse");
         drop(tx);

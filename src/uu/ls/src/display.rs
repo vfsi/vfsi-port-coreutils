@@ -32,10 +32,12 @@ use glob::MatchOptions;
 #[cfg(unix)]
 use rustc_hash::FxHashMap;
 use term_grid::{DEFAULT_SEPARATOR_SIZE, Direction, Filling, Grid, GridOptions};
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+use vnfs::backend as vfsi_sync;
 
 #[cfg(unix)]
 use uucore::entries;
-#[cfg(feature = "vnfs")]
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
 use uucore::fs::display_permissions_unix;
 #[cfg(any(
     target_os = "freebsd",
@@ -1035,15 +1037,15 @@ fn display_item_long(
         // mount one xattr RPC per file. Only trust it when it was actually
         // requested and returned; otherwise probe locally.
         let is_acl_set = match item.metadata() {
-            #[cfg(feature = "vnfs")]
-            Some(LsMeta::Vf(a)) if a.returned.contains(vnfs::AttrMask::NAMED_ATTR) => {
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Some(LsMeta::Vf(a)) if a.returned.contains(vfsi_sync::AttrMask::NAMED_ATTR) => {
                 a.has_named_attr
             }
             _ => has_acl(item.path(), item.must_dereference),
         };
         let permissions = match md {
             LsMeta::Std(metadata) => display_permissions(metadata, true),
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             LsMeta::Vf(_) => display_permissions_unix(md.mode(), true),
         };
         state.display_buf.extend(permissions.as_bytes());
@@ -1449,8 +1451,8 @@ fn calculate_padding_collection(
                     target_os = "netbsd"
                 ))]
                 let is_acl_set = match item.metadata() {
-                    #[cfg(feature = "vnfs")]
-                    Some(LsMeta::Vf(a)) if a.returned.contains(vnfs::AttrMask::NAMED_ATTR) => {
+                    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+                    Some(LsMeta::Vf(a)) if a.returned.contains(vfsi_sync::AttrMask::NAMED_ATTR) => {
                         a.has_named_attr
                     }
                     _ => has_acl(item.path(), item.must_dereference),

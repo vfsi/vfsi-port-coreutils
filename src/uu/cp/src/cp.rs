@@ -56,7 +56,7 @@ use crate::copydir::copy_directory;
 
 mod copydir;
 mod platform;
-#[cfg(all(feature = "vnfs", unix))]
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
 mod vfsi;
 
 #[derive(Debug, Error)]
@@ -1482,7 +1482,7 @@ pub fn copy(sources: &[PathBuf], target: &Path, options: &Options) -> CopyResult
         None
     };
 
-    #[cfg(all(feature = "vnfs", unix))]
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
     if !options.attributes_only
         && matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
         && options.reflink_mode != ReflinkMode::Always
@@ -3067,7 +3067,7 @@ fn copy_helper(
         // applying O_NOFOLLOW here only with `-P`.
         #[cfg(unix)]
         let nofollow = !options.dereference(source_in_command_line);
-        #[cfg(all(feature = "vnfs", unix))]
+        #[cfg(all(feature = "vnfs", target_os = "linux"))]
         let vfsi_method = if !options.attributes_only
             && options.reflink_mode != ReflinkMode::Always
             && options.sparse_mode != SparseMode::Always
@@ -3077,7 +3077,7 @@ fn copy_helper(
         } else {
             None
         };
-        #[cfg(not(all(feature = "vnfs", unix)))]
+        #[cfg(not(all(feature = "vnfs", target_os = "linux")))]
         let vfsi_method: Option<&str> = None;
 
         let copy_debug = if vfsi_method.is_some() {

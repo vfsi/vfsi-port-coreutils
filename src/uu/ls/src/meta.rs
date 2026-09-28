@@ -8,18 +8,20 @@
 //! vectorized filesystem backend. This keeps the output layer independent of
 //! how each entry's attributes were obtained.
 
-#[cfg(feature = "vnfs")]
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
 use std::ffi::OsString;
 use std::fs::DirEntry;
 use std::io;
 use std::path::Path;
-#[cfg(feature = "vnfs")]
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
 use std::path::PathBuf;
-#[cfg(any(unix, feature = "vnfs"))]
+#[cfg(any(unix, all(feature = "vnfs", target_os = "linux")))]
 use std::time::Duration;
 use std::time::SystemTime;
-#[cfg(any(unix, feature = "vnfs"))]
+#[cfg(any(unix, all(feature = "vnfs", target_os = "linux")))]
 use std::time::UNIX_EPOCH;
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+use vnfs::backend as vfsi_sync;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -183,7 +185,7 @@ impl LsFileType {
     }
 
     /// NFSv4 `NF4*` file type code (see `nfsv41_sys`).
-    #[cfg(feature = "vnfs")]
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
     pub fn from_ftype(ftype: u32) -> Self {
         match ftype {
             1 => Self::File,        // NF4REG
@@ -225,12 +227,12 @@ impl LsFileType {
 #[derive(Debug, Clone)]
 pub enum LsMeta {
     Std(std::fs::Metadata),
-    #[cfg(feature = "vnfs")]
-    Vf(vnfs::VfAttrs),
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+    Vf(vfsi_sync::VfAttrs),
 }
 
 impl LsMeta {
-    #[cfg(any(unix, feature = "vnfs"))]
+    #[cfg(any(unix, all(feature = "vnfs", target_os = "linux")))]
     fn secs_nsecs(secs: i64, nsecs: u32) -> SystemTime {
         let base = if secs >= 0 {
             UNIX_EPOCH + Duration::from_secs(secs as u64)
@@ -243,9 +245,9 @@ impl LsMeta {
     pub fn len(&self) -> u64 {
         match self {
             Self::Std(m) => m.len(),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::SIZE) => v.size,
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::SIZE) => v.size,
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => 0,
         }
     }
@@ -253,9 +255,9 @@ impl LsMeta {
     pub fn nlink(&self) -> u64 {
         match self {
             Self::Std(m) => std_nlink(m),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::NLINK) => v.nlink as u64,
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::NLINK) => v.nlink as u64,
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => 1,
         }
     }
@@ -263,9 +265,9 @@ impl LsMeta {
     pub fn uid(&self) -> u32 {
         match self {
             Self::Std(m) => std_uid(m),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::UID) => v.uid,
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::UID) => v.uid,
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => 0,
         }
     }
@@ -273,9 +275,9 @@ impl LsMeta {
     pub fn gid(&self) -> u32 {
         match self {
             Self::Std(m) => std_gid(m),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::GID) => v.gid,
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::GID) => v.gid,
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => 0,
         }
     }
@@ -283,9 +285,9 @@ impl LsMeta {
     pub fn rdev(&self) -> u64 {
         match self {
             Self::Std(m) => std_rdev(m),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::RDEV) => v.rdev,
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::RDEV) => v.rdev,
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => 0,
         }
     }
@@ -293,9 +295,9 @@ impl LsMeta {
     pub fn ino(&self) -> u64 {
         match self {
             Self::Std(m) => std_ino(m),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::FILEID) => v.fileid,
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::FILEID) => v.fileid,
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => 0,
         }
     }
@@ -303,9 +305,9 @@ impl LsMeta {
     pub fn blocks(&self) -> u64 {
         match self {
             Self::Std(m) => std_blocks(m),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::BLOCKS) => v.blocks,
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::BLOCKS) => v.blocks,
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => 0,
         }
     }
@@ -313,9 +315,9 @@ impl LsMeta {
     pub fn mode(&self) -> u32 {
         match self {
             Self::Std(m) => std_mode(m),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::MODE) => v.mode,
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::MODE) => v.mode,
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => 0,
         }
     }
@@ -323,7 +325,7 @@ impl LsMeta {
     pub fn file_type(&self) -> LsFileType {
         match self {
             Self::Std(m) => LsFileType::from_std(m.file_type()),
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => LsFileType::from_ftype(v.ftype.as_nfs()),
         }
     }
@@ -335,11 +337,11 @@ impl LsMeta {
     pub fn mtime(&self) -> Option<SystemTime> {
         match self {
             Self::Std(m) => m.modified().ok(),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::MTIME) => {
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::MTIME) => {
                 Some(Self::secs_nsecs(v.mtime_sec, v.mtime_nsec))
             }
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => None,
         }
     }
@@ -347,11 +349,11 @@ impl LsMeta {
     pub fn atime(&self) -> Option<SystemTime> {
         match self {
             Self::Std(m) => m.accessed().ok(),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::ATIME) => {
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::ATIME) => {
                 Some(Self::secs_nsecs(v.atime_sec, v.atime_nsec))
             }
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => None,
         }
     }
@@ -359,22 +361,25 @@ impl LsMeta {
     pub fn ctime(&self) -> Option<SystemTime> {
         match self {
             Self::Std(m) => std_ctime(m),
-            #[cfg(feature = "vnfs")]
-            Self::Vf(v) if v.returned.contains(vnfs::AttrMask::CTIME) => {
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::CTIME) => {
                 Some(Self::secs_nsecs(v.ctime_sec, v.ctime_nsec))
             }
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => None,
         }
     }
 
     /// The `std::fs::Metadata`, when this is a local entry (used only for
     /// coloring; the vectorized backend cannot reconstruct one).
-    #[cfg_attr(not(feature = "vnfs"), allow(clippy::unnecessary_wraps))]
+    #[cfg_attr(
+        not(all(feature = "vnfs", target_os = "linux")),
+        allow(clippy::unnecessary_wraps)
+    )]
     pub fn as_std_metadata(&self) -> Option<&std::fs::Metadata> {
         match self {
             Self::Std(m) => Some(m),
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(_) => None,
         }
     }
@@ -393,11 +398,11 @@ impl LsMeta {
 /// A directory entry, either from `std::fs` or from the vectorized backend.
 pub enum LsDirEntry {
     Std(DirEntry),
-    #[cfg(feature = "vnfs")]
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
     Vf {
         path: PathBuf,
         name: OsString,
-        attrs: vnfs::VfAttrs,
+        attrs: vfsi_sync::VfAttrs,
     },
 }
 
@@ -409,7 +414,7 @@ pub struct LsReadDir {
 
 enum LsReadDirInner {
     Std(std::fs::ReadDir),
-    #[cfg(feature = "vnfs")]
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
     Vf(std::vec::IntoIter<LsDirEntry>),
 }
 
@@ -420,7 +425,7 @@ impl LsReadDir {
         }
     }
 
-    #[cfg(feature = "vnfs")]
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
     pub fn from_vf(entries: Vec<LsDirEntry>) -> Self {
         Self {
             inner: LsReadDirInner::Vf(entries.into_iter()),
@@ -434,7 +439,7 @@ impl Iterator for LsReadDir {
     fn next(&mut self) -> Option<io::Result<LsDirEntry>> {
         match &mut self.inner {
             LsReadDirInner::Std(rd) => rd.next().map(|r| r.map(LsDirEntry::Std)),
-            #[cfg(feature = "vnfs")]
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
             LsReadDirInner::Vf(it) => it.next().map(Ok),
         }
     }

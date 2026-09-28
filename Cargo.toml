@@ -420,12 +420,13 @@ unindent = "0.2.3"
 unit-prefix = "0.5"
 utmp-classic = "0.1.6"
 uutils_term_grid = "0.8"
-vnfs = { version = "=0.0.13", features = ["dummy"] }
+vnfs = { path = "../../vnfs/crates/vnfs", features = ["dummy"] }
 walkdir = "2.5"
 wild = "2.2.1"
 windows-sys = { version = "0.61.0", default-features = false }
 xattr = { version = "1.3.1", default-features = false }
 z85 = "3.0.5"
+
 zip = { version = "8.0.0", default-features = false, features = ["deflate"] }
 
 hex = "0.4.3"
