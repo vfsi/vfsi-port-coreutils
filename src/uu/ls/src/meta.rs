@@ -21,7 +21,7 @@ use std::time::SystemTime;
 #[cfg(any(unix, all(feature = "vnfs", target_os = "linux")))]
 use std::time::UNIX_EPOCH;
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
-use vnfs::backend as vfsi_sync;
+use vnfs::{Metadata as VnfsMetadata, VfType};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -184,18 +184,18 @@ impl LsFileType {
         }
     }
 
-    /// NFSv4 `NF4*` file type code (see `nfsv41_sys`).
+    /// File type reported by the application-facing vnfs API.
     #[cfg(all(feature = "vnfs", target_os = "linux"))]
-    pub fn from_ftype(ftype: u32) -> Self {
+    pub fn from_vf_type(ftype: VfType) -> Self {
         match ftype {
-            1 => Self::File,        // NF4REG
-            2 => Self::Dir,         // NF4DIR
-            5 => Self::Symlink,     // NF4LNK
-            6 => Self::BlockDevice, // NF4BLK
-            7 => Self::CharDevice,  // NF4CHR
-            8 => Self::Fifo,        // NF4FIFO
-            9 => Self::Socket,      // NF4SOCK
-            _ => Self::Unknown,
+            VfType::Regular => Self::File,
+            VfType::Directory => Self::Dir,
+            VfType::Symlink => Self::Symlink,
+            VfType::BlockDevice => Self::BlockDevice,
+            VfType::CharDevice => Self::CharDevice,
+            VfType::Fifo => Self::Fifo,
+            VfType::Socket => Self::Socket,
+            VfType::Other(_) => Self::Unknown,
         }
     }
 
@@ -228,7 +228,7 @@ impl LsFileType {
 pub enum LsMeta {
     Std(std::fs::Metadata),
     #[cfg(all(feature = "vnfs", target_os = "linux"))]
-    Vf(vfsi_sync::VfAttrs),
+    Vf(VnfsMetadata),
 }
 
 impl LsMeta {
@@ -246,9 +246,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => m.len(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::SIZE) => v.size,
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => 0,
+            Self::Vf(v) => v.len(),
         }
     }
 
@@ -256,9 +254,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => std_nlink(m),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::NLINK) => v.nlink as u64,
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => 1,
+            Self::Vf(v) => v.nlink().map_or(1, u64::from),
         }
     }
 
@@ -266,9 +262,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => std_uid(m),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::UID) => v.uid,
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => 0,
+            Self::Vf(v) => v.uid().unwrap_or(0),
         }
     }
 
@@ -276,9 +270,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => std_gid(m),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::GID) => v.gid,
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => 0,
+            Self::Vf(v) => v.gid().unwrap_or(0),
         }
     }
 
@@ -286,9 +278,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => std_rdev(m),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::RDEV) => v.rdev,
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => 0,
+            Self::Vf(v) => v.device_id().unwrap_or(0),
         }
     }
 
@@ -296,9 +286,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => std_ino(m),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::FILEID) => v.fileid,
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => 0,
+            Self::Vf(v) => v.file_id().unwrap_or(0),
         }
     }
 
@@ -306,9 +294,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => std_blocks(m),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::BLOCKS) => v.blocks,
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => 0,
+            Self::Vf(v) => v.blocks().unwrap_or(0),
         }
     }
 
@@ -316,9 +302,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => std_mode(m),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::MODE) => v.mode,
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => 0,
+            Self::Vf(v) => v.mode().unwrap_or(0),
         }
     }
 
@@ -326,7 +310,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => LsFileType::from_std(m.file_type()),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) => LsFileType::from_ftype(v.ftype.as_nfs()),
+            Self::Vf(v) => LsFileType::from_vf_type(v.file_type()),
         }
     }
 
@@ -338,11 +322,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => m.modified().ok(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::MTIME) => {
-                Some(Self::secs_nsecs(v.mtime_sec, v.mtime_nsec))
-            }
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => None,
+            Self::Vf(v) => v.modified(),
         }
     }
 
@@ -350,11 +330,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => m.accessed().ok(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::ATIME) => {
-                Some(Self::secs_nsecs(v.atime_sec, v.atime_nsec))
-            }
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => None,
+            Self::Vf(v) => v.accessed(),
         }
     }
 
@@ -362,11 +338,7 @@ impl LsMeta {
         match self {
             Self::Std(m) => std_ctime(m),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(v) if v.returned.contains(vfsi_sync::AttrMask::CTIME) => {
-                Some(Self::secs_nsecs(v.ctime_sec, v.ctime_nsec))
-            }
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Self::Vf(_) => None,
+            Self::Vf(v) => v.changed(),
         }
     }
 
@@ -402,7 +374,7 @@ pub enum LsDirEntry {
     Vf {
         path: PathBuf,
         name: OsString,
-        attrs: vfsi_sync::VfAttrs,
+        entry: vnfs::DirEntry,
     },
 }
 

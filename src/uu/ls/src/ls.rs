@@ -29,7 +29,7 @@ use std::{
 };
 use thiserror::Error;
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
-use vnfs::backend as vfsi_sync;
+use vnfs::DirEntry as VnfsDirEntry;
 
 #[cfg(unix)]
 use uucore::libc::{S_IXGRP, S_IXOTH, S_IXUSR};
@@ -916,15 +916,15 @@ impl<'a> PathData<'a> {
     /// vectorized backend. When dereferencing is requested the metadata is
     /// left to be resolved from the local filesystem instead.
     #[cfg(all(feature = "vnfs", target_os = "linux"))]
-    fn from_vf(path: PathBuf, name: OsString, attrs: vfsi_sync::VfAttrs, config: &Config) -> Self {
-        let ftype = attrs.ftype.as_nfs();
+    fn from_vf(path: PathBuf, name: OsString, entry: VnfsDirEntry, config: &Config) -> Self {
+        let ftype = entry.file_type();
         let must_dereference = matches!(&config.dereference, Dereference::All);
         let md = OnceCell::new();
         let ft = OnceCell::new();
         let security_context = OnceCell::new();
         if !must_dereference {
-            let _ = md.set(Some(LsMeta::Vf(attrs)));
-            let _ = ft.set(Some(LsFileType::from_ftype(ftype)));
+            let _ = md.set(Some(LsMeta::Vf(entry.metadata().clone())));
+            let _ = ft.set(Some(LsFileType::from_vf_type(ftype)));
         }
         Self {
             md,
@@ -1400,9 +1400,9 @@ fn collect_directory_entries<O: LsOutput>(
                 }
             }
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Ok(LsDirEntry::Vf { path, name, attrs }) => {
+            Ok(LsDirEntry::Vf { path, name, entry }) => {
                 if display::should_display(name.as_os_str(), config) {
-                    entries.push(PathData::from_vf(path, name, attrs, config));
+                    entries.push(PathData::from_vf(path, name, entry, config));
                 }
             }
         }
@@ -1515,12 +1515,7 @@ fn list_recursive_vf<O: LsOutput>(
             ));
         }
         for a in &w.entries {
-            let name = a
-                .file
-                .path()
-                .and_then(|p| p.file_name())
-                .map(OsStr::to_os_string)
-                .unwrap_or_default();
+            let name = a.file_name().map(OsStr::to_os_string).unwrap_or_default();
             if !display::should_display(&name, config) {
                 continue;
             }
@@ -1748,19 +1743,16 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
 /// corresponding [`PathData`], so the vectorized recursive walk can order its
 /// output (and thus the sub-directory visit order) identically to the normal
 /// path under any locale and sort mode.
-pub(crate) fn sort_vf_entries(entries: &mut [vfsi_sync::VfAttrs], config: &Config) {
+pub(crate) fn sort_vf_entries(entries: &mut [VnfsDirEntry], config: &Config) {
     use crate::config::Sort;
-    fn name_of(a: &vfsi_sync::VfAttrs) -> &OsStr {
-        a.file
-            .path()
-            .and_then(|p| p.file_name())
-            .unwrap_or_default()
+    fn name_of(a: &VnfsDirEntry) -> &OsStr {
+        a.file_name().unwrap_or_default()
     }
-    fn ext_of(e: &vfsi_sync::VfAttrs) -> Option<&OsStr> {
-        e.file.path().and_then(|p| p.extension())
+    fn ext_of(e: &VnfsDirEntry) -> Option<&OsStr> {
+        e.path().extension()
     }
-    fn stem_of(e: &vfsi_sync::VfAttrs) -> Option<&OsStr> {
-        e.file.path().and_then(|p| p.file_stem())
+    fn stem_of(e: &VnfsDirEntry) -> Option<&OsStr> {
+        e.path().file_stem()
     }
     match config.sort {
         Sort::Time => {
@@ -1768,7 +1760,12 @@ pub(crate) fn sort_vf_entries(entries: &mut [vfsi_sync::VfAttrs], config: &Confi
                 .sort_unstable_by_key(|k| Reverse(vf_time(k, config.time).unwrap_or(UNIX_EPOCH)));
         }
         Sort::Size => {
-            entries.sort_unstable_by(|a, b| b.size.cmp(&a.size).then(name_of(a).cmp(name_of(b))));
+            entries.sort_unstable_by(|a, b| {
+                b.metadata()
+                    .len()
+                    .cmp(&a.metadata().len())
+                    .then(name_of(a).cmp(name_of(b)))
+            });
         }
         Sort::Name => {
             if uucore::i18n::collator::should_use_locale_collation() {
@@ -1787,7 +1784,7 @@ pub(crate) fn sort_vf_entries(entries: &mut [vfsi_sync::VfAttrs], config: &Confi
                 os_str_as_bytes_lossy(name_of(a)).as_ref(),
                 os_str_as_bytes_lossy(name_of(b)).as_ref(),
             )
-            .then(a.file.path().cmp(&b.file.path()))
+            .then(a.path().cmp(b.path()))
         }),
         Sort::Extension => entries
             .sort_unstable_by(|a, b| ext_of(a).cmp(&ext_of(b)).then(stem_of(a).cmp(&stem_of(b)))),
@@ -1803,32 +1800,19 @@ pub(crate) fn sort_vf_entries(entries: &mut [vfsi_sync::VfAttrs], config: &Confi
         entries.reverse();
     }
     if config.group_directories_first && config.sort != Sort::None {
-        entries.sort_by_key(|p| p.ftype != vfsi_sync::VfType::Directory);
+        entries.sort_by_key(|p| p.file_type() != vnfs::VfType::Directory);
     }
 }
 
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
-fn vf_time(a: &vfsi_sync::VfAttrs, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
-    use std::time::Duration;
+fn vf_time(a: &VnfsDirEntry, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
     use uucore::fsext::MetadataTimeField;
-    // Only trust a time field the backend actually returned; `walk` falls
-    // back to the epoch for missing ones.
-    let returned = match field {
-        MetadataTimeField::Modification => vfsi_sync::AttrMask::MTIME,
-        MetadataTimeField::Access => vfsi_sync::AttrMask::ATIME,
-        MetadataTimeField::Change => vfsi_sync::AttrMask::CTIME,
-        MetadataTimeField::Birth => return None,
-    };
-    if !a.returned.contains(returned) {
-        return None;
+    match field {
+        MetadataTimeField::Modification => a.metadata().modified(),
+        MetadataTimeField::Access => a.metadata().accessed(),
+        MetadataTimeField::Change => a.metadata().changed(),
+        MetadataTimeField::Birth => None,
     }
-    let (sec, nsec) = match field {
-        MetadataTimeField::Modification => (a.mtime_sec, a.mtime_nsec),
-        MetadataTimeField::Access => (a.atime_sec, a.atime_nsec),
-        MetadataTimeField::Change => (a.ctime_sec, a.ctime_nsec),
-        MetadataTimeField::Birth => return None,
-    };
-    Some(UNIX_EPOCH + Duration::new(sec.max(0) as u64, nsec))
 }
 
 fn ls_time(md: &LsMeta, md_time: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {

@@ -32,8 +32,6 @@ use glob::MatchOptions;
 #[cfg(unix)]
 use rustc_hash::FxHashMap;
 use term_grid::{DEFAULT_SEPARATOR_SIZE, Direction, Filling, Grid, GridOptions};
-#[cfg(all(feature = "vnfs", target_os = "linux"))]
-use vnfs::backend as vfsi_sync;
 
 #[cfg(unix)]
 use uucore::entries;
@@ -1038,8 +1036,8 @@ fn display_item_long(
         // requested and returned; otherwise probe locally.
         let is_acl_set = match item.metadata() {
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Some(LsMeta::Vf(a)) if a.returned.contains(vfsi_sync::AttrMask::NAMED_ATTR) => {
-                a.has_named_attr
+            Some(LsMeta::Vf(a)) if a.has_named_attributes().is_some() => {
+                a.has_named_attributes().unwrap_or(false)
             }
             _ => has_acl(item.path(), item.must_dereference),
         };
@@ -1452,8 +1450,8 @@ fn calculate_padding_collection(
                 ))]
                 let is_acl_set = match item.metadata() {
                     #[cfg(all(feature = "vnfs", target_os = "linux"))]
-                    Some(LsMeta::Vf(a)) if a.returned.contains(vfsi_sync::AttrMask::NAMED_ATTR) => {
-                        a.has_named_attr
+                    Some(LsMeta::Vf(a)) if a.has_named_attributes().is_some() => {
+                        a.has_named_attributes().unwrap_or(false)
                     }
                     _ => has_acl(item.path(), item.must_dereference),
                 };

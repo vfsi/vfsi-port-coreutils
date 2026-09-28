@@ -14,12 +14,15 @@ use std::path::{Path, PathBuf};
 
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
-use vnfs::backend as vfsi_sync;
-use vnfs::backend::{VfAttrs, VfFile, WalkEntry};
 use vnfs::{
     DirEntry, DirectoryListing, MetadataFields, Mounted, Nfs, NfsClient, ReadDirOptions, VfError,
     WalkOptions,
 };
+
+pub(crate) struct WalkEntry {
+    pub path: PathBuf,
+    pub entries: Vec<DirEntry>,
+}
 
 /// Runtime backend selection. `VNFS_IMPL=off` (or unset) uses `std::fs`;
 /// `dummy` uses the mounted kernel tree; `nfs` talks to the NFS
@@ -66,81 +69,6 @@ fn full_mask(config: &crate::config::Config) -> MetadataFields {
     mask
 }
 
-fn time_parts(time: std::time::SystemTime) -> (i64, u32) {
-    use std::time::UNIX_EPOCH;
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => (duration.as_secs() as i64, duration.subsec_nanos()),
-        Err(error) => {
-            let duration = error.duration();
-            let seconds = duration.as_secs() as i64;
-            if duration.subsec_nanos() == 0 {
-                (-seconds, 0)
-            } else {
-                (-seconds - 1, 1_000_000_000 - duration.subsec_nanos())
-            }
-        }
-    }
-}
-
-/// Adapt the high-level metadata to ls's existing presentation model. This
-/// adapter does not perform filesystem I/O; every field came from READDIR.
-fn into_attrs(entry: DirEntry, requested: MetadataFields) -> VfAttrs {
-    let metadata = entry.metadata();
-    let mut attrs = VfAttrs {
-        file: VfFile::from_os_path(entry.path()),
-        masks: requested,
-        ftype: metadata.file_type(),
-        size: metadata.len(),
-        returned: MetadataFields::SIZE,
-        ..VfAttrs::default()
-    };
-    if let Some(value) = metadata.mode() {
-        attrs.mode = value;
-        attrs.returned |= MetadataFields::MODE;
-    }
-    if let Some(value) = metadata.nlink() {
-        attrs.nlink = value;
-        attrs.returned |= MetadataFields::NLINK;
-    }
-    if let Some(value) = metadata.file_id() {
-        attrs.fileid = value;
-        attrs.returned |= MetadataFields::FILEID;
-    }
-    if let Some(value) = metadata.blocks() {
-        attrs.blocks = value;
-        attrs.returned |= MetadataFields::BLOCKS;
-    }
-    if let Some(value) = metadata.uid() {
-        attrs.uid = value;
-        attrs.returned |= MetadataFields::UID;
-    }
-    if let Some(value) = metadata.gid() {
-        attrs.gid = value;
-        attrs.returned |= MetadataFields::GID;
-    }
-    if let Some(value) = metadata.device_id() {
-        attrs.rdev = value;
-        attrs.returned |= MetadataFields::RDEV;
-    }
-    if let Some(value) = metadata.modified() {
-        (attrs.mtime_sec, attrs.mtime_nsec) = time_parts(value);
-        attrs.returned |= MetadataFields::MTIME;
-    }
-    if let Some(value) = metadata.accessed() {
-        (attrs.atime_sec, attrs.atime_nsec) = time_parts(value);
-        attrs.returned |= MetadataFields::ATIME;
-    }
-    if let Some(value) = metadata.changed() {
-        (attrs.ctime_sec, attrs.ctime_nsec) = time_parts(value);
-        attrs.returned |= MetadataFields::CTIME;
-    }
-    if let Some(value) = metadata.has_named_attributes() {
-        attrs.has_named_attr = value;
-        attrs.returned |= MetadataFields::NAMED_ATTR;
-    }
-    attrs
-}
-
 /// The application-facing clients selected for this mount.
 enum Backend {
     Dummy(Mounted),
@@ -159,41 +87,11 @@ impl Backend {
         }
     }
 
-    fn listdir(
-        &self,
-        dir: &Path,
-        masks: MetadataFields,
-        max_count: usize,
-        recursive: bool,
-    ) -> vnfs::VfResult<Vec<VfAttrs>> {
-        let mut attrs: Vec<VfAttrs> = if recursive {
-            self.walk(dir, masks, &mut |_, _| {})?
-                .into_iter()
-                .flat_map(|directory| directory.entries)
-                .collect()
-        } else {
-            self.read_dirs(&[dir], masks)?
-                .pop()
-                .map(|listing| {
-                    listing
-                        .entries
-                        .into_iter()
-                        .map(|entry| into_attrs(entry, masks))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        if max_count != 0 {
-            attrs.truncate(max_count);
-        }
-        Ok(attrs)
-    }
-
     fn walk(
         &self,
         root: &Path,
         masks: MetadataFields,
-        sort: &mut dyn FnMut(&Path, &mut Vec<VfAttrs>),
+        sort: &mut dyn FnMut(&Path, &mut Vec<DirEntry>),
     ) -> vnfs::VfResult<Vec<WalkEntry>> {
         let tree = match self {
             Self::Dummy(fs) => fs.walk_with_options(root, masks, WalkOptions::default()),
@@ -201,11 +99,7 @@ impl Backend {
         }?;
         let mut by_path = std::collections::HashMap::with_capacity(tree.len());
         for listing in tree {
-            let mut entries: Vec<VfAttrs> = listing
-                .entries
-                .into_iter()
-                .map(|entry| into_attrs(entry, masks))
-                .collect();
+            let mut entries = listing.entries;
             sort(&listing.path, &mut entries);
             by_path.insert(listing.path, entries);
         }
@@ -216,43 +110,13 @@ impl Backend {
                 continue;
             };
             for child in entries.iter().rev() {
-                if child.ftype == vnfs::VfType::Directory
-                    && let Some(path) = child.file.path()
-                {
-                    pending.push(path.to_path_buf());
+                if child.file_type() == vnfs::VfType::Directory {
+                    pending.push(child.path().to_path_buf());
                 }
             }
             ordered.push(WalkEntry { path, entries });
         }
         Ok(ordered)
-    }
-
-    fn listdirv(
-        &self,
-        dirs: &[&Path],
-        masks: MetadataFields,
-        max_entries: usize,
-        recursive: bool,
-        cb: &mut dyn FnMut(&VfAttrs, &Path) -> bool,
-    ) -> vnfs::VfResult<()> {
-        if recursive {
-            return Err(VfError::client(0, vfsi_sync::ERR_INVAL));
-        }
-        let listings = self.read_dirs(dirs, masks)?;
-        let mut seen = 0usize;
-        for listing in listings {
-            for entry in listing.entries {
-                if max_entries != 0 && seen >= max_entries {
-                    return Ok(());
-                }
-                let attrs = into_attrs(entry, masks);
-                if !cb(&attrs, &listing.path) {
-                    return Ok(());
-                }
-                seen += 1;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -264,7 +128,13 @@ struct VfContext {
 impl Drop for VfContext {
     fn drop(&mut self) {
         if std::env::var("VNFS_STATS").as_deref() == Ok("1") {
-            let (n, ops, bytes, max) = vnfs::backend::compound::compound_stats();
+            let stats = vnfs::diagnostics::snapshot();
+            let (n, ops, bytes, max) = (
+                stats.compounds,
+                stats.operations,
+                stats.compound_bytes,
+                stats.max_operations,
+            );
             if n > 0 {
                 eprintln!(
                     "[vnfs] compounds={n} avg_ops={:.2} max_ops={max} avg_bytes={:.0} total_bytes={bytes}",
@@ -272,7 +142,7 @@ impl Drop for VfContext {
                     bytes as f64 / n as f64
                 );
             }
-            let (calls, us) = vnfs::backend::compound::rpc_stats();
+            let (calls, us) = (stats.rpc_calls, stats.rpc_micros);
             if calls > 0 {
                 eprintln!(
                     "[vnfs] rpc_calls={calls} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
@@ -332,24 +202,25 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
 
         let rel = path.strip_prefix(&ctx.mount.point).unwrap_or(path);
         let vpath = Path::new("/").join(rel);
-        let attrs = match ctx.backend.listdir(&vpath, full_mask(config), 0, false) {
-            Ok(attrs) => attrs,
+        let listing = match ctx.backend.read_dirs(&[&vpath], full_mask(config)) {
+            Ok(mut listings) => match listings.pop() {
+                Some(listing) => listing,
+                None => return Err(io::Error::other("vnfs returned no directory listing")),
+            },
             Err(error) if error.err_no() == uucore::libc::EFBIG as u32 => return Ok(None),
             Err(error) => return Err(vf_io_error(error)),
         };
 
-        let mut out = Vec::with_capacity(attrs.len());
-        for a in attrs {
-            let name = a
-                .file
-                .path()
-                .and_then(|p| p.file_name())
+        let mut out = Vec::with_capacity(listing.entries.len());
+        for entry in listing.entries {
+            let name = entry
+                .file_name()
                 .map(std::ffi::OsStr::to_os_string)
                 .unwrap_or_default();
             out.push(LsDirEntry::Vf {
                 path: path.join(&name),
                 name,
-                attrs: a,
+                entry,
             });
         }
         Ok(Some(LsReadDir::from_vf(out)))
@@ -363,7 +234,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
 fn ctx_open_many(
     ctx: &mut VfContext,
     kernel_dirs: &[&Path],
-    masks: vfsi_sync::AttrMask,
+    masks: MetadataFields,
 ) -> Vec<Option<LsReadDir>> {
     let vpaths: Vec<PathBuf> = kernel_dirs
         .iter()
@@ -373,41 +244,24 @@ fn ctx_open_many(
         })
         .collect();
     let refs: Vec<&Path> = vpaths.iter().map(PathBuf::as_path).collect();
-    let mut slot: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
-    for (i, v) in refs.iter().enumerate() {
-        slot.insert(v.to_path_buf(), i);
-    }
-    let mut entries: Vec<Vec<VfAttrs>> = vec![Vec::new(); refs.len()];
-    let mut cb = |a: &VfAttrs, dir: &Path| {
-        if let Some(&i) = slot.get(dir) {
-            entries[i].push(a.clone());
-        }
-        true
-    };
-    if ctx
-        .backend
-        .listdirv(&refs, masks, 0, false, &mut cb)
-        .is_err()
-    {
+    let Ok(listings) = ctx.backend.read_dirs(&refs, masks) else {
         // Callback entries can interleave across directories by READDIR page.
         // An error index identifies the failed operand, not which earlier
         // callback streams are complete.
         return std::iter::repeat_with(|| None).take(refs.len()).collect();
-    }
+    };
     let mut out = Vec::with_capacity(refs.len());
-    for i in 0..refs.len() {
-        let mut list = Vec::with_capacity(entries[i].len());
-        for attrs in &entries[i] {
-            let name = attrs
-                .file
-                .path()
-                .and_then(|p| p.file_name())
+    for (i, listing) in listings.into_iter().enumerate() {
+        let mut list = Vec::with_capacity(listing.entries.len());
+        for entry in listing.entries {
+            let name = entry
+                .file_name()
                 .map(std::ffi::OsStr::to_os_string)
                 .unwrap_or_default();
             list.push(LsDirEntry::Vf {
                 path: kernel_dirs[i].join(&name),
                 name,
-                attrs: attrs.clone(),
+                entry,
             });
         }
         out.push(Some(LsReadDir::from_vf(list)));
@@ -476,8 +330,8 @@ pub fn try_walk_vf(
 
         let rel = path.strip_prefix(&ctx.mount.point).unwrap_or(path);
         let vpath = Path::new("/").join(rel);
-        let mut sort = |_dir: &Path, attrs: &mut Vec<VfAttrs>| {
-            crate::sort_vf_entries(attrs, config);
+        let mut sort = |_dir: &Path, entries: &mut Vec<DirEntry>| {
+            crate::sort_vf_entries(entries, config);
         };
         let t0 = std::time::Instant::now();
         let tree = match ctx.backend.walk(&vpath, full_mask(config), &mut sort) {
@@ -542,12 +396,39 @@ mod tests {
         let mut ctx = dummy_ctx(root.path());
         let dirs = [root.path().join("d1"), root.path().join("d2")];
         let paths: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
-        let masks = vfsi_sync::AttrMask::MODE | vfsi_sync::AttrMask::SIZE;
+        let masks = MetadataFields::MODE | MetadataFields::SIZE;
         let mut out = ctx_open_many(&mut ctx, &paths, masks);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(Option::is_some));
         assert_eq!(names(out[0].as_mut()), vec!["f.txt"]);
         assert_eq!(names(out[1].as_mut()), vec!["f.txt"]);
+    }
+
+    #[test]
+    fn open_many_preserves_duplicate_operands_and_high_level_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("d")).unwrap();
+        std::fs::write(root.path().join("d/item"), b"hello").unwrap();
+        let mut ctx = dummy_ctx(root.path());
+        let path = root.path().join("d");
+        let mut results = ctx_open_many(
+            &mut ctx,
+            &[path.as_path(), path.as_path()],
+            MetadataFields::MODE | MetadataFields::SIZE | MetadataFields::NLINK,
+        );
+        assert_eq!(results.len(), 2);
+        for result in &mut results {
+            let entry = result.as_mut().unwrap().next().unwrap().unwrap();
+            let LsDirEntry::Vf { name, entry, .. } = entry else {
+                panic!("expected a vnfs entry");
+            };
+            assert_eq!(name, "item");
+            let metadata = crate::meta::LsMeta::Vf(entry.metadata().clone());
+            assert_eq!(metadata.len(), 5);
+            assert!(metadata.mode() != 0);
+            assert!(metadata.nlink() >= 1);
+            assert!(result.as_mut().unwrap().next().is_none());
+        }
     }
 
     #[test]
@@ -565,7 +446,7 @@ mod tests {
             root.path().join("d2"),
         ];
         let paths: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
-        let masks = vfsi_sync::AttrMask::MODE | vfsi_sync::AttrMask::SIZE;
+        let masks = MetadataFields::MODE | MetadataFields::SIZE;
         let out = ctx_open_many(&mut ctx, &paths, masks);
         assert!(out.iter().all(Option::is_none));
     }
@@ -581,7 +462,7 @@ mod tests {
         let fields = MetadataFields::MODE | MetadataFields::SIZE | MetadataFields::BLOCKS;
         let tree = backend
             .walk(Path::new("/"), fields, &mut |_, entries| {
-                entries.sort_by(|a, b| b.file.path().cmp(&a.file.path()));
+                entries.sort_by(|a, b| b.path().cmp(a.path()));
             })
             .unwrap();
         let paths: Vec<_> = tree
@@ -589,7 +470,7 @@ mod tests {
             .map(|directory| directory.path.as_path())
             .collect();
         assert_eq!(paths, [Path::new("/"), Path::new("/b"), Path::new("/a")]);
-        assert_eq!(tree[1].entries[0].size, 4);
-        assert!(tree[1].entries[0].returned.contains(MetadataFields::BLOCKS));
+        assert_eq!(tree[1].entries[0].metadata().len(), 4);
+        assert!(tree[1].entries[0].metadata().blocks().is_some());
     }
 }
