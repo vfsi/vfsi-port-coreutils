@@ -71,7 +71,8 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - { os: ubuntu-latest  , features: all             , workspace: true }
+          # vnfs needs libntirpc >= 6.3; Ubuntu 24.04's package is 4.3.
+          - { os: ubuntu-26.04  , features: all             , workspace: true }
           # The VFSI/NFS backend is Linux-only; exercise the portable Unix
           # feature set on macOS and reserve --all-features for Linux.
           - { os: macos-latest   , features: feat_os_unix    , workspace: true }
