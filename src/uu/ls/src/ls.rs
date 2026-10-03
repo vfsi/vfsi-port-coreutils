@@ -179,7 +179,6 @@ pub fn uu_app() -> Command {
                 options::format::LONG,
                 options::format::ACROSS,
                 options::format::COLUMNS,
-                options::DIRED,
             ]),
     )
     .arg(
@@ -255,8 +254,7 @@ pub fn uu_app() -> Command {
             .long(options::DIRED)
             .short('D')
             .help(translate!("ls-help-generate-dired-output"))
-            .action(ArgAction::SetTrue)
-            .overrides_with(options::HYPERLINK),
+            .action(ArgAction::SetTrue),
     )
     .arg(
         Arg::new(options::HYPERLINK)
@@ -271,8 +269,7 @@ pub fn uu_app() -> Command {
             .num_args(0..=1)
             .default_missing_value("always")
             .default_value("never")
-            .value_name("WHEN")
-            .overrides_with(options::DIRED),
+            .value_name("WHEN"),
     )
     // The next four arguments do not override with the other format
     // options, see the comment in Config::from for the reason.
@@ -807,11 +804,11 @@ enum PathDataDisplayName<'a> {
 /// Represents a Path along with it's associated data.
 /// Any data that will be reused several times makes sense to be added to this structure.
 /// Caching data here helps eliminate redundant syscalls to fetch same information.
-#[derive(Debug)]
 /// Internal representation of file/directory entry data.
 ///
 /// This struct is used internally for file enumeration. It can be converted
 /// to [`EntryInfo`] for programmatic access via the [`LsOutput`] trait.
+#[derive(Debug)]
 pub struct PathData<'a> {
     // Result<MetaData> got from symlink_metadata() or metadata() based on config
     md: OnceCell<Option<LsMeta>>,
@@ -1690,8 +1687,8 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
         Sort::Name => entries.sort_unstable_by(name_cmp),
         Sort::Version => entries.sort_unstable_by(|a, b| {
             version_cmp(
-                os_str_as_bytes_lossy(a.file_name()).as_ref(),
-                os_str_as_bytes_lossy(b.file_name()).as_ref(),
+                os_str_as_bytes_lossy(a.display_name()).as_ref(),
+                os_str_as_bytes_lossy(b.display_name()).as_ref(),
             )
             .then(a.path().cmp(b.path()))
         }),
