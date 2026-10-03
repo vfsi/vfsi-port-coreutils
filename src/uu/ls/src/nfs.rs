@@ -139,12 +139,11 @@ impl Drop for VfContext {
                 stats.max_operations,
             );
             if n > 0 {
-                let avg_bytes = bytes
-                    .map(|b| format!("{:.0}", b as f64 / n as f64))
-                    .unwrap_or_else(|| "unknown".into());
-                let bytes = bytes
-                    .map(|b| b.to_string())
-                    .unwrap_or_else(|| "unknown".into());
+                let avg_bytes = bytes.map_or_else(
+                    || "unknown".into(),
+                    |b| format!("{:.0}", b as f64 / n as f64),
+                );
+                let bytes = bytes.map_or_else(|| "unknown".into(), |b| b.to_string());
                 eprintln!(
                     "[vnfs] compounds={n} avg_ops={:.2} max_ops={max} avg_bytes={avg_bytes} total_bytes={bytes}",
                     ops as f64 / n as f64

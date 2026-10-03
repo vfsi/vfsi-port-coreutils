@@ -74,8 +74,7 @@ impl Backend {
             .strip_prefix(&mount.point)
             .map_err(|_| io::Error::other("path is outside VFSI mount"))?;
         match self {
-            Self::Dummy(_) => Ok(Path::new("/").join(relative)),
-            Self::Nfs { .. } => Ok(Path::new("/").join(relative)),
+            Self::Dummy(_) | Self::Nfs { .. } => Ok(Path::new("/").join(relative)),
         }
     }
 

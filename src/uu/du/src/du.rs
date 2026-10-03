@@ -1245,7 +1245,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                     // Streaming may already have printed children. Never replay
                     // them via the kernel walker after a backend failure.
                     print_tx
-                        .send(Err(USimpleError::new(1, error.to_string()).into()))
+                        .send(Err(USimpleError::new(1, error.to_string())))
                         .map_err(|e| USimpleError::new(1, e.to_string()))?;
                     continue 'loop_file;
                 }

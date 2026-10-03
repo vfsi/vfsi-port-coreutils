@@ -213,10 +213,11 @@ fn traverse(
             if event.kind == WalkEventKind::Enter {
                 stack.push(Some(usage));
             } else {
-                if let Some(info) = file_info(metadata) {
-                    if !options.count_links && !seen.insert(info) {
-                        return Ok(WalkControl::Continue);
-                    }
+                if let Some(info) = file_info(metadata)
+                    && !options.count_links
+                    && !seen.insert(info)
+                {
+                    return Ok(WalkControl::Continue);
                 }
                 if let Some(Some(parent)) = stack.last_mut() {
                     parent.size += usage.size;
@@ -291,12 +292,11 @@ fn print_stats() {
         stats.max_operations,
     );
     if compounds > 0 {
-        let avg_bytes = bytes
-            .map(|b| format!("{:.0}", b as f64 / compounds as f64))
-            .unwrap_or_else(|| "unknown".into());
-        let bytes = bytes
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "unknown".into());
+        let avg_bytes = bytes.map_or_else(
+            || "unknown".into(),
+            |b| format!("{:.0}", b as f64 / compounds as f64),
+        );
+        let bytes = bytes.map_or_else(|| "unknown".into(), |b| b.to_string());
         eprintln!(
             "[vnfs] compounds={compounds} avg_ops={:.2} max_ops={max_ops} avg_bytes={avg_bytes} total_bytes={bytes}",
             ops as f64 / compounds as f64
