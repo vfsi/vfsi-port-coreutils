@@ -1238,14 +1238,24 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         }
 
         #[cfg(all(feature = "vnfs", target_os = "linux"))]
-        if vnfs::is_enabled()
-            && vnfs::supports(&traversal_options)
-            && let Ok(Some(usage)) = vnfs::try_du(&path, &traversal_options, &print_tx)
-        {
-            print_tx
-                .send(Ok(StatPrintInfo { usage, depth: 0 }))
-                .map_err(|e| USimpleError::new(1, e.to_string()))?;
-            continue 'loop_file;
+        if vnfs::is_enabled() && vnfs::supports(&traversal_options) {
+            match vnfs::try_du(&path, &traversal_options, &print_tx) {
+                Ok(Some(usage)) => {
+                    print_tx
+                        .send(Ok(StatPrintInfo { usage, depth: 0 }))
+                        .map_err(|e| USimpleError::new(1, e.to_string()))?;
+                    continue 'loop_file;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // Streaming may already have printed children. Never replay
+                    // them via the kernel walker after a backend failure.
+                    print_tx
+                        .send(Err(USimpleError::new(1, error.to_string()).into()))
+                        .map_err(|e| USimpleError::new(1, e.to_string()))?;
+                    continue 'loop_file;
+                }
+            }
         }
 
         if use_safe_traversal {

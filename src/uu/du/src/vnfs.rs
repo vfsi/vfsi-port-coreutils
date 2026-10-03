@@ -5,17 +5,16 @@
 
 //! Opt-in VFSI-backed traversal for `du` on Linux NFS mounts.
 //!
-//! When `VNFS_IMPL=dummy|nfs` and the operand lies on an NFS mount, the whole
-//! subtree is enumerated and stat'd through the high-level `vnfs` API. It
-//! asks the server for file attributes in the `READDIR` reply and batches
-//! `READDIR`/`GETATTR` into NFS compounds, instead of issuing one kernel
+//! When `VNFS_IMPL=dummy|nfs` and the operand lies on an NFS mount, traversal
+//! visits one bounded directory at a time through the high-level `vnfs` API.
+//! It asks the server for file attributes in the `READDIR` reply instead of issuing one kernel
 //! `lstat` per entry. Enabling it does not change the output: this module
 //! reproduces the parent module's post-order walk, hard-link deduplication,
 //! `--exclude`, `-S`, `-a`, `--time`, `--inodes`, and `--apparent-size`
-//! handling. Every unsupported mode or backend failure falls back to the
-//! standard `std::fs` traversal in the parent module.
+//! handling. Unsupported modes and connection setup failures use the standard
+//! traversal. Errors after traversal starts are reported without replaying
+//! already emitted output. Excluded directories are pruned before listing.
 
-use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -25,11 +24,12 @@ use rustc_hash::FxHashSet as HashSet;
 use uucore::display::Quotable;
 use uucore::error::UResult;
 use uucore::fsext::MetadataTimeField;
+use uucore::libc;
 use uucore::translate;
 
 use vnfs::{
-    DirEntry, DirectoryListing, Metadata, MetadataFields, Mounted, Nfs, NfsClient, VfType,
-    WalkOptions,
+    FileType as VfType, Metadata, MetadataFields, Mounted, Nfs, NfsClient, WalkControl,
+    WalkEventKind, WalkOptions,
 };
 
 use crate::{Deref, FileInfo, StatPrintInfo, TraversalOptions, Usage};
@@ -41,7 +41,7 @@ enum Backend {
 
 impl Backend {
     /// No-follow attributes for one path (the operand or a single file).
-    fn lstat(&self, path: &Path, fields: MetadataFields) -> vnfs::VfResult<Metadata> {
+    fn lstat(&self, path: &Path, fields: MetadataFields) -> vnfs::Result<Metadata> {
         match self {
             Self::Dummy(fs) => fs.symlink_metadata_with_fields(path, fields),
             Self::Nfs(fs) => fs.symlink_metadata_with_fields(path, fields),
@@ -49,13 +49,20 @@ impl Backend {
     }
 
     /// Enumerate the subtree with attributes delivered in READDIR replies.
-    /// A tree beyond the default resource limits falls back to the kernel
-    /// walker, which can process arbitrarily large trees without materializing
-    /// every entry here.
-    fn walk(&self, dir: &Path, fields: MetadataFields) -> vnfs::VfResult<Vec<DirectoryListing>> {
+    /// Resource-limit failures are reported; partial output is not replayed.
+    fn visit(
+        &self,
+        dir: &Path,
+        fields: MetadataFields,
+        callback: impl FnMut(&vnfs::WalkEvent) -> vnfs::Result<WalkControl>,
+    ) -> vnfs::Result<vnfs::TraversalCompletion> {
         match self {
-            Self::Dummy(fs) => fs.walk_with_options(dir, fields, WalkOptions::default()),
-            Self::Nfs(fs) => fs.walk_with_options(dir, fields, WalkOptions::default()),
+            Self::Dummy(fs) => {
+                fs.walk_events_with_options(dir, fields, WalkOptions::default(), false, callback)
+            }
+            Self::Nfs(fs) => {
+                fs.walk_events_with_options(dir, fields, WalkOptions::default(), false, callback)
+            }
         }
     }
 }
@@ -70,7 +77,7 @@ pub fn is_enabled() -> bool {
 /// `-L`/`--dereference-args` follow symbolic links and need the cycle-safe
 /// logic in the standard traversal, so they are left to `std::fs`.
 pub fn supports(options: &TraversalOptions) -> bool {
-    matches!(options.dereference, Deref::None)
+    matches!(options.dereference, Deref::None) && !options.one_file_system
 }
 
 fn attr_mask(options: &TraversalOptions) -> MetadataFields {
@@ -136,81 +143,6 @@ fn send(
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "du printer stopped"))
 }
 
-/// Recursively total `dir`'s subtree, emitting children in the same post-order
-/// the standard walk uses, and return the directory's own accumulated usage.
-#[allow(clippy::too_many_arguments)]
-fn compute_dir(
-    dir: &Path,
-    depth: usize,
-    dir_attrs: &Metadata,
-    children: &HashMap<PathBuf, Vec<DirEntry>>,
-    options: &TraversalOptions,
-    print_path: &dyn Fn(&Path) -> PathBuf,
-    print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
-    seen: &mut HashSet<FileInfo>,
-) -> io::Result<Usage> {
-    let mut total = usage_from_attrs(&print_path(dir), dir_attrs, options);
-    total.inodes = 1;
-
-    for entry in children.get(dir).map_or(&[][..], Vec::as_slice) {
-        let entry_path = entry.path();
-        let metadata = entry.metadata();
-        let rendered = print_path(entry_path);
-
-        let name = rendered.file_name().map(|n| n.to_string_lossy());
-        let excluded = options.excludes.iter().any(|pattern| {
-            pattern.matches(&rendered.to_string_lossy())
-                || name.as_deref().is_some_and(|name| pattern.matches(name))
-        });
-        if excluded {
-            if options.verbose {
-                println!(
-                    "{}",
-                    translate!("du-verbose-ignored", "path" => rendered.quote())
-                );
-            }
-            continue;
-        }
-
-        if metadata.file_type() == VfType::Directory {
-            let child = compute_dir(
-                entry_path,
-                depth + 1,
-                metadata,
-                children,
-                options,
-                print_path,
-                print_tx,
-                seen,
-            )?;
-            if !options.separate_dirs {
-                total.size += child.size;
-                total.blocks += child.blocks;
-                total.inodes += child.inodes;
-                total.latest_time = max_time(total.latest_time, child.latest_time);
-            }
-            send(print_tx, child, depth + 1)?;
-        } else {
-            if let Some(info) = file_info(metadata) {
-                if seen.contains(&info) && !options.count_links {
-                    continue;
-                }
-                seen.insert(info);
-            }
-            let usage = usage_from_attrs(&rendered, metadata, options);
-            total.size += usage.size;
-            total.blocks += usage.blocks;
-            total.inodes += 1;
-            total.latest_time = max_time(total.latest_time, usage.latest_time);
-            if options.all {
-                send(print_tx, usage, depth + 1)?;
-            }
-        }
-    }
-
-    Ok(total)
-}
-
 /// Traverse `path` through `backend` and emit each entry, returning the root's
 /// accumulated usage. `vroot` is the operand's path inside the backend
 /// namespace; emitted paths are mapped back onto `path` as the user typed it.
@@ -236,38 +168,87 @@ fn traverse(
         return Ok(usage_from_attrs(path, &root_attrs, options));
     }
 
-    let directories = backend.walk(vroot, masks).map_err(io::Error::other)?;
-
-    // Group entries under their parent directory, preserving each directory's
-    // enumeration order. The root itself is not in `entries`.
-    let mut children: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
-    for directory in directories {
-        children.insert(directory.path, directory.entries);
-    }
-
     let mut seen: HashSet<FileInfo> = HashSet::default();
-    compute_dir(
-        vroot,
-        0,
-        &root_attrs,
-        &children,
-        options,
-        &print_path,
-        print_tx,
-        &mut seen,
-    )
+    let mut stack: Vec<Option<Usage>> = Vec::new();
+    let mut total = None;
+    backend
+        .visit(vroot, masks, |event| {
+            let rendered = print_path(event.entry.path());
+            if event.kind == WalkEventKind::Leave {
+                if let Some(Some(child)) = stack.pop() {
+                    if let Some(Some(parent)) = stack.last_mut() {
+                        if !options.separate_dirs {
+                            parent.size += child.size;
+                            parent.blocks += child.blocks;
+                            parent.inodes += child.inodes;
+                            parent.latest_time = max_time(parent.latest_time, child.latest_time);
+                        }
+                        send(print_tx, child, event.depth)
+                            .map_err(|_| vnfs::Error::client(0, libc::EPIPE as u32))?;
+                    } else if event.depth == 0 {
+                        total = Some(child);
+                    }
+                }
+                return Ok(WalkControl::Continue);
+            }
+            let name = rendered.file_name().map(|n| n.to_string_lossy());
+            let excluded = options.excludes.iter().any(|pattern| {
+                pattern.matches(&rendered.to_string_lossy())
+                    || name.as_deref().is_some_and(|n| pattern.matches(n))
+            });
+            if event.depth > 0 && excluded {
+                if options.verbose {
+                    println!(
+                        "{}",
+                        translate!("du-verbose-ignored", "path" => rendered.quote())
+                    );
+                }
+                if event.kind == WalkEventKind::Enter {
+                    stack.push(None);
+                }
+                return Ok(WalkControl::SkipSubtree);
+            }
+            let metadata = event.entry.metadata();
+            let usage = usage_from_attrs(&rendered, metadata, options);
+            if event.kind == WalkEventKind::Enter {
+                stack.push(Some(usage));
+            } else {
+                if let Some(info) = file_info(metadata) {
+                    if !options.count_links && !seen.insert(info) {
+                        return Ok(WalkControl::Continue);
+                    }
+                }
+                if let Some(Some(parent)) = stack.last_mut() {
+                    parent.size += usage.size;
+                    parent.blocks += usage.blocks;
+                    parent.inodes += 1;
+                    parent.latest_time = max_time(parent.latest_time, usage.latest_time);
+                }
+                if options.all {
+                    send(print_tx, usage, event.depth)
+                        .map_err(|_| vnfs::Error::client(0, libc::EPIPE as u32))?;
+                }
+            }
+            Ok(WalkControl::Continue)
+        })
+        .map_err(io::Error::other)?;
+    total.ok_or_else(|| io::Error::other("vnfs walk did not finish its root"))
 }
 
 /// Compute `du` for `path` through VFSI.
 ///
 /// Returns `Ok(None)` when the path is not on an NFS mount or the backend is
-/// disabled. Any backend error is returned so the caller can fall back to
-/// `std::fs`, which also produces the canonical error message.
+/// disabled. Traversal errors are returned without restarting the walk.
 pub fn try_du(
     path: &Path,
     options: &TraversalOptions,
     print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
 ) -> io::Result<Option<Usage>> {
+    // Canonicalizing a no-follow symlink operand would walk its target.
+    // Keep that uncommon case on the existing kernel implementation.
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Ok(None);
+    }
     let Some(mount) = uucore::vnfs::nfs_mount(path) else {
         return Ok(None);
     };
@@ -280,7 +261,10 @@ pub fn try_du(
 
     let backend = match std::env::var("VNFS_IMPL").as_deref() {
         Ok("dummy") => Backend::Dummy(Mounted::new(&mount.point).map_err(io::Error::other)?),
-        Ok("nfs") => Backend::Nfs(Nfs::connect(&mount.server).map_err(io::Error::other)?),
+        Ok("nfs") => match Nfs::from_mount(&mount.point) {
+            Ok(fs) => Backend::Nfs(fs),
+            Err(_) => return Ok(None),
+        },
         _ => return Ok(None),
     };
 
@@ -289,7 +273,7 @@ pub fn try_du(
     if std::env::var("VNFS_PROFILE").as_deref() == Ok("1")
         && let Err(error) = &result
     {
-        eprintln!("[vnfs] traversal failed, falling back to std::fs: {error}");
+        eprintln!("[vnfs] traversal failed: {error}");
     }
     result.map(Some)
 }
@@ -299,7 +283,7 @@ fn print_stats() {
     if std::env::var("VNFS_STATS").as_deref() != Ok("1") {
         return;
     }
-    let stats = vnfs::diagnostics::snapshot();
+    let stats = vnfs::diagnostics::take_and_reset();
     let (compounds, ops, bytes, max_ops) = (
         stats.compounds,
         stats.operations,
@@ -307,10 +291,15 @@ fn print_stats() {
         stats.max_operations,
     );
     if compounds > 0 {
+        let avg_bytes = bytes
+            .map(|b| format!("{:.0}", b as f64 / compounds as f64))
+            .unwrap_or_else(|| "unknown".into());
+        let bytes = bytes
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "unknown".into());
         eprintln!(
-            "[vnfs] compounds={compounds} avg_ops={:.2} max_ops={max_ops} avg_bytes={:.0} total_bytes={bytes}",
-            ops as f64 / compounds as f64,
-            bytes as f64 / compounds as f64
+            "[vnfs] compounds={compounds} avg_ops={:.2} max_ops={max_ops} avg_bytes={avg_bytes} total_bytes={bytes}",
+            ops as f64 / compounds as f64
         );
     }
     let (calls, micros) = (stats.rpc_calls, stats.rpc_micros);
@@ -339,6 +328,14 @@ mod tests {
             excludes: Vec::new(),
             time: None,
         }
+    }
+
+    #[test]
+    fn device_boundary_and_follow_modes_keep_kernel_semantics() {
+        let mut options = options();
+        assert!(supports(&options));
+        options.one_file_system = true;
+        assert!(!supports(&options), "filesystem identity is not available");
     }
 
     /// Run the VFSI traversal over `root` with given options and return

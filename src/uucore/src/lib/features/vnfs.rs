@@ -7,12 +7,10 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use vnfs::{Mounted, Nfs, NfsClient, VfResult};
+use vnfs::{Mounted, Nfs, NfsClient, Result as VfResult};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Mount {
-    server: String,
-    export: PathBuf,
     point: PathBuf,
 }
 
@@ -31,11 +29,11 @@ pub struct NfsMount {
 /// directories resolve to the same mount a kernel traversal would see.
 pub fn nfs_mount(path: &Path) -> Option<NfsMount> {
     let resolved = path.canonicalize().ok()?;
-    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
-    find_mount(&resolved, &mounts).map(|mount| NfsMount {
-        server: mount.server,
-        export: mount.export,
-        point: mount.point,
+    let mount = Nfs::discover_mount(&resolved).ok()?;
+    Some(NfsMount {
+        server: mount.host().to_owned(),
+        export: mount.export_root().to_path_buf(),
+        point: mount.mount_point().to_path_buf(),
     })
 }
 
@@ -53,27 +51,6 @@ impl Backend {
     }
 }
 
-fn find_mount(path: &Path, mounts: &str) -> Option<Mount> {
-    mounts
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let spec = fields.next()?;
-            let point = PathBuf::from(fields.next()?);
-            let fstype = fields.next()?;
-            if (fstype != "nfs" && fstype != "nfs4") || !path.starts_with(&point) {
-                return None;
-            }
-            let (server, export) = spec.rsplit_once(':')?;
-            Some(Mount {
-                server: server.trim_matches(['[', ']']).to_owned(),
-                export: PathBuf::from(export),
-                point,
-            })
-        })
-        .max_by_key(|mount| mount.point.as_os_str().len())
-}
-
 fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
     let Component::Normal(name) = path.components().next_back()? else {
         return None;
@@ -81,8 +58,10 @@ fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));
     let parent = parent.canonicalize().ok()?;
-    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
-    let mount = find_mount(&parent, &mounts)?;
+    let info = Nfs::discover_mount(&parent).ok()?;
+    let mount = Mount {
+        point: info.mount_point().to_path_buf(),
+    };
     let absolute = parent.join(name);
 
     // Removing an export's mount point through its server-side path would
@@ -114,7 +93,7 @@ pub fn try_remove(path: &Path, recursive: bool) -> bool {
             Backend::Dummy(client)
         }
         Ok("nfs") => {
-            let Ok(client) = Nfs::builder(&mount.server).root(&mount.export).connect() else {
+            let Ok(client) = Nfs::from_mount(&mount.point) else {
                 return false;
             };
             Backend::Nfs(client)
@@ -128,14 +107,6 @@ pub fn try_remove(path: &Path, recursive: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn selects_longest_nfs_mount() {
-        let mounts = "server:/ /mnt nfs4 rw 0 0\nserver:/nested /mnt/nested nfs rw 0 0\n";
-        let mount = find_mount(Path::new("/mnt/nested/tree"), mounts).unwrap();
-        assert_eq!(mount.point, Path::new("/mnt/nested"));
-        assert_eq!(mount.export, Path::new("/nested"));
-    }
 
     #[test]
     fn removes_empty_directory() {

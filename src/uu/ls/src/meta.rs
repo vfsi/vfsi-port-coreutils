@@ -21,7 +21,7 @@ use std::time::SystemTime;
 #[cfg(any(unix, all(feature = "vnfs", target_os = "linux")))]
 use std::time::UNIX_EPOCH;
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
-use vnfs::{Metadata as VnfsMetadata, VfType};
+use vnfs::{FileType as VfType, Metadata as VnfsMetadata};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};

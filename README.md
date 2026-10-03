@@ -38,6 +38,21 @@ Minimal compatible glibc version is same with ubuntu-latest runner. Use `coreuti
 
 <!-- markdownlint-disable-next-line MD026 -->
 
+## VFSI port
+
+This branch adds opt-in mounted-NFS acceleration with the `vnfs` feature and
+`VNFS_IMPL=nfs`. The Rust ports use the high-level vNFS API and retain mount
+connection settings through shared discovery. `du` and recursive `ls` process
+bounded directory listings incrementally; excluded subtrees are skipped before
+listing. Traversal failures are reported without repeating partial output.
+Unsupported modes, including `du --one-file-system`, use the kernel path.
+
+`cp` batches small-file prefetch under an aggregate memory budget. Direct
+server-side COPY is experimental and disabled by default: enabling
+`VNFS_CP_SERVER_COPY=1` mixes kernel and direct-client access and requires the
+caller to account for cache coherence. This port does not provide filesystem
+identity or a new coherence guarantee.
+
 ## Goals
 
 uutils coreutils aims to be a drop-in replacement for the GNU utils. Differences with GNU

@@ -7,9 +7,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use vnfs::{Mounted, Nfs, NfsClient, ReadAllOptions, VfError, VfResult};
+use vnfs::{Error as VfError, Mounted, NfsClient, ReadAllOptions, Result as VfResult};
 
-const READ_ALL_FILES_PER_BATCH: usize = 8;
 const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
 
 fn impl_choice() -> Option<&'static str> {
@@ -50,25 +49,17 @@ fn nfs_mount(path: &Path) -> Option<Mount> {
     let path = existing_ancestor(path)
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf());
-    let text = std::fs::read_to_string("/proc/self/mounts").ok()?;
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let spec = fields.next()?;
-            let point = PathBuf::from(fields.next()?);
-            let fstype = fields.next()?;
-            if (fstype != "nfs" && fstype != "nfs4") || !path.starts_with(&point) {
-                return None;
-            }
-            let (server, export) = spec.rsplit_once(':')?;
-            let server = server.trim_matches(['[', ']']).to_owned();
-            Some(Mount {
-                server,
-                export: PathBuf::from(export),
-                point,
-            })
-        })
-        .max_by_key(|mount| mount.point.as_os_str().len())
+    let directory = if path.is_dir() {
+        path.as_path()
+    } else {
+        path.parent()?
+    };
+    let mount = vnfs::Nfs::discover_mount(directory).ok()?;
+    Some(Mount {
+        server: mount.host().to_owned(),
+        export: mount.export_root().to_path_buf(),
+        point: mount.mount_point().to_path_buf(),
+    })
 }
 
 enum Backend {
@@ -84,7 +75,7 @@ impl Backend {
             .map_err(|_| io::Error::other("path is outside VFSI mount"))?;
         match self {
             Self::Dummy(_) => Ok(Path::new("/").join(relative)),
-            Self::Nfs { .. } => Ok(mount.export.join(relative)),
+            Self::Nfs { .. } => Ok(Path::new("/").join(relative)),
         }
     }
 
@@ -105,6 +96,7 @@ impl Backend {
             Self::Dummy(fs) => fs.read_stream(path, |_, data| callback(data)),
             Self::Nfs { fs, .. } => fs.read_stream(path, |_, data| callback(data)),
         }
+        .map(|_| ())
     }
 
     fn copy_files(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<VfResult<()>> {
@@ -145,16 +137,18 @@ thread_local! {
 fn make_context(mount: Mount) -> io::Result<Context> {
     let backend = match impl_choice() {
         Some("dummy") => Backend::Dummy(Mounted::new(&mount.point).map_err(vf_io_error)?),
-        Some("nfs") => match Nfs::builder(&mount.server).minor_version(Some(2)).connect() {
-            Ok(fs) => Backend::Nfs {
-                fs,
-                supports_copy: true,
-            },
-            Err(_) => Backend::Nfs {
-                fs: Nfs::connect(&mount.server).map_err(vf_io_error)?,
-                supports_copy: false,
-            },
-        },
+        Some("nfs") => {
+            // Inherit and retain the mount's security/version/port and root.
+            let fs = vnfs::NfsBuilder::from_mount(&mount.point)
+                .map_err(vf_io_error)?
+                .connect()
+                .map_err(vf_io_error)?;
+            let supports_copy = fs
+                .capabilities()
+                .map_err(vf_io_error)?
+                .contains(vnfs::Capabilities::SERVER_COPY);
+            Backend::Nfs { fs, supports_copy }
+        }
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
     Ok(Context {
@@ -170,7 +164,7 @@ fn mounted_vf_path(path: &Path, mount: &Mount) -> io::Result<PathBuf> {
     let relative = absolute
         .strip_prefix(&mount.point)
         .map_err(|_| io::Error::other("path is outside VFSI mount"))?;
-    Ok(mount.export.join(relative))
+    Ok(Path::new("/").join(relative))
 }
 
 fn new_mounted_vf_path(path: &Path, mount: &Mount) -> io::Result<PathBuf> {
@@ -185,11 +179,13 @@ fn new_mounted_vf_path(path: &Path, mount: &Mount) -> io::Result<PathBuf> {
     let relative = absolute
         .strip_prefix(&mount.point)
         .map_err(|_| io::Error::other("path is outside VFSI mount"))?;
-    Ok(mount.export.join(relative))
+    Ok(Path::new("/").join(relative))
 }
 
 fn server_copy_enabled() -> bool {
-    std::env::var("VNFS_CP_SERVER_COPY").as_deref() != Ok("0")
+    // Direct COPY followed by kernel metadata/rename does not share caches.
+    // Keep this experimental path explicit until coherent publication exists.
+    std::env::var("VNFS_CP_SERVER_COPY").as_deref() == Ok("1")
 }
 
 fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<bool> {
@@ -217,7 +213,7 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
         let Some(source_mount) = nfs_mount(source) else {
             return Ok(false);
         };
-        if source_mount.server != target_mount.server {
+        if source_mount != target_mount {
             return Ok(false);
         }
         let Some(name) = source.file_name() else {
@@ -326,10 +322,12 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
             *slot = Some(context);
         }
         let ctx = slot.as_mut().expect("VFSI context initialized");
-        // Keep each read-all vector modest: path OPEN/READ/CLOSE sequences
-        // also consume the server's negotiated compound-operation budget.
-        let mut prefetched_bytes = 0usize;
-        for batch in selected.chunks(READ_ALL_FILES_PER_BATCH) {
+        // vNFS partitions compounds from negotiated limits. The application
+        // owns one aggregate byte budget, including files that grew since stat.
+        ctx.prefetched.clear();
+        let prefetched_bytes;
+        {
+            let batch = &selected;
             let Ok(files): io::Result<Vec<PathBuf>> = batch
                 .iter()
                 .map(|source| ctx.backend.mapped_path(source, &ctx.mount))
@@ -343,7 +341,7 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
             else {
                 return Ok(());
             };
-            prefetched_bytes += contents.iter().map(Vec::len).sum::<usize>();
+            prefetched_bytes = contents.iter().map(Vec::len).sum::<usize>();
             ctx.prefetched.extend(batch.iter().cloned().zip(contents));
         }
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
@@ -387,7 +385,7 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
         if server_copy_enabled()
             && dest_mount
                 .as_ref()
-                .is_some_and(|mount| mount.server == source_mount.server)
+                .is_some_and(|mount| *mount == source_mount)
         {
             // Create/truncate through the kernel first so cp retains its normal
             // destination-creation semantics and the mount has no stale tail.

@@ -14,9 +14,11 @@ use std::path::{Path, PathBuf};
 
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
+#[cfg(test)]
+use vnfs::WalkOptions;
 use vnfs::{
-    DirEntry, DirectoryListing, MetadataFields, Mounted, Nfs, NfsClient, ReadDirOptions, VfError,
-    WalkOptions,
+    DirEntry, DirectoryListing, Error as VfError, MetadataFields, Mounted, Nfs, NfsClient,
+    ReadDirOptions,
 };
 
 pub(crate) struct WalkEntry {
@@ -36,7 +38,7 @@ fn impl_choice() -> Option<&'static str> {
 }
 
 /// Map a vectorized error to an `io::Error`, choosing an `ErrorKind` from the
-/// typed [`vnfs::VfError`] (transport vs. filesystem status) and keeping the
+/// typed [`vnfs::Error`] (transport vs. filesystem status) and keeping the
 /// operation index in the message.
 fn vf_io_error(e: VfError) -> io::Error {
     if e.is_transport() {
@@ -80,19 +82,20 @@ impl Backend {
         &self,
         dirs: &[&Path],
         fields: MetadataFields,
-    ) -> vnfs::VfResult<Vec<DirectoryListing>> {
+    ) -> vnfs::Result<Vec<DirectoryListing>> {
         match self {
             Self::Dummy(fs) => fs.read_dirs_with_options(dirs, fields, ReadDirOptions::default()),
             Self::Nfs(fs) => fs.read_dirs_with_options(dirs, fields, ReadDirOptions::default()),
         }
     }
 
+    #[cfg(test)]
     fn walk(
         &self,
         root: &Path,
         masks: MetadataFields,
         sort: &mut dyn FnMut(&Path, &mut Vec<DirEntry>),
-    ) -> vnfs::VfResult<Vec<WalkEntry>> {
+    ) -> vnfs::Result<Vec<WalkEntry>> {
         let tree = match self {
             Self::Dummy(fs) => fs.walk_with_options(root, masks, WalkOptions::default()),
             Self::Nfs(fs) => fs.walk_with_options(root, masks, WalkOptions::default()),
@@ -110,7 +113,7 @@ impl Backend {
                 continue;
             };
             for child in entries.iter().rev() {
-                if child.file_type() == vnfs::VfType::Directory {
+                if child.file_type() == vnfs::FileType::Directory {
                     pending.push(child.path().to_path_buf());
                 }
             }
@@ -128,7 +131,7 @@ struct VfContext {
 impl Drop for VfContext {
     fn drop(&mut self) {
         if std::env::var("VNFS_STATS").as_deref() == Ok("1") {
-            let stats = vnfs::diagnostics::snapshot();
+            let stats = vnfs::diagnostics::take_and_reset();
             let (n, ops, bytes, max) = (
                 stats.compounds,
                 stats.operations,
@@ -136,10 +139,15 @@ impl Drop for VfContext {
                 stats.max_operations,
             );
             if n > 0 {
+                let avg_bytes = bytes
+                    .map(|b| format!("{:.0}", b as f64 / n as f64))
+                    .unwrap_or_else(|| "unknown".into());
+                let bytes = bytes
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "unknown".into());
                 eprintln!(
-                    "[vnfs] compounds={n} avg_ops={:.2} max_ops={max} avg_bytes={:.0} total_bytes={bytes}",
-                    ops as f64 / n as f64,
-                    bytes as f64 / n as f64
+                    "[vnfs] compounds={n} avg_ops={:.2} max_ops={max} avg_bytes={avg_bytes} total_bytes={bytes}",
+                    ops as f64 / n as f64
                 );
             }
             let (calls, us) = (stats.rpc_calls, stats.rpc_micros);
@@ -166,12 +174,7 @@ fn nfs_mountpoint(path: &Path) -> Option<NfsMount> {
 fn make_ctx(mount: NfsMount) -> io::Result<VfContext> {
     let backend = match impl_choice() {
         Some("dummy") => Backend::Dummy(Mounted::new(&mount.point).map_err(vf_io_error)?),
-        Some("nfs") => Backend::Nfs(
-            Nfs::builder(&mount.server)
-                .root(&mount.export)
-                .connect()
-                .map_err(vf_io_error)?,
-        ),
+        Some("nfs") => Backend::Nfs(Nfs::from_mount(&mount.point).map_err(vf_io_error)?),
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
     Ok(VfContext { backend, mount })
@@ -304,15 +307,16 @@ pub fn try_open_many_vf(
 /// list them (via [`sort_entries`] semantics, so it is correct under any
 /// locale and sort mode). Paths in the result are mapped back to kernel paths
 /// (under the mountpoint).
-pub fn try_walk_vf(
+pub fn try_visit_walk_vf(
     path: &Path,
     config: &crate::config::Config,
-) -> io::Result<Option<Vec<WalkEntry>>> {
+    mut callback: impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
+) -> uucore::error::UResult<bool> {
     if impl_choice().is_none() {
-        return Ok(None);
+        return Ok(false);
     }
     let Some(mount) = nfs_mountpoint(path) else {
-        return Ok(None);
+        return Ok(false);
     };
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
@@ -330,15 +334,65 @@ pub fn try_walk_vf(
 
         let rel = path.strip_prefix(&ctx.mount.point).unwrap_or(path);
         let vpath = Path::new("/").join(rel);
-        let mut sort = |_dir: &Path, entries: &mut Vec<DirEntry>| {
-            crate::sort_vf_entries(entries, config);
-        };
         let t0 = std::time::Instant::now();
-        let tree = match ctx.backend.walk(&vpath, full_mask(config), &mut sort) {
-            Ok(tree) => tree,
-            Err(error) if error.err_no() == uucore::libc::EFBIG as u32 => return Ok(None),
-            Err(error) => return Err(vf_io_error(error)),
-        };
+        let mut pending = vec![(vpath, 0usize)];
+        let limits = vnfs::ResourceLimits::default();
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        while let Some((dir, depth)) = pending.pop() {
+            if depth > limits.max_walk_depth {
+                return Err(io::Error::from_raw_os_error(uucore::libc::EFBIG).into());
+            }
+            let listing = match &ctx.backend {
+                Backend::Dummy(fs) => fs.read_dirs_with_options(
+                    &[&dir],
+                    full_mask(config),
+                    ReadDirOptions::new()
+                        .max_entries(limits.max_directory_entries.saturating_sub(count))
+                        .max_path_bytes(limits.max_directory_path_bytes.saturating_sub(bytes)),
+                ),
+                Backend::Nfs(fs) => fs.read_dirs_with_options(
+                    &[&dir],
+                    full_mask(config),
+                    ReadDirOptions::new()
+                        .max_entries(limits.max_directory_entries.saturating_sub(count))
+                        .max_path_bytes(limits.max_directory_path_bytes.saturating_sub(bytes)),
+                ),
+            }
+            .map_err(vf_io_error)?;
+            let mut listing = listing
+                .into_iter()
+                .next()
+                .ok_or_else(|| io::Error::other("missing directory listing"))?;
+            for entry in &listing.entries {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::from_raw_os_error(uucore::libc::EFBIG))?;
+                bytes = bytes
+                    .checked_add(entry.path().as_os_str().len())
+                    .ok_or_else(|| io::Error::from_raw_os_error(uucore::libc::EFBIG))?;
+            }
+            crate::sort_vf_entries(&mut listing.entries, config);
+            for entry in listing.entries.iter().rev() {
+                if entry.file_type() == vnfs::FileType::Directory
+                    && entry
+                        .file_name()
+                        .is_some_and(|name| crate::display::should_display(name, config))
+                {
+                    pending.push((entry.path().to_path_buf(), depth + 1));
+                }
+            }
+            let relative = dir.strip_prefix("/").unwrap_or(&dir);
+            let kernel_path = if depth == 0 {
+                path.to_path_buf()
+            } else {
+                ctx.mount.point.join(relative)
+            };
+            callback(WalkEntry {
+                path: kernel_path,
+                entries: listing.entries,
+            })?;
+        }
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             eprintln!(
                 "[profile] walk_ms={:.1}",
@@ -346,14 +400,7 @@ pub fn try_walk_vf(
             );
         }
 
-        let mut out = Vec::with_capacity(tree.len());
-        for mut w in tree {
-            // Rewrite root-relative vnfs paths back to kernel paths.
-            let rel = w.path.strip_prefix("/").unwrap_or(&w.path);
-            w.path = ctx.mount.point.join(rel);
-            out.push(w);
-        }
-        Ok(Some(out))
+        Ok(true)
     })
 }
 

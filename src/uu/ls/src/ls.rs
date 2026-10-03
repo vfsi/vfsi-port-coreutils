@@ -1463,9 +1463,6 @@ fn list_recursive_vf<O: LsOutput>(
     if config.sort == Sort::Time {
         return Ok(false);
     }
-    let Some(tree) = nfs::try_walk_vf(root.path(), config)? else {
-        return Ok(false);
-    };
     let t0 = std::time::Instant::now();
     let root_kernel = root.path();
     // A directory (and its whole subtree) is skipped when it or any ancestor
@@ -1473,14 +1470,15 @@ fn list_recursive_vf<O: LsOutput>(
     // pre-ordered, so once one is skipped its descendants follow contiguously.
     let mut skip_until: Option<usize> = None;
     let mut entries = Vec::new();
-    for (i, w) in tree.iter().enumerate() {
+    let mut i = 0usize;
+    let used = nfs::try_visit_walk_vf(root.path(), config, |w| {
         let rel = Path::new(&w.path)
             .strip_prefix(root_kernel)
             .unwrap_or(Path::new(&w.path));
         let depth = rel.components().count();
         if let Some(skip) = skip_until {
             if depth > skip {
-                continue;
+                return Ok(());
             }
             skip_until = None;
         }
@@ -1489,7 +1487,7 @@ fn list_recursive_vf<O: LsOutput>(
             .any(|c| !display::should_display(c.as_os_str(), config))
         {
             skip_until = Some(depth);
-            continue;
+            return Ok(());
         }
         let path = PathBuf::from(&w.path);
         let path_data = PathData::new(path.clone().into(), None, None, config, false, false);
@@ -1531,14 +1529,16 @@ fn list_recursive_vf<O: LsOutput>(
                 t0.elapsed().as_secs_f64() * 1000.0
             );
         }
-    }
+        i += 1;
+        Ok(())
+    })?;
     if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
         eprintln!(
             "[profile] render_ms={:.1}",
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
-    Ok(true)
+    Ok(used)
 }
 
 fn enter_directory<O: LsOutput>(
@@ -1800,7 +1800,7 @@ pub(crate) fn sort_vf_entries(entries: &mut [VnfsDirEntry], config: &Config) {
         entries.reverse();
     }
     if config.group_directories_first && config.sort != Sort::None {
-        entries.sort_by_key(|p| p.file_type() != vnfs::VfType::Directory);
+        entries.sort_by_key(|p| p.file_type() != vnfs::FileType::Directory);
     }
 }
 
