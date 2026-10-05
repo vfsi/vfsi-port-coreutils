@@ -7,7 +7,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use vnfs::{Mounted, Nfs, NfsClient, Result as VfResult};
+use vnfs::helpers::{MountSession, ResolvePath};
+use vnfs::{Mounted, Nfs, NfsClient, RemoveMode, RemoveOptions, Result as VfResult, Vfsi};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Mount {
@@ -45,8 +46,24 @@ enum Backend {
 impl Backend {
     fn remove(&self, path: &Path, recursive: bool) -> VfResult<()> {
         match self {
-            Self::Dummy(fs) => fs.remove_paths(&[path], recursive),
-            Self::Nfs(fs) => fs.remove_paths(&[path], recursive),
+            Self::Dummy(fs) => fs.vremove(
+                &[path],
+                if recursive {
+                    RemoveMode::Tree
+                } else {
+                    RemoveMode::Entry
+                },
+                RemoveOptions::default(),
+            ),
+            Self::Nfs(fs) => fs.vremove(
+                &[path],
+                if recursive {
+                    RemoveMode::Tree
+                } else {
+                    RemoveMode::Entry
+                },
+                RemoveOptions::default(),
+            ),
         }
     }
 }
@@ -70,38 +87,42 @@ fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
         return None;
     }
 
-    let relative = absolute.strip_prefix(&mount.point).ok()?;
-    let dummy_path = Path::new("/").join(relative);
+    let session = MountSession::new((), &mount.point).ok()?;
+    let dummy_path = session.map(path, ResolvePath::NoFollow).ok()?;
     Some((mount, dummy_path))
 }
 
 /// Try to remove `path` through VNFS.
 ///
-/// Returns `true` only when an enabled backend removed the path. Unsupported
-/// paths, connection failures, and filesystem errors return `false`, allowing
-/// the caller to preserve its normal platform-specific behavior as a fallback.
-pub fn try_remove(path: &Path, recursive: bool) -> bool {
+/// `None` means no operation was submitted and the kernel path may be used.
+/// Once submitted, return its result even on failure: a direct recursive
+/// removal can have partial effects and must not be replayed via the kernel.
+pub fn try_remove(path: &Path, recursive: bool) -> Option<std::io::Result<()>> {
     let Some((mount, relative_path)) = remove_paths(path) else {
-        return false;
+        return None;
     };
 
     let backend = match std::env::var("VNFS_IMPL").as_deref() {
         Ok("dummy") => {
             let Ok(client) = Mounted::new(&mount.point) else {
-                return false;
+                return None;
             };
             Backend::Dummy(client)
         }
         Ok("nfs") => {
             let Ok(client) = Nfs::from_mount(&mount.point) else {
-                return false;
+                return None;
             };
             Backend::Nfs(client)
         }
-        _ => return false,
+        _ => return None,
     };
 
-    backend.remove(&relative_path, recursive).is_ok()
+    Some(
+        backend
+            .remove(&relative_path, recursive)
+            .map_err(Into::into),
+    )
 }
 
 #[cfg(test)]
@@ -115,7 +136,8 @@ mod tests {
         std::fs::create_dir(&empty).unwrap();
         let fs = Mounted::new(root.path()).unwrap();
 
-        fs.remove_paths(&["/empty"], false).unwrap();
+        fs.vremove(&["/empty"], RemoveMode::Entry, RemoveOptions::default())
+            .unwrap();
 
         assert!(!empty.exists());
     }
@@ -128,7 +150,8 @@ mod tests {
         std::fs::write(tree.join("child/file"), b"data").unwrap();
         let fs = Mounted::new(root.path()).unwrap();
 
-        fs.remove_paths(&["/tree"], true).unwrap();
+        fs.vremove(&["/tree"], RemoveMode::Tree, RemoveOptions::default())
+            .unwrap();
 
         assert!(!tree.exists());
     }
@@ -141,7 +164,10 @@ mod tests {
         std::fs::write(dir.join("file"), b"data").unwrap();
         let fs = Mounted::new(root.path()).unwrap();
 
-        assert!(fs.remove_paths(&["/dir"], false).is_err());
+        assert!(
+            fs.vremove(&["/dir"], RemoveMode::Entry, RemoveOptions::default())
+                .is_err()
+        );
         assert!(dir.exists());
     }
 }

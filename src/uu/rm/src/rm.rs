@@ -688,8 +688,12 @@ fn remove_dir_recursive(
     }
 
     #[cfg(all(feature = "vnfs", target_os = "linux"))]
-    if vnfs_removal_allowed(options) && uucore::vnfs::try_remove(path, true) {
-        return false;
+    if vnfs_removal_allowed(options)
+        && let Some(result) = uucore::vnfs::try_remove(path, true)
+    {
+        return result
+            .err()
+            .is_some_and(|error| show_removal_error(error, path));
     }
 
     // Use secure traversal on Unix (except Redox) for all recursive directory removals
@@ -860,8 +864,12 @@ fn remove_dir(path: &Path, options: &Options, progress_bar: Option<&ProgressBar>
     }
 
     #[cfg(all(feature = "vnfs", target_os = "linux"))]
-    if vnfs_removal_allowed(options) && uucore::vnfs::try_remove(path, false) {
-        return false;
+    if vnfs_removal_allowed(options)
+        && let Some(result) = uucore::vnfs::try_remove(path, false)
+    {
+        return result
+            .err()
+            .is_some_and(|error| show_removal_error(error, path));
     }
 
     // Use safe traversal on Unix (except Redox) for empty directory removal
@@ -884,8 +892,12 @@ fn remove_dir(path: &Path, options: &Options, progress_bar: Option<&ProgressBar>
 fn remove_file(path: &Path, options: &Options, progress_bar: Option<&ProgressBar>) -> bool {
     if prompt_file(path, options) {
         #[cfg(all(feature = "vnfs", target_os = "linux"))]
-        if vnfs_removal_allowed(options) && uucore::vnfs::try_remove(path, false) {
-            return false;
+        if vnfs_removal_allowed(options)
+            && let Some(result) = uucore::vnfs::try_remove(path, false)
+        {
+            return result
+                .err()
+                .is_some_and(|error| show_removal_error(error, path));
         }
 
         // Update progress bar before removing the file

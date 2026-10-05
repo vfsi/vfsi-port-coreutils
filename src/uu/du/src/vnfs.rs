@@ -28,44 +28,11 @@ use uucore::libc;
 use uucore::translate;
 
 use vnfs::{
-    FileType as VfType, Metadata, MetadataFields, Mounted, Nfs, NfsClient, WalkControl,
-    WalkEventKind, WalkOptions,
+    FileType as VfType, Metadata, MetadataFields, MetadataOptions, Mounted, Nfs, Vfsi, VfsiExt,
+    WalkControl, WalkEventKind,
 };
 
 use crate::{Deref, FileInfo, StatPrintInfo, TraversalOptions, Usage};
-
-enum Backend {
-    Dummy(Mounted),
-    Nfs(NfsClient),
-}
-
-impl Backend {
-    /// No-follow attributes for one path (the operand or a single file).
-    fn lstat(&self, path: &Path, fields: MetadataFields) -> vnfs::Result<Metadata> {
-        match self {
-            Self::Dummy(fs) => fs.symlink_metadata_with_fields(path, fields),
-            Self::Nfs(fs) => fs.symlink_metadata_with_fields(path, fields),
-        }
-    }
-
-    /// Enumerate the subtree with attributes delivered in READDIR replies.
-    /// Resource-limit failures are reported; partial output is not replayed.
-    fn visit(
-        &self,
-        dir: &Path,
-        fields: MetadataFields,
-        callback: impl FnMut(&vnfs::WalkEvent) -> vnfs::Result<WalkControl>,
-    ) -> vnfs::Result<vnfs::TraversalCompletion> {
-        match self {
-            Self::Dummy(fs) => {
-                fs.walk_events_with_options(dir, fields, WalkOptions::default(), false, callback)
-            }
-            Self::Nfs(fs) => {
-                fs.walk_events_with_options(dir, fields, WalkOptions::default(), false, callback)
-            }
-        }
-    }
-}
 
 /// Whether `VNFS_IMPL` selects a vectorized backend.
 pub fn is_enabled() -> bool {
@@ -146,8 +113,8 @@ fn send(
 /// Traverse `path` through `backend` and emit each entry, returning the root's
 /// accumulated usage. `vroot` is the operand's path inside the backend
 /// namespace; emitted paths are mapped back onto `path` as the user typed it.
-fn traverse(
-    backend: &Backend,
+fn traverse<F: Vfsi>(
+    backend: &F,
     path: &Path,
     vroot: &Path,
     options: &TraversalOptions,
@@ -162,7 +129,12 @@ fn traverse(
     };
 
     let masks = attr_mask(options);
-    let root_attrs = backend.lstat(vroot, masks).map_err(io::Error::other)?;
+    let root_attrs = backend
+        .metadata_with_options(
+            vroot,
+            MetadataOptions::new().fields(masks).follow_symlinks(false),
+        )
+        .map_err(io::Error::other)?;
 
     if root_attrs.file_type() != VfType::Directory {
         return Ok(usage_from_attrs(path, &root_attrs, options));
@@ -172,66 +144,73 @@ fn traverse(
     let mut stack: Vec<Option<Usage>> = Vec::new();
     let mut total = None;
     backend
-        .visit(vroot, masks, |event| {
-            let rendered = print_path(event.entry.path());
-            if event.kind == WalkEventKind::Leave {
-                if let Some(Some(child)) = stack.pop() {
-                    if let Some(Some(parent)) = stack.last_mut() {
-                        if !options.separate_dirs {
-                            parent.size += child.size;
-                            parent.blocks += child.blocks;
-                            parent.inodes += child.inodes;
-                            parent.latest_time = max_time(parent.latest_time, child.latest_time);
+        .walk_events_with_options(
+            vroot,
+            masks,
+            backend.limits().walk_options(),
+            false,
+            |event| {
+                let rendered = print_path(event.entry.path());
+                if event.kind == WalkEventKind::Leave {
+                    if let Some(Some(child)) = stack.pop() {
+                        if let Some(Some(parent)) = stack.last_mut() {
+                            if !options.separate_dirs {
+                                parent.size += child.size;
+                                parent.blocks += child.blocks;
+                                parent.inodes += child.inodes;
+                                parent.latest_time =
+                                    max_time(parent.latest_time, child.latest_time);
+                            }
+                            send(print_tx, child, event.depth)
+                                .map_err(|_| vnfs::Error::client(0, libc::EPIPE as u32))?;
+                        } else if event.depth == 0 {
+                            total = Some(child);
                         }
-                        send(print_tx, child, event.depth)
-                            .map_err(|_| vnfs::Error::client(0, libc::EPIPE as u32))?;
-                    } else if event.depth == 0 {
-                        total = Some(child);
                     }
-                }
-                return Ok(WalkControl::Continue);
-            }
-            let name = rendered.file_name().map(|n| n.to_string_lossy());
-            let excluded = options.excludes.iter().any(|pattern| {
-                pattern.matches(&rendered.to_string_lossy())
-                    || name.as_deref().is_some_and(|n| pattern.matches(n))
-            });
-            if event.depth > 0 && excluded {
-                if options.verbose {
-                    println!(
-                        "{}",
-                        translate!("du-verbose-ignored", "path" => rendered.quote())
-                    );
-                }
-                if event.kind == WalkEventKind::Enter {
-                    stack.push(None);
-                }
-                return Ok(WalkControl::SkipSubtree);
-            }
-            let metadata = event.entry.metadata();
-            let usage = usage_from_attrs(&rendered, metadata, options);
-            if event.kind == WalkEventKind::Enter {
-                stack.push(Some(usage));
-            } else {
-                if let Some(info) = file_info(metadata)
-                    && !options.count_links
-                    && !seen.insert(info)
-                {
                     return Ok(WalkControl::Continue);
                 }
-                if let Some(Some(parent)) = stack.last_mut() {
-                    parent.size += usage.size;
-                    parent.blocks += usage.blocks;
-                    parent.inodes += 1;
-                    parent.latest_time = max_time(parent.latest_time, usage.latest_time);
+                let name = rendered.file_name().map(|n| n.to_string_lossy());
+                let excluded = options.excludes.iter().any(|pattern| {
+                    pattern.matches(&rendered.to_string_lossy())
+                        || name.as_deref().is_some_and(|n| pattern.matches(n))
+                });
+                if event.depth > 0 && excluded {
+                    if options.verbose {
+                        println!(
+                            "{}",
+                            translate!("du-verbose-ignored", "path" => rendered.quote())
+                        );
+                    }
+                    if event.kind == WalkEventKind::Enter {
+                        stack.push(None);
+                    }
+                    return Ok(WalkControl::SkipSubtree);
                 }
-                if options.all {
-                    send(print_tx, usage, event.depth)
-                        .map_err(|_| vnfs::Error::client(0, libc::EPIPE as u32))?;
+                let metadata = event.entry.metadata();
+                let usage = usage_from_attrs(&rendered, metadata, options);
+                if event.kind == WalkEventKind::Enter {
+                    stack.push(Some(usage));
+                } else {
+                    if let Some(info) = file_info(metadata)
+                        && !options.count_links
+                        && !seen.insert(info)
+                    {
+                        return Ok(WalkControl::Continue);
+                    }
+                    if let Some(Some(parent)) = stack.last_mut() {
+                        parent.size += usage.size;
+                        parent.blocks += usage.blocks;
+                        parent.inodes += 1;
+                        parent.latest_time = max_time(parent.latest_time, usage.latest_time);
+                    }
+                    if options.all {
+                        send(print_tx, usage, event.depth)
+                            .map_err(|_| vnfs::Error::client(0, libc::EPIPE as u32))?;
+                    }
                 }
-            }
-            Ok(WalkControl::Continue)
-        })
+                Ok(WalkControl::Continue)
+            },
+        )
         .map_err(io::Error::other)?;
     total.ok_or_else(|| io::Error::other("vnfs walk did not finish its root"))
 }
@@ -260,16 +239,21 @@ pub fn try_du(
     // Path inside the export namespace the backend resolves against.
     let vroot = Path::new("/").join(relative);
 
-    let backend = match std::env::var("VNFS_IMPL").as_deref() {
-        Ok("dummy") => Backend::Dummy(Mounted::new(&mount.point).map_err(io::Error::other)?),
+    let result = match std::env::var("VNFS_IMPL").as_deref() {
+        Ok("dummy") => traverse(
+            &Mounted::new(&mount.point).map_err(io::Error::other)?,
+            path,
+            &vroot,
+            options,
+            print_tx,
+        ),
         Ok("nfs") => match Nfs::from_mount(&mount.point) {
-            Ok(fs) => Backend::Nfs(fs),
+            Ok(fs) => traverse(&fs, path, &vroot, options, print_tx),
             Err(_) => return Ok(None),
         },
         _ => return Ok(None),
     };
 
-    let result = traverse(&backend, path, &vroot, options, print_tx);
     print_stats();
     if std::env::var("VNFS_PROFILE").as_deref() == Ok("1")
         && let Err(error) = &result
@@ -342,7 +326,7 @@ mod tests {
     /// `(path, size, inodes, depth)` for every emitted entry plus the root
     /// total.
     fn run(root: &Path, options: &TraversalOptions) -> (Vec<(PathBuf, u64, u64, usize)>, Usage) {
-        let backend = Backend::Dummy(Mounted::new(root).expect("dummy root"));
+        let backend = Mounted::new(root).expect("dummy root");
         let (tx, rx) = mpsc::channel();
         let total = traverse(&backend, root, Path::new("/"), options, &tx).expect("traverse");
         drop(tx);

@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use vnfs::{Error as VfError, Mounted, NfsClient, ReadAllOptions, Result as VfResult};
+use vnfs::{Error as VfError, Mounted, NfsClient, ReadOptions, Result as VfResult, VfsiExt};
 
 const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
 
@@ -20,11 +20,7 @@ fn impl_choice() -> Option<&'static str> {
 }
 
 fn vf_io_error(e: VfError) -> io::Error {
-    if e.is_transport() {
-        io::Error::new(io::ErrorKind::ConnectionRefused, e)
-    } else {
-        e.into()
-    }
+    e.into()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,34 +64,25 @@ enum Backend {
 }
 
 impl Backend {
-    fn mapped_path(&self, path: &Path, mount: &Mount) -> io::Result<PathBuf> {
-        let absolute = path.canonicalize()?;
-        let relative = absolute
-            .strip_prefix(&mount.point)
-            .map_err(|_| io::Error::other("path is outside VFSI mount"))?;
-        match self {
-            Self::Dummy(_) | Self::Nfs { .. } => Ok(Path::new("/").join(relative)),
-        }
-    }
-
     fn read_files(&self, paths: &[PathBuf], limit: usize) -> VfResult<Vec<Vec<u8>>> {
-        let options = ReadAllOptions::new().max_total_bytes(limit);
+        let limit = std::num::NonZeroUsize::new(limit)
+            .ok_or_else(|| VfError::failure(0, libc::EINVAL as u32))?;
+        let options = ReadOptions::new().max_total_bytes(Some(limit));
         match self {
             Self::Dummy(fs) => fs.read_files_with_options(paths, options),
             Self::Nfs { fs, .. } => fs.read_files_with_options(paths, options),
         }
     }
 
-    fn read_stream(
-        &self,
-        path: &Path,
-        mut callback: impl FnMut(&[u8]) -> VfResult<bool>,
-    ) -> VfResult<()> {
+    fn copy_to_writer(&self, path: &Path, writer: &mut impl Write) -> VfResult<u64> {
         match self {
-            Self::Dummy(fs) => fs.read_stream(path, |_, data| callback(data)),
-            Self::Nfs { fs, .. } => fs.read_stream(path, |_, data| callback(data)),
+            Self::Dummy(fs) => {
+                vnfs::helpers::copy_to_writer(fs, path, writer, vnfs::ReadStreamOptions::default())
+            }
+            Self::Nfs { fs, .. } => {
+                vnfs::helpers::copy_to_writer(fs, path, writer, vnfs::ReadStreamOptions::default())
+            }
         }
-        .map(|_| ())
     }
 
     fn copy_files(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<VfResult<()>> {
@@ -103,7 +90,7 @@ impl Backend {
             Self::Nfs {
                 fs,
                 supports_copy: true,
-            } => Some(fs.copy_files(pairs)),
+            } => Some(fs.vcopy(pairs)),
             _ => None,
         }
     }
@@ -116,6 +103,7 @@ struct PreparedCopy {
 
 struct Context {
     mount: Mount,
+    paths: vnfs::helpers::MountSession<()>,
     backend: Backend,
     prefetched: HashMap<PathBuf, Vec<u8>>,
     prepared_copies: HashMap<PathBuf, PreparedCopy>,
@@ -151,34 +139,12 @@ fn make_context(mount: Mount) -> io::Result<Context> {
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
     Ok(Context {
+        paths: vnfs::helpers::MountSession::new((), &mount.point)?,
         mount,
         backend,
         prefetched: HashMap::new(),
         prepared_copies: HashMap::new(),
     })
-}
-
-fn mounted_vf_path(path: &Path, mount: &Mount) -> io::Result<PathBuf> {
-    let absolute = path.canonicalize()?;
-    let relative = absolute
-        .strip_prefix(&mount.point)
-        .map_err(|_| io::Error::other("path is outside VFSI mount"))?;
-    Ok(Path::new("/").join(relative))
-}
-
-fn new_mounted_vf_path(path: &Path, mount: &Mount) -> io::Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("destination has no parent"))?
-        .canonicalize()?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::other("destination has no file name"))?;
-    let absolute = parent.join(name);
-    let relative = absolute
-        .strip_prefix(&mount.point)
-        .map_err(|_| io::Error::other("path is outside VFSI mount"))?;
-    Ok(Path::new("/").join(relative))
 }
 
 fn server_copy_enabled() -> bool {
@@ -205,6 +171,7 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
     let mut seen_destinations = HashSet::new();
     let mut plans = Vec::with_capacity(sources.len());
     let mut pairs = Vec::with_capacity(sources.len());
+    let paths = vnfs::helpers::MountSession::new((), &target_mount.point)?;
     for (i, source) in sources.iter().enumerate() {
         if !source.metadata().is_ok_and(|metadata| metadata.is_file()) {
             return Ok(false);
@@ -224,8 +191,8 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
         }
         let temp = target.join(format!(".vfsi-cp-{}-{nonce}-{i}", std::process::id()));
         pairs.push((
-            mounted_vf_path(source, &source_mount)?,
-            new_mounted_vf_path(&temp, &target_mount)?,
+            paths.map(source, vnfs::helpers::ResolvePath::Follow)?,
+            paths.map(&temp, vnfs::helpers::ResolvePath::NoFollow)?,
         ));
         plans.push((source.clone(), PreparedCopy { dest, temp }));
     }
@@ -329,7 +296,11 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
             let batch = &selected;
             let Ok(files): io::Result<Vec<PathBuf>> = batch
                 .iter()
-                .map(|source| ctx.backend.mapped_path(source, &ctx.mount))
+                .map(|source| {
+                    ctx.paths
+                        .map(source, vnfs::helpers::ResolvePath::Follow)
+                        .map_err(Into::into)
+                })
                 .collect()
             else {
                 return Ok(());
@@ -394,10 +365,9 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
                 .truncate(true)
                 .mode(0o600)
                 .open(dest)?;
-            let dest_mount = dest_mount.as_ref().expect("same-server NFS destination");
             let pair = (
-                mounted_vf_path(source, &source_mount)?,
-                mounted_vf_path(dest, dest_mount)?,
+                ctx.paths.map(source, vnfs::helpers::ResolvePath::Follow)?,
+                ctx.paths.map(dest, vnfs::helpers::ResolvePath::Follow)?,
             );
             if let Some(result) = ctx.backend.copy_files(std::slice::from_ref(&pair)) {
                 match result {
@@ -428,7 +398,7 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
             output.write_all(&contents)?;
             return Ok(Some("vfsi-client-read"));
         }
-        let source_path = ctx.backend.mapped_path(source, &ctx.mount)?;
+        let source_path = ctx.paths.map(source, vnfs::helpers::ResolvePath::Follow)?;
         let mut output = OpenOptions::new()
             .write(true)
             .create(true)
@@ -438,19 +408,9 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             eprintln!("[profile] cp_vfsi_method=client_read");
         }
-        let mut write_error = None;
-        let read_result = ctx.backend.read_stream(&source_path, |data| {
-            if let Err(error) = output.write_all(data) {
-                write_error = Some(error);
-                Ok(false)
-            } else {
-                Ok(true)
-            }
-        });
-        if let Some(error) = write_error {
-            return Err(error);
-        }
-        read_result.map_err(vf_io_error)?;
+        ctx.backend
+            .copy_to_writer(&source_path, &mut output)
+            .map_err(vf_io_error)?;
         Ok(Some("vfsi-client-read"))
     })
 }
@@ -470,7 +430,10 @@ mod tests {
             point: root.path().to_path_buf(),
         };
         let backend = Backend::Dummy(Mounted::new(root.path()).unwrap());
-        let mapped = backend.mapped_path(&file, &mount).unwrap();
+        let mapped = vnfs::helpers::MountSession::new((), &mount.point)
+            .unwrap()
+            .map(&file, vnfs::helpers::ResolvePath::Follow)
+            .unwrap();
         assert_eq!(mapped, Path::new("/file"));
         assert_eq!(
             backend
@@ -478,14 +441,19 @@ mod tests {
                 .unwrap(),
             vec![b"hello world".to_vec()]
         );
+        // A disabled/empty budget must not become an inherited allocation limit.
+        let error = backend
+            .read_files(std::slice::from_ref(&mapped), 0)
+            .unwrap_err();
+        assert_eq!(io::Error::from(error).kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            backend
+                .read_files(std::slice::from_ref(&mapped), 4)
+                .is_err()
+        );
 
         let mut bytes = Vec::new();
-        backend
-            .read_stream(&mapped, |chunk| {
-                bytes.extend_from_slice(chunk);
-                Ok(true)
-            })
-            .unwrap();
+        backend.copy_to_writer(&mapped, &mut bytes).unwrap();
         assert_eq!(bytes, b"hello world");
     }
 }

@@ -123,9 +123,9 @@ fn remove_single(path: &Path, opts: Opts) -> Result<(), Error<'_>> {
         && path
             .symlink_metadata()
             .is_ok_and(|metadata| metadata.is_dir())
-        && uucore::vnfs::try_remove(path, false)
+        && let Some(result) = uucore::vnfs::try_remove(path, false)
     {
-        return Ok(());
+        return result.map_err(|error| Error { error, path });
     }
 
     remove_dir(path).map_err(|error| Error { error, path })

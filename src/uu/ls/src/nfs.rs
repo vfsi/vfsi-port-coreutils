@@ -14,11 +14,9 @@ use std::path::{Path, PathBuf};
 
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
-#[cfg(test)]
-use vnfs::WalkOptions;
 use vnfs::{
-    DirEntry, DirectoryListing, Error as VfError, MetadataFields, Mounted, Nfs, NfsClient,
-    ReadDirOptions,
+    DirEntry, DirectoryListing, Error as VfError, MetadataFields, Mounted, Nfs, NfsClient, VfsiExt,
+    VisitOptions,
 };
 
 pub(crate) struct WalkEntry {
@@ -41,11 +39,7 @@ fn impl_choice() -> Option<&'static str> {
 /// typed [`vnfs::Error`] (transport vs. filesystem status) and keeping the
 /// operation index in the message.
 fn vf_io_error(e: VfError) -> io::Error {
-    if e.is_transport() {
-        io::Error::new(io::ErrorKind::ConnectionRefused, e)
-    } else {
-        e.into()
-    }
+    e.into()
 }
 
 /// Attributes requested for every entry (all supported fields). The
@@ -84,48 +78,17 @@ impl Backend {
         fields: MetadataFields,
     ) -> vnfs::Result<Vec<DirectoryListing>> {
         match self {
-            Self::Dummy(fs) => fs.read_dirs_with_options(dirs, fields, ReadDirOptions::default()),
-            Self::Nfs(fs) => fs.read_dirs_with_options(dirs, fields, ReadDirOptions::default()),
+            Self::Dummy(fs) => fs.read_dirs_with_options(dirs, VisitOptions::new().fields(fields)),
+            Self::Nfs(fs) => fs.read_dirs_with_options(dirs, VisitOptions::new().fields(fields)),
         }
-    }
-
-    #[cfg(test)]
-    fn walk(
-        &self,
-        root: &Path,
-        masks: MetadataFields,
-        sort: &mut dyn FnMut(&Path, &mut Vec<DirEntry>),
-    ) -> vnfs::Result<Vec<WalkEntry>> {
-        let tree = match self {
-            Self::Dummy(fs) => fs.walk_with_options(root, masks, WalkOptions::default()),
-            Self::Nfs(fs) => fs.walk_with_options(root, masks, WalkOptions::default()),
-        }?;
-        let mut by_path = std::collections::HashMap::with_capacity(tree.len());
-        for listing in tree {
-            let mut entries = listing.entries;
-            sort(&listing.path, &mut entries);
-            by_path.insert(listing.path, entries);
-        }
-        let mut ordered = Vec::with_capacity(by_path.len());
-        let mut pending = vec![root.to_path_buf()];
-        while let Some(path) = pending.pop() {
-            let Some(entries) = by_path.remove(&path) else {
-                continue;
-            };
-            for child in entries.iter().rev() {
-                if child.file_type() == vnfs::FileType::Directory {
-                    pending.push(child.path().to_path_buf());
-                }
-            }
-            ordered.push(WalkEntry { path, entries });
-        }
-        Ok(ordered)
+        .map(|trees| trees.into_iter().flatten().collect())
     }
 }
 
 struct VfContext {
     backend: Backend,
     mount: NfsMount,
+    paths: vnfs::helpers::MountSession<()>,
 }
 
 impl Drop for VfContext {
@@ -176,7 +139,12 @@ fn make_ctx(mount: NfsMount) -> io::Result<VfContext> {
         Some("nfs") => Backend::Nfs(Nfs::from_mount(&mount.point).map_err(vf_io_error)?),
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
-    Ok(VfContext { backend, mount })
+    let paths = vnfs::helpers::MountSession::new((), &mount.point)?;
+    Ok(VfContext {
+        backend,
+        mount,
+        paths,
+    })
 }
 
 /// Open `path` for listing through the vectorized backend when applicable.
@@ -202,8 +170,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         }
         let ctx = ctx.as_mut().unwrap();
 
-        let rel = path.strip_prefix(&ctx.mount.point).unwrap_or(path);
-        let vpath = Path::new("/").join(rel);
+        let vpath = ctx.paths.map(path, vnfs::helpers::ResolvePath::Follow)?;
         let listing = match ctx.backend.read_dirs(&[&vpath], full_mask(config)) {
             Ok(mut listings) => match listings.pop() {
                 Some(listing) => listing,
@@ -238,13 +205,15 @@ fn ctx_open_many(
     kernel_dirs: &[&Path],
     masks: MetadataFields,
 ) -> Vec<Option<LsReadDir>> {
-    let vpaths: Vec<PathBuf> = kernel_dirs
+    let vpaths: vnfs::Result<Vec<PathBuf>> = kernel_dirs
         .iter()
-        .map(|d| {
-            let rel = d.strip_prefix(&ctx.mount.point).unwrap_or(d);
-            Path::new("/").join(rel)
-        })
+        .map(|d| ctx.paths.map(d, vnfs::helpers::ResolvePath::Follow))
         .collect();
+    let Ok(vpaths) = vpaths else {
+        return std::iter::repeat_with(|| None)
+            .take(kernel_dirs.len())
+            .collect();
+    };
     let refs: Vec<&Path> = vpaths.iter().map(PathBuf::as_path).collect();
     let Ok(listings) = ctx.backend.read_dirs(&refs, masks) else {
         // Callback entries can interleave across directories by READDIR page.
@@ -271,8 +240,8 @@ fn ctx_open_many(
     out
 }
 
-/// Open several directory operands in one vectorized batch when they all live
-/// on the same NFS mount (and the backend is enabled). Returns `Ok(None)`
+/// Group operands by mount and batch each eligible group independently.
+/// Mixed local/NFS inputs retain their original positions. Returns `Ok(None)`
 /// when the batch path does not apply, and a per-directory result vector
 /// otherwise (entries, or `None` where the caller must fall back).
 pub fn try_open_many_vf(
@@ -282,23 +251,41 @@ pub fn try_open_many_vf(
     if impl_choice().is_none() || dirs.len() < 2 {
         return Ok(None);
     }
-    let Some(mount) = nfs_mountpoint(dirs[0]) else {
-        return Ok(None);
-    };
-    if dirs[1..]
-        .iter()
-        .any(|d| nfs_mountpoint(d) != Some(mount.clone()))
-    {
+    let groups = group_mounts(dirs.iter().map(|path| nfs_mountpoint(path)));
+    if groups.is_empty() {
         return Ok(None);
     }
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
-        if ctx.as_ref().is_none_or(|ctx| ctx.mount != mount) {
-            *ctx = Some(make_ctx(mount)?);
+        let mut out: Vec<Option<LsReadDir>> =
+            std::iter::repeat_with(|| None).take(dirs.len()).collect();
+        for (mount, indices) in groups {
+            if ctx.as_ref().is_none_or(|ctx| ctx.mount != mount) {
+                *ctx = Some(make_ctx(mount)?);
+            }
+            let grouped: Vec<&Path> = indices.iter().map(|&i| dirs[i]).collect();
+            let listings = ctx_open_many(ctx.as_mut().unwrap(), &grouped, full_mask(config));
+            for (index, listing) in indices.into_iter().zip(listings) {
+                out[index] = listing;
+            }
         }
-        let ctx = ctx.as_mut().unwrap();
-        Ok(Some(ctx_open_many(ctx, dirs, full_mask(config))))
+        Ok(Some(out))
     })
+}
+
+fn group_mounts(mounts: impl IntoIterator<Item = Option<NfsMount>>) -> Vec<(NfsMount, Vec<usize>)> {
+    let mut groups: Vec<(NfsMount, Vec<usize>)> = Vec::new();
+    for (index, mount) in mounts.into_iter().enumerate() {
+        let Some(mount) = mount else {
+            continue;
+        };
+        if let Some((_, indices)) = groups.iter_mut().find(|(candidate, _)| *candidate == mount) {
+            indices.push(index);
+        } else {
+            groups.push((mount, vec![index]));
+        }
+    }
+    groups
 }
 
 /// Walk the whole subtree rooted at `path` through the vectorized backend,
@@ -331,66 +318,10 @@ pub fn try_visit_walk_vf(
         }
         let ctx = ctx.as_mut().unwrap();
 
-        let rel = path.strip_prefix(&ctx.mount.point).unwrap_or(path);
-        let vpath = Path::new("/").join(rel);
         let t0 = std::time::Instant::now();
-        let mut pending = vec![(vpath, 0usize)];
-        let limits = vnfs::ResourceLimits::default();
-        let mut count = 0usize;
-        let mut bytes = 0usize;
-        while let Some((dir, depth)) = pending.pop() {
-            if depth > limits.max_walk_depth {
-                return Err(io::Error::from_raw_os_error(uucore::libc::EFBIG).into());
-            }
-            let listing = match &ctx.backend {
-                Backend::Dummy(fs) => fs.read_dirs_with_options(
-                    &[&dir],
-                    full_mask(config),
-                    ReadDirOptions::new()
-                        .max_entries(limits.max_directory_entries.saturating_sub(count))
-                        .max_path_bytes(limits.max_directory_path_bytes.saturating_sub(bytes)),
-                ),
-                Backend::Nfs(fs) => fs.read_dirs_with_options(
-                    &[&dir],
-                    full_mask(config),
-                    ReadDirOptions::new()
-                        .max_entries(limits.max_directory_entries.saturating_sub(count))
-                        .max_path_bytes(limits.max_directory_path_bytes.saturating_sub(bytes)),
-                ),
-            }
-            .map_err(vf_io_error)?;
-            let mut listing = listing
-                .into_iter()
-                .next()
-                .ok_or_else(|| io::Error::other("missing directory listing"))?;
-            for entry in &listing.entries {
-                count = count
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::from_raw_os_error(uucore::libc::EFBIG))?;
-                bytes = bytes
-                    .checked_add(entry.path().as_os_str().len())
-                    .ok_or_else(|| io::Error::from_raw_os_error(uucore::libc::EFBIG))?;
-            }
-            crate::sort_vf_entries(&mut listing.entries, config);
-            for entry in listing.entries.iter().rev() {
-                if entry.file_type() == vnfs::FileType::Directory
-                    && entry
-                        .file_name()
-                        .is_some_and(|name| crate::display::should_display(name, config))
-                {
-                    pending.push((entry.path().to_path_buf(), depth + 1));
-                }
-            }
-            let relative = dir.strip_prefix("/").unwrap_or(&dir);
-            let kernel_path = if depth == 0 {
-                path.to_path_buf()
-            } else {
-                ctx.mount.point.join(relative)
-            };
-            callback(WalkEntry {
-                path: kernel_path,
-                entries: listing.entries,
-            })?;
+        match &ctx.backend {
+            Backend::Dummy(fs) => visit_ordered(fs, &ctx.mount.point, path, config, &mut callback)?,
+            Backend::Nfs(fs) => visit_ordered(fs, &ctx.mount.point, path, config, &mut callback)?,
         }
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             eprintln!(
@@ -403,6 +334,55 @@ pub fn try_visit_walk_vf(
     })
 }
 
+fn visit_ordered<F: vnfs::Vfsi>(
+    fs: &F,
+    mount: &Path,
+    path: &Path,
+    config: &crate::config::Config,
+    callback: &mut impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
+) -> uucore::error::UResult<()> {
+    use vnfs::{
+        WalkControl,
+        helpers::{MountSession, ResolvePath},
+    };
+    let session = MountSession::new(fs, mount).map_err(vf_io_error)?;
+    let root = session
+        .map(path, ResolvePath::Follow)
+        .map_err(vf_io_error)?;
+    let mut output_error = None;
+    let result = fs.visit_dirs_ordered(
+        root,
+        full_mask(config),
+        fs.limits().walk_options(),
+        |entries| crate::sort_vf_entries(entries, config),
+        |entry| {
+            entry
+                .file_name()
+                .is_some_and(|name| crate::display::should_display(name, config))
+        },
+        |listing, depth| {
+            let rendered = if depth == 0 {
+                path.to_path_buf()
+            } else {
+                session.local_path(&listing.path)?
+            };
+            if let Err(error) = callback(WalkEntry {
+                path: rendered,
+                entries: listing.entries,
+            }) {
+                output_error = Some(error);
+                return Ok(WalkControl::Stop);
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+    if let Some(error) = output_error {
+        return Err(error);
+    }
+    result.map_err(vf_io_error)?;
+    Ok(())
+}
+
 #[cfg(all(test, all(feature = "vnfs", target_os = "linux")))]
 mod tests {
     use super::*;
@@ -410,6 +390,7 @@ mod tests {
 
     fn dummy_ctx(root: &Path) -> VfContext {
         VfContext {
+            paths: vnfs::helpers::MountSession::new((), root).unwrap(),
             backend: Backend::Dummy(Mounted::new(root).unwrap()),
             mount: NfsMount {
                 server: "dummy".to_string(),
@@ -430,6 +411,29 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn groups_mixed_mounts_and_duplicates_without_losing_original_indices() {
+        let mount = NfsMount {
+            server: "a".into(),
+            export: "/export".into(),
+            point: "/mnt/a".into(),
+        };
+        let other = NfsMount {
+            point: "/mnt/b".into(),
+            ..mount.clone()
+        };
+        assert_eq!(
+            group_mounts([
+                None,
+                Some(mount.clone()),
+                Some(other.clone()),
+                Some(mount.clone()),
+                None
+            ]),
+            [(mount, vec![1, 3]), (other, vec![2])]
+        );
     }
 
     #[test]
@@ -504,12 +508,24 @@ mod tests {
             std::fs::create_dir(root.path().join(name)).unwrap();
             std::fs::write(root.path().join(name).join("file"), b"data").unwrap();
         }
-        let backend = Backend::Dummy(Mounted::new(root.path()).unwrap());
+        let backend = Mounted::new(root.path()).unwrap();
         let fields = MetadataFields::MODE | MetadataFields::SIZE | MetadataFields::BLOCKS;
-        let tree = backend
-            .walk(Path::new("/"), fields, &mut |_, entries| {
-                entries.sort_by(|a, b| b.path().cmp(a.path()));
-            })
+        let mut tree = Vec::new();
+        backend
+            .visit_dirs_ordered(
+                "/",
+                fields,
+                backend.limits().walk_options(),
+                |entries| entries.sort_by(|a, b| b.path().cmp(a.path())),
+                |_| true,
+                |listing, _| {
+                    tree.push(WalkEntry {
+                        path: listing.path,
+                        entries: listing.entries,
+                    });
+                    Ok(vnfs::WalkControl::Continue)
+                },
+            )
             .unwrap();
         let paths: Vec<_> = tree
             .iter()
