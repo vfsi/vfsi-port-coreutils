@@ -98,9 +98,7 @@ fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
 /// Once submitted, return its result even on failure: a direct recursive
 /// removal can have partial effects and must not be replayed via the kernel.
 pub fn try_remove(path: &Path, recursive: bool) -> Option<std::io::Result<()>> {
-    let Some((mount, relative_path)) = remove_paths(path) else {
-        return None;
-    };
+    let (mount, relative_path) = remove_paths(path)?;
 
     let backend = match std::env::var("VNFS_IMPL").as_deref() {
         Ok("dummy") => {
