@@ -71,7 +71,7 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          # vnfs needs libntirpc >= 6.3; Ubuntu 24.04's package is 4.3.
+          # Exercise the Linux-only VFSI backend with its bundled ntirpc build.
           - { os: ubuntu-26.04  , features: all             , workspace: true }
           # The VFSI/NFS backend is Linux-only; exercise the portable Unix
           # feature set on macOS and reserve --all-features for Linux.
@@ -118,8 +118,9 @@ jobs:
         case '${{ matrix.job.os }}' in
           ubuntu-*)
             sudo apt-get -y update
-            # selinux and systemd headers needed to enable all features
-            sudo apt-get -y install libntirpc-dev libselinux1-dev libsystemd-dev
+            # Build bundled ntirpc and generate bindings; also enable the
+            # SELinux and systemd features without a system ntirpc dependency.
+            sudo apt-get -y install cmake pkg-config libclang-dev liburcu-dev libselinux1-dev libsystemd-dev
           ;;
         esac
     - name: "`cargo clippy` lint testing"
