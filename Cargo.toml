@@ -403,7 +403,15 @@ rustix = { workspace = true, features = ["net", "process"] }
 phf_codegen.workspace = true
 
 [features]
-feat_vnfs = ["cp?/vnfs", "dir?/vnfs", "du?/vnfs", "ls?/vnfs", "rm?/vnfs", "rmdir?/vnfs", "vdir?/vnfs"]
+feat_vnfs = [
+  "cp?/vnfs",
+  "dir?/vnfs",
+  "du?/vnfs",
+  "ls?/vnfs",
+  "rm?/vnfs",
+  "rmdir?/vnfs",
+  "vdir?/vnfs",
+]
 default = ["feat_common_core", "feat_diagnostics"]
 ## OS feature shortcodes
 unix = ["feat_os_unix"]
