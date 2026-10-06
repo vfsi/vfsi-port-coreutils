@@ -920,7 +920,7 @@ impl<'a> PathData<'a> {
         let ft = OnceCell::new();
         let security_context = OnceCell::new();
         if !must_dereference {
-            let _ = md.set(Some(LsMeta::Vf(entry.metadata().clone())));
+            let _ = md.set(Some(LsMeta::Vf(entry.attrs().clone())));
             let _ = ft.set(Some(LsFileType::from_vf_type(ftype)));
         }
         Self {
@@ -1758,9 +1758,9 @@ pub(crate) fn sort_vf_entries(entries: &mut [VnfsDirEntry], config: &Config) {
         }
         Sort::Size => {
             entries.sort_unstable_by(|a, b| {
-                b.metadata()
+                b.attrs()
                     .len()
-                    .cmp(&a.metadata().len())
+                    .cmp(&a.attrs().len())
                     .then(name_of(a).cmp(name_of(b)))
             });
         }
@@ -1805,9 +1805,9 @@ pub(crate) fn sort_vf_entries(entries: &mut [VnfsDirEntry], config: &Config) {
 fn vf_time(a: &VnfsDirEntry, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
     use uucore::fsext::MetadataTimeField;
     match field {
-        MetadataTimeField::Modification => a.metadata().modified(),
-        MetadataTimeField::Access => a.metadata().accessed(),
-        MetadataTimeField::Change => a.metadata().changed(),
+        MetadataTimeField::Modification => a.attrs().modified(),
+        MetadataTimeField::Access => a.attrs().accessed(),
+        MetadataTimeField::Change => a.attrs().changed(),
         MetadataTimeField::Birth => None,
     }
 }

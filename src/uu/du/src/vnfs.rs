@@ -28,7 +28,7 @@ use uucore::libc;
 use uucore::translate;
 
 use vnfs::{
-    FileType as VfType, Metadata, MetadataFields, MetadataOptions, Mounted, Nfs, Vfsi, VfsiExt,
+    Attrs as Metadata, AttrsOptions, Attributes, FileType as VfType, Mounted, Nfs, Vfsi, VfsiExt,
     WalkControl, WalkEventKind,
 };
 
@@ -47,14 +47,14 @@ pub fn supports(options: &TraversalOptions) -> bool {
     matches!(options.dereference, Deref::None) && !options.one_file_system
 }
 
-fn attr_mask(options: &TraversalOptions) -> MetadataFields {
-    let mut masks = MetadataFields::MODE
-        | MetadataFields::SIZE
-        | MetadataFields::NLINK
-        | MetadataFields::FILEID
-        | MetadataFields::BLOCKS;
+fn attr_mask(options: &TraversalOptions) -> Attributes {
+    let mut masks = Attributes::MODE
+        | Attributes::SIZE
+        | Attributes::NLINK
+        | Attributes::FILEID
+        | Attributes::BLOCKS;
     if options.time.is_some() {
-        masks |= MetadataFields::MTIME | MetadataFields::ATIME | MetadataFields::CTIME;
+        masks |= Attributes::MTIME | Attributes::ATIME | Attributes::CTIME;
     }
     masks
 }
@@ -130,9 +130,9 @@ fn traverse<F: Vfsi>(
 
     let masks = attr_mask(options);
     let root_attrs = backend
-        .metadata_with_options(
+        .attrs_with_options(
             vroot,
-            MetadataOptions::new().fields(masks).follow_symlinks(false),
+            AttrsOptions::new().fields(masks).follow_symlinks(false),
         )
         .map_err(io::Error::other)?;
 
@@ -186,7 +186,7 @@ fn traverse<F: Vfsi>(
                     }
                     return Ok(WalkControl::SkipSubtree);
                 }
-                let metadata = event.entry.metadata();
+                let metadata = event.entry.attrs();
                 let usage = usage_from_attrs(&rendered, metadata, options);
                 if event.kind == WalkEventKind::Enter {
                     stack.push(Some(usage));

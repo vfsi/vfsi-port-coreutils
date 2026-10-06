@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
 use vnfs::{
-    DirEntry, DirectoryListing, Error as VfError, MetadataFields, Mounted, Nfs, NfsClient, VfsiExt,
-    VisitOptions,
+    DirEntry, DirectoryListing, Error as VfError, Attributes, Mounted, Nfs, NfsClient, VfsiExt,
+    ListDirOptions,
 };
 
 pub(crate) struct WalkEntry {
@@ -46,8 +46,8 @@ fn vf_io_error(e: VfError) -> io::Error {
 /// FATTR4_NAMED_ATTR boolean is only needed by the long format (for the `+`
 /// access-indicator), and costs the server a per-entry xattr enumeration, so
 /// it is only requested then.
-fn full_mask(config: &crate::config::Config) -> MetadataFields {
-    use vnfs::MetadataFields as AttrMask;
+fn full_mask(config: &crate::config::Config) -> Attributes {
+    use vnfs::Attributes as AttrMask;
     let mut mask = AttrMask::MODE
         | AttrMask::SIZE
         | AttrMask::NLINK
@@ -75,11 +75,11 @@ impl Backend {
     fn read_dirs(
         &self,
         dirs: &[&Path],
-        fields: MetadataFields,
+        fields: Attributes,
     ) -> vnfs::Result<Vec<DirectoryListing>> {
         match self {
-            Self::Dummy(fs) => fs.read_dirs_with_options(dirs, VisitOptions::new().fields(fields)),
-            Self::Nfs(fs) => fs.read_dirs_with_options(dirs, VisitOptions::new().fields(fields)),
+            Self::Dummy(fs) => fs.read_dirs_with_options(dirs, ListDirOptions::new().fields(fields)),
+            Self::Nfs(fs) => fs.read_dirs_with_options(dirs, ListDirOptions::new().fields(fields)),
         }
         .map(|trees| trees.into_iter().flatten().collect())
     }
@@ -203,7 +203,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
 fn ctx_open_many(
     ctx: &mut VfContext,
     kernel_dirs: &[&Path],
-    masks: MetadataFields,
+    masks: Attributes,
 ) -> Vec<Option<LsReadDir>> {
     let vpaths: vnfs::Result<Vec<PathBuf>> = kernel_dirs
         .iter()
@@ -446,7 +446,7 @@ mod tests {
         let mut ctx = dummy_ctx(root.path());
         let dirs = [root.path().join("d1"), root.path().join("d2")];
         let paths: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
-        let masks = MetadataFields::MODE | MetadataFields::SIZE;
+        let masks = Attributes::MODE | Attributes::SIZE;
         let mut out = ctx_open_many(&mut ctx, &paths, masks);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(Option::is_some));
@@ -464,7 +464,7 @@ mod tests {
         let mut results = ctx_open_many(
             &mut ctx,
             &[path.as_path(), path.as_path()],
-            MetadataFields::MODE | MetadataFields::SIZE | MetadataFields::NLINK,
+            Attributes::MODE | Attributes::SIZE | Attributes::NLINK,
         );
         assert_eq!(results.len(), 2);
         for result in &mut results {
@@ -473,7 +473,7 @@ mod tests {
                 panic!("expected a vnfs entry");
             };
             assert_eq!(name, "item");
-            let metadata = crate::meta::LsMeta::Vf(entry.metadata().clone());
+            let metadata = crate::meta::LsMeta::Vf(entry.attrs().clone());
             assert_eq!(metadata.len(), 5);
             assert!(metadata.mode() != 0);
             assert!(metadata.nlink() >= 1);
@@ -496,7 +496,7 @@ mod tests {
             root.path().join("d2"),
         ];
         let paths: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
-        let masks = MetadataFields::MODE | MetadataFields::SIZE;
+        let masks = Attributes::MODE | Attributes::SIZE;
         let out = ctx_open_many(&mut ctx, &paths, masks);
         assert!(out.iter().all(Option::is_none));
     }
@@ -509,7 +509,7 @@ mod tests {
             std::fs::write(root.path().join(name).join("file"), b"data").unwrap();
         }
         let backend = Mounted::new(root.path()).unwrap();
-        let fields = MetadataFields::MODE | MetadataFields::SIZE | MetadataFields::BLOCKS;
+        let fields = Attributes::MODE | Attributes::SIZE | Attributes::BLOCKS;
         let mut tree = Vec::new();
         backend
             .visit_dirs_ordered(
@@ -532,7 +532,7 @@ mod tests {
             .map(|directory| directory.path.as_path())
             .collect();
         assert_eq!(paths, [Path::new("/"), Path::new("/b"), Path::new("/a")]);
-        assert_eq!(tree[1].entries[0].metadata().len(), 4);
-        assert!(tree[1].entries[0].metadata().blocks().is_some());
+        assert_eq!(tree[1].entries[0].attrs().len(), 4);
+        assert!(tree[1].entries[0].attrs().blocks().is_some());
     }
 }

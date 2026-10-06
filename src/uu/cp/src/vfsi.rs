@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use vnfs::{Error as VfError, Mounted, NfsClient, ReadOptions, Result as VfResult, VfsiExt};
+use vnfs::{CopyOption, Error as VfError, Mounted, NfsClient, ReadOptions, Result as VfResult, VfsiExt};
 
 const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
 
@@ -77,10 +77,10 @@ impl Backend {
     fn copy_to_writer(&self, path: &Path, writer: &mut impl Write) -> VfResult<u64> {
         match self {
             Self::Dummy(fs) => {
-                vnfs::helpers::copy_to_writer(fs, path, writer, vnfs::ReadStreamOptions::default())
+                vnfs::helpers::copy_to_writer(fs, path, writer, vnfs::StreamOptions::default())
             }
             Self::Nfs { fs, .. } => {
-                vnfs::helpers::copy_to_writer(fs, path, writer, vnfs::ReadStreamOptions::default())
+                vnfs::helpers::copy_to_writer(fs, path, writer, vnfs::StreamOptions::default())
             }
         }
     }
@@ -90,7 +90,7 @@ impl Backend {
             Self::Nfs {
                 fs,
                 supports_copy: true,
-            } => Some(fs.vcopy(pairs)),
+            } => Some(fs.vcopy(pairs, CopyOption::default())),
             _ => None,
         }
     }
