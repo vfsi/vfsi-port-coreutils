@@ -807,7 +807,8 @@ jobs:
             # selinux and systemd headers needed to build tests
             # acl: setfacl for coverage profile-trace dir default ACL (umask 0777 tests)
             sudo apt-get -y update
-            sudo apt-get -y install libselinux1-dev libsystemd-dev acl
+            # liburcu is required by the bundled libntirpc used by the VFSI NFS backend.
+            sudo apt-get -y install libselinux1-dev libsystemd-dev liburcu-dev acl
             # pinky is a tool to show logged-in users from utmp, and gecos fields from /etc/passwd.
             # In GitHub Action *nix VMs, no accounts log in, even the "runner" account that runs the commands, and "system boot" entry is missing.
             # The account also has empty gecos fields.
