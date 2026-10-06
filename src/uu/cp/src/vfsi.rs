@@ -7,7 +7,9 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use vnfs::{CopyOption, Error as VfError, Mounted, NfsClient, ReadOptions, Result as VfResult, VfsiExt};
+use vnfs::{
+    CopyOption, Error as VfError, Mounted, NfsClient, ReadOptions, Result as VfResult, VfsiExt,
+};
 
 const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
 

@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
 use vnfs::{
-    DirEntry, DirectoryListing, Error as VfError, Attributes, Mounted, Nfs, NfsClient, VfsiExt,
-    ListDirOptions,
+    Attributes, DirEntry, DirectoryListing, Error as VfError, ListDirOptions, Mounted, Nfs,
+    NfsClient, VfsiExt,
 };
 
 pub(crate) struct WalkEntry {
@@ -72,13 +72,11 @@ enum Backend {
 }
 
 impl Backend {
-    fn read_dirs(
-        &self,
-        dirs: &[&Path],
-        fields: Attributes,
-    ) -> vnfs::Result<Vec<DirectoryListing>> {
+    fn read_dirs(&self, dirs: &[&Path], fields: Attributes) -> vnfs::Result<Vec<DirectoryListing>> {
         match self {
-            Self::Dummy(fs) => fs.read_dirs_with_options(dirs, ListDirOptions::new().fields(fields)),
+            Self::Dummy(fs) => {
+                fs.read_dirs_with_options(dirs, ListDirOptions::new().fields(fields))
+            }
             Self::Nfs(fs) => fs.read_dirs_with_options(dirs, ListDirOptions::new().fields(fields)),
         }
         .map(|trees| trees.into_iter().flatten().collect())

@@ -28,7 +28,7 @@ use uucore::libc;
 use uucore::translate;
 
 use vnfs::{
-    Attrs as Metadata, AttrsOptions, Attributes, FileType as VfType, Mounted, Nfs, Vfsi, VfsiExt,
+    Attributes, Attrs as Metadata, AttrsOptions, FileType as VfType, Mounted, Nfs, Vfsi, VfsiExt,
     WalkControl, WalkEventKind,
 };
 
