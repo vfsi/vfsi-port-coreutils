@@ -86,7 +86,7 @@ impl Backend {
 struct VfContext {
     backend: Backend,
     mount: NfsMount,
-    paths: vnfs::helpers::MountSession<()>,
+    paths: vnfs::helpers::PathMapper,
 }
 
 impl Drop for VfContext {
@@ -137,7 +137,7 @@ fn make_ctx(mount: NfsMount) -> io::Result<VfContext> {
         Some("nfs") => Backend::Nfs(Nfs::from_mount(&mount.point).map_err(vf_io_error)?),
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
-    let paths = vnfs::helpers::MountSession::new((), &mount.point)?;
+    let paths = vnfs::helpers::PathMapper::new(&mount.point)?;
     Ok(VfContext {
         backend,
         mount,
@@ -296,7 +296,8 @@ pub fn try_visit_walk_vf(
     config: &crate::config::Config,
     mut callback: impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
 ) -> uucore::error::UResult<bool> {
-    if impl_choice().is_none() {
+    // A comparator cannot reverse the server's unsorted enumeration order.
+    if impl_choice().is_none() || (config.sort == crate::config::Sort::None && config.reverse) {
         return Ok(false);
     }
     let Some(mount) = nfs_mountpoint(path) else {
@@ -341,18 +342,17 @@ fn visit_ordered<F: vnfs::Vfsi>(
 ) -> uucore::error::UResult<()> {
     use vnfs::{
         WalkControl,
-        helpers::{MountSession, ResolvePath},
+        helpers::{PathMapper, ResolvePath},
     };
-    let session = MountSession::new(fs, mount).map_err(vf_io_error)?;
+    let session = PathMapper::new(mount).map_err(vf_io_error)?;
     let root = session
         .map(path, ResolvePath::Follow)
         .map_err(vf_io_error)?;
     let mut output_error = None;
     let result = fs.visit_dirs_ordered(
         root,
-        full_mask(config),
-        fs.limits().walk_options(),
-        |entries| crate::sort_vf_entries(entries, config),
+        fs.limits().walk_options().fields(full_mask(config)),
+        crate::vf_entry_order(config),
         |entry| {
             entry
                 .file_name()
@@ -385,10 +385,11 @@ fn visit_ordered<F: vnfs::Vfsi>(
 mod tests {
     use super::*;
     use std::path::Path;
+    use vnfs::Vfsi;
 
     fn dummy_ctx(root: &Path) -> VfContext {
         VfContext {
-            paths: vnfs::helpers::MountSession::new((), root).unwrap(),
+            paths: vnfs::helpers::PathMapper::new(root).unwrap(),
             backend: Backend::Dummy(Mounted::new(root).unwrap()),
             mount: NfsMount {
                 server: "dummy".to_string(),
@@ -472,7 +473,7 @@ mod tests {
             };
             assert_eq!(name, "item");
             let metadata = crate::meta::LsMeta::Vf(entry.attrs().clone());
-            assert_eq!(metadata.len(), 5);
+            assert_eq!(metadata.len(), Some(5));
             assert!(metadata.mode() != 0);
             assert!(metadata.nlink() >= 1);
             assert!(result.as_mut().unwrap().next().is_none());
@@ -512,9 +513,8 @@ mod tests {
         backend
             .visit_dirs_ordered(
                 "/",
-                fields,
-                backend.limits().walk_options(),
-                |entries| entries.sort_by(|a, b| b.path().cmp(a.path())),
+                backend.limits().walk_options().fields(fields),
+                |a, b| b.path().cmp(a.path()),
                 |_| true,
                 |listing, _| {
                     tree.push(WalkEntry {
@@ -530,7 +530,74 @@ mod tests {
             .map(|directory| directory.path.as_path())
             .collect();
         assert_eq!(paths, [Path::new("/"), Path::new("/b"), Path::new("/a")]);
-        assert_eq!(tree[1].entries[0].attrs().len(), 4);
+        assert_eq!(tree[1].entries[0].attrs().len(), Some(4));
         assert!(tree[1].entries[0].attrs().blocks().is_some());
+    }
+
+    #[test]
+    fn vector_order_matches_normal_sort_modes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        for (name, contents) in [("a10.txt", "x"), ("a2.rs", "longer"), ("bb.txt", "zz")] {
+            std::fs::write(root.path().join(name), contents).unwrap();
+        }
+        let fs = Mounted::new(root.path()).unwrap();
+        let entries = fs.read_dir("/").unwrap();
+        let matches = crate::uu_app().get_matches_from(["ls"]);
+        let mut config = crate::config::Config::from(&matches, None).unwrap();
+        for sort in [
+            "time",
+            "size",
+            "name",
+            "version",
+            "extension",
+            "width",
+            "none",
+        ] {
+            for reverse in [false, true] {
+                if sort == "none" && reverse {
+                    continue; // This mode retains the ordinary kernel traversal.
+                }
+                for group in [false, true] {
+                    config.sort = match sort {
+                        "time" => crate::config::Sort::Time,
+                        "size" => crate::config::Sort::Size,
+                        "name" => crate::config::Sort::Name,
+                        "version" => crate::config::Sort::Version,
+                        "extension" => crate::config::Sort::Extension,
+                        "width" => crate::config::Sort::Width,
+                        _ => crate::config::Sort::None,
+                    };
+                    config.reverse = reverse;
+                    config.group_directories_first = group;
+                    let mut vector = entries.clone();
+                    vector.sort_by(crate::vf_entry_order(&config));
+                    let mut normal: Vec<_> = entries
+                        .iter()
+                        .map(|entry| {
+                            let name = entry.file_name().unwrap().to_os_string();
+                            crate::PathData::from_vf(
+                                root.path().join(&name),
+                                name,
+                                entry.clone(),
+                                &config,
+                            )
+                        })
+                        .collect();
+                    crate::sort_entries(&mut normal, &config);
+                    assert_eq!(
+                        vector
+                            .iter()
+                            .map(|entry| entry.file_name().unwrap())
+                            .collect::<Vec<_>>(),
+                        normal
+                            .iter()
+                            .map(|entry| entry.file_name())
+                            .collect::<Vec<_>>(),
+                        "sort={sort}, reverse={reverse}, group={group}",
+                    );
+                }
+            }
+        }
     }
 }

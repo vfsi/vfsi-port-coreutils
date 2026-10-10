@@ -792,9 +792,12 @@ fn display_len_or_rdev(metadata: &LsMeta, config: &Config) -> SizeOrDeviceId {
             return SizeOrDeviceId::Device(major.to_string(), minor.to_string());
         }
     }
+    let Some(len) = metadata.len() else {
+        return SizeOrDeviceId::Size("?".to_owned());
+    };
     let len_adjusted = {
-        let d = metadata.len() / config.file_size_block_size;
-        let r = metadata.len() % config.file_size_block_size;
+        let d = len / config.file_size_block_size;
+        let r = len % config.file_size_block_size;
         if r == 0 { d } else { d + 1 }
     };
     SizeOrDeviceId::Size(display_size(len_adjusted, config))
@@ -1576,4 +1579,31 @@ fn os_str_starts_with(haystack: &OsStr, needle: &[u8]) -> bool {
 
 fn write_os_str<W: Write>(writer: &mut W, string: &OsStr) -> std::io::Result<()> {
     writer.write_all(&os_str_as_bytes_lossy(string))
+}
+
+#[cfg(all(test, feature = "vnfs", target_os = "linux"))]
+mod vfsi_size_tests {
+    use super::*;
+    use vnfs::{Attributes, AttrsOptions, Mounted, VfsiExt};
+
+    #[test]
+    fn missing_size_is_displayed_as_unknown_not_zero() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("empty"), b"").unwrap();
+        let fs = Mounted::new(root.path()).unwrap();
+        let config = Config::from(&crate::uu_app().get_matches_from(["ls"]), None).unwrap();
+        for (fields, expected) in [
+            (Attributes::MODE, "?"),
+            (Attributes::MODE | Attributes::SIZE, "0"),
+        ] {
+            let metadata = LsMeta::Vf(
+                fs.attrs_with_options("/empty", AttrsOptions::new().fields(fields))
+                    .unwrap(),
+            );
+            match display_len_or_rdev(&metadata, &config) {
+                SizeOrDeviceId::Size(size) => assert_eq!(size, expected),
+                SizeOrDeviceId::Device(..) => panic!("regular file displayed as device"),
+            }
+        }
+    }
 }

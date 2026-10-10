@@ -242,9 +242,9 @@ impl LsMeta {
         base + Duration::from_nanos(nsecs as u64)
     }
 
-    pub fn len(&self) -> u64 {
+    pub fn len(&self) -> Option<u64> {
         match self {
-            Self::Std(m) => m.len(),
+            Self::Std(m) => Some(m.len()),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => v.len(),
         }

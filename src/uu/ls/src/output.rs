@@ -97,7 +97,7 @@ impl EntryInfo {
 
     /// Returns the file size in bytes, if metadata is available
     pub fn size(&self) -> Option<u64> {
-        self.metadata.as_ref().map(LsMeta::len)
+        self.metadata.as_ref().and_then(LsMeta::len)
     }
 
     /// Returns the file name as a string slice, if valid UTF-8

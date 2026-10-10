@@ -1,0 +1,28 @@
+name: VFSI public package integration
+
+on:
+  push:
+    branches: [vfsi]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # stable
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake pkg-config liburcu-dev
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Test VFSI utility integrations against registry crates
+        run: |
+          cargo test --locked -p uu_cp -p uu_du -p uu_ls -p uucore --lib --features vnfs
+          cargo check --locked -p uu_rm -p uu_rmdir --features vnfs
+      - name: Build the VFSI multicall binary
+        run: |
+          cargo build --locked --no-default-features --features "cp du ls rm rmdir feat_vnfs"

@@ -69,19 +69,25 @@ fn entry_time(metadata: &Metadata, field: MetadataTimeField) -> Option<SystemTim
     }
 }
 
-fn usage_from_attrs(path: &Path, attrs: &Metadata, options: &TraversalOptions) -> Usage {
-    Usage {
+fn usage_from_attrs(
+    path: &Path,
+    attrs: &Metadata,
+    options: &TraversalOptions,
+) -> io::Result<Usage> {
+    Ok(Usage {
         path: path.to_path_buf(),
         // Directories report zero apparent size, like `Stat::new`.
         size: if attrs.file_type() == VfType::Directory {
             0
         } else {
-            attrs.len()
+            attrs.len().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Unsupported, "file size was not supplied")
+            })?
         },
         blocks: attrs.blocks().unwrap_or_default(),
         inodes: 1,
         latest_time: options.time.and_then(|field| entry_time(attrs, field)),
-    }
+    })
 }
 
 fn file_info(attrs: &Metadata) -> Option<FileInfo> {
@@ -137,18 +143,21 @@ fn traverse<F: Vfsi>(
         .map_err(io::Error::other)?;
 
     if root_attrs.file_type() != VfType::Directory {
-        return Ok(usage_from_attrs(path, &root_attrs, options));
+        return usage_from_attrs(path, &root_attrs, options);
     }
 
     let mut seen: HashSet<FileInfo> = HashSet::default();
     let mut stack: Vec<Option<Usage>> = Vec::new();
     let mut total = None;
     backend
-        .walk_events_with_options(
+        .listdir(
             vroot,
-            masks,
-            backend.limits().walk_options(),
-            false,
+            backend
+                .limits()
+                .walk_options()
+                .fields(masks)
+                .recursive(true)
+                .enter_leave(true),
             |event| {
                 let rendered = print_path(event.entry.path());
                 if event.kind == WalkEventKind::Leave {
@@ -187,7 +196,8 @@ fn traverse<F: Vfsi>(
                     return Ok(WalkControl::SkipSubtree);
                 }
                 let metadata = event.entry.attrs();
-                let usage = usage_from_attrs(&rendered, metadata, options);
+                let usage = usage_from_attrs(&rendered, metadata, options)
+                    .map_err(|_| vnfs::Error::client(0, libc::ENOTSUP as u32))?;
                 if event.kind == WalkEventKind::Enter {
                     stack.push(Some(usage));
                 } else {
@@ -312,6 +322,32 @@ mod tests {
             excludes: Vec::new(),
             time: None,
         }
+    }
+
+    #[test]
+    fn missing_size_is_an_error_but_empty_file_is_zero() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("empty"), b"").unwrap();
+        let fs = Mounted::new(root.path()).unwrap();
+        let partial = fs
+            .attrs_with_options("/empty", AttrsOptions::new().fields(Attributes::MODE))
+            .unwrap();
+        assert_eq!(
+            usage_from_attrs(Path::new("empty"), &partial, &options())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        let full = fs
+            .attrs_with_options("/empty", AttrsOptions::new().fields(attr_mask(&options())))
+            .unwrap();
+        assert_eq!(
+            usage_from_attrs(Path::new("empty"), &full, &options())
+                .unwrap()
+                .size,
+            0
+        );
     }
 
     #[test]

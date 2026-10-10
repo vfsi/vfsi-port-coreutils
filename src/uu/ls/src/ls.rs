@@ -17,7 +17,7 @@ use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::cell::RefCell;
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
-use std::cmp::Reverse;
+use std::cmp::Ordering;
 use std::{
     cell::OnceCell,
     ffi::{OsStr, OsString},
@@ -1678,8 +1678,8 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
         Sort::Size => {
             entries.sort_unstable_by(|a, b| {
                 b.metadata()
-                    .map_or(0, LsMeta::len)
-                    .cmp(&a.metadata().map_or(0, LsMeta::len))
+                    .and_then(LsMeta::len)
+                    .cmp(&a.metadata().and_then(LsMeta::len))
                     .then(a.file_name().cmp(b.file_name()))
             });
         }
@@ -1740,7 +1740,9 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
 /// corresponding [`PathData`], so the vectorized recursive walk can order its
 /// output (and thus the sub-directory visit order) identically to the normal
 /// path under any locale and sort mode.
-pub(crate) fn sort_vf_entries(entries: &mut [VnfsDirEntry], config: &Config) {
+pub(crate) fn vf_entry_order(
+    config: &Config,
+) -> impl FnMut(&VnfsDirEntry, &VnfsDirEntry) -> Ordering + '_ {
     use crate::config::Sort;
     fn name_of(a: &VnfsDirEntry) -> &OsStr {
         a.file_name().unwrap_or_default()
@@ -1751,53 +1753,53 @@ pub(crate) fn sort_vf_entries(entries: &mut [VnfsDirEntry], config: &Config) {
     fn stem_of(e: &VnfsDirEntry) -> Option<&OsStr> {
         e.path().file_stem()
     }
-    match config.sort {
-        Sort::Time => {
-            entries
-                .sort_unstable_by_key(|k| Reverse(vf_time(k, config.time).unwrap_or(UNIX_EPOCH)));
-        }
-        Sort::Size => {
-            entries.sort_unstable_by(|a, b| {
-                b.attrs()
-                    .len()
-                    .cmp(&a.attrs().len())
-                    .then(name_of(a).cmp(name_of(b)))
-            });
-        }
-        Sort::Name => {
-            if uucore::i18n::collator::should_use_locale_collation() {
-                entries.sort_unstable_by(|a, b| {
-                    uucore::i18n::collator::locale_cmp(
-                        os_str_as_bytes_lossy(name_of(a)).as_ref(),
-                        os_str_as_bytes_lossy(name_of(b)).as_ref(),
-                    )
-                });
+    let use_locale = uucore::i18n::collator::should_use_locale_collation();
+    move |a, b| {
+        let name_cmp = || {
+            if use_locale {
+                uucore::i18n::collator::locale_cmp(
+                    os_str_as_bytes_lossy(name_of(a)).as_ref(),
+                    os_str_as_bytes_lossy(name_of(b)).as_ref(),
+                )
             } else {
-                entries.sort_unstable_by(|a, b| name_of(a).cmp(name_of(b)));
+                name_of(a).cmp(name_of(b))
             }
-        }
-        Sort::Version => entries.sort_unstable_by(|a, b| {
-            version_cmp(
+        };
+        let order = match config.sort {
+            Sort::Time => vf_time(b, config.time)
+                .unwrap_or(UNIX_EPOCH)
+                .cmp(&vf_time(a, config.time).unwrap_or(UNIX_EPOCH))
+                .then_with(name_cmp),
+            Sort::Size => b
+                .attrs()
+                .len()
+                .cmp(&a.attrs().len())
+                .then_with(|| name_of(a).cmp(name_of(b))),
+            Sort::Name => name_cmp(),
+            Sort::Version => version_cmp(
                 os_str_as_bytes_lossy(name_of(a)).as_ref(),
                 os_str_as_bytes_lossy(name_of(b)).as_ref(),
             )
-            .then(a.path().cmp(b.path()))
-        }),
-        Sort::Extension => entries
-            .sort_unstable_by(|a, b| ext_of(a).cmp(&ext_of(b)).then(stem_of(a).cmp(&stem_of(b)))),
-        Sort::Width => entries.sort_unstable_by(|a, b| {
-            name_of(a)
+            .then(a.path().cmp(b.path())),
+            Sort::Extension => ext_of(a).cmp(&ext_of(b)).then(stem_of(a).cmp(&stem_of(b))),
+            Sort::Width => name_of(a)
                 .len()
                 .cmp(&name_of(b).len())
-                .then(name_of(a).cmp(name_of(b)))
-        }),
-        Sort::None => {}
-    }
-    if config.reverse {
-        entries.reverse();
-    }
-    if config.group_directories_first && config.sort != Sort::None {
-        entries.sort_by_key(|p| p.file_type() != vnfs::FileType::Directory);
+                .then(name_of(a).cmp(name_of(b))),
+            Sort::None => Ordering::Equal,
+        };
+        let order = if config.reverse {
+            order.reverse()
+        } else {
+            order
+        };
+        if config.group_directories_first && config.sort != Sort::None {
+            (a.file_type() != vnfs::FileType::Directory)
+                .cmp(&(b.file_type() != vnfs::FileType::Directory))
+                .then(order)
+        } else {
+            order
+        }
     }
 }
 
@@ -1862,7 +1864,7 @@ fn get_block_size(md: &LsMeta, config: &Config) -> u64 {
     #[cfg(not(unix))]
     {
         // no way to get block size for windows, fall-back to file size
-        md.len()
+        md.len().expect("standard metadata always supplies size")
     }
 }
 

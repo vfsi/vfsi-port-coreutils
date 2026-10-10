@@ -7,7 +7,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use vnfs::helpers::{MountSession, ResolvePath};
+use vnfs::helpers::{PathMapper, ResolvePath};
 use vnfs::{Mounted, Nfs, NfsClient, RemoveMode, RemoveOptions, Result as VfResult, Vfsi};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,7 +87,7 @@ fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
         return None;
     }
 
-    let session = MountSession::new((), &mount.point).ok()?;
+    let session = PathMapper::new(&mount.point).ok()?;
     let dummy_path = session.map(path, ResolvePath::NoFollow).ok()?;
     Some((mount, dummy_path))
 }

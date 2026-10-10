@@ -8,7 +8,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use vnfs::{
-    CopyOption, Error as VfError, Mounted, NfsClient, ReadOptions, Result as VfResult, VfsiExt,
+    CopyOption, Error as VfError, Mounted, NfsClient, ReadOptions, Result as VfResult, Vfsi,
+    VfsiExt,
 };
 
 const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
@@ -105,7 +106,7 @@ struct PreparedCopy {
 
 struct Context {
     mount: Mount,
-    paths: vnfs::helpers::MountSession<()>,
+    paths: vnfs::helpers::PathMapper,
     backend: Backend,
     prefetched: HashMap<PathBuf, Vec<u8>>,
     prepared_copies: HashMap<PathBuf, PreparedCopy>,
@@ -141,7 +142,7 @@ fn make_context(mount: Mount) -> io::Result<Context> {
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
     Ok(Context {
-        paths: vnfs::helpers::MountSession::new((), &mount.point)?,
+        paths: vnfs::helpers::PathMapper::new(&mount.point)?,
         mount,
         backend,
         prefetched: HashMap::new(),
@@ -173,7 +174,7 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
     let mut seen_destinations = HashSet::new();
     let mut plans = Vec::with_capacity(sources.len());
     let mut pairs = Vec::with_capacity(sources.len());
-    let paths = vnfs::helpers::MountSession::new((), &target_mount.point)?;
+    let paths = vnfs::helpers::PathMapper::new(&target_mount.point)?;
     for (i, source) in sources.iter().enumerate() {
         if !source.metadata().is_ok_and(|metadata| metadata.is_file()) {
             return Ok(false);
@@ -432,7 +433,7 @@ mod tests {
             point: root.path().to_path_buf(),
         };
         let backend = Backend::Dummy(Mounted::new(root.path()).unwrap());
-        let mapped = vnfs::helpers::MountSession::new((), &mount.point)
+        let mapped = vnfs::helpers::PathMapper::new(&mount.point)
             .unwrap()
             .map(&file, vnfs::helpers::ResolvePath::Follow)
             .unwrap();
