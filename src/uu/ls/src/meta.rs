@@ -242,6 +242,11 @@ impl LsMeta {
         base + Duration::from_nanos(nsecs as u64)
     }
 
+    // Keep the sparse-attribute signature even when VFSI is not compiled in.
+    #[cfg_attr(
+        not(all(feature = "vnfs", target_os = "linux")),
+        allow(clippy::unnecessary_wraps)
+    )]
     pub fn len(&self) -> Option<u64> {
         match self {
             Self::Std(m) => Some(m.len()),
@@ -368,6 +373,8 @@ impl LsMeta {
 }
 
 /// A directory entry, either from `std::fs` or from the vectorized backend.
+// Keep listing attributes inline to avoid another heap allocation per entry.
+#[allow(clippy::large_enum_variant)]
 pub enum LsDirEntry {
     Std(DirEntry),
     #[cfg(all(feature = "vnfs", target_os = "linux"))]

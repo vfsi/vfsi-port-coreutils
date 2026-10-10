@@ -592,7 +592,7 @@ mod tests {
                             .collect::<Vec<_>>(),
                         normal
                             .iter()
-                            .map(|entry| entry.file_name())
+                            .map(crate::PathData::file_name)
                             .collect::<Vec<_>>(),
                         "sort={sort}, reverse={reverse}, group={group}",
                     );
