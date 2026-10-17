@@ -7,10 +7,11 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use vnfs::{
-    CopyOption, Error as VfError, Mounted, NfsClient, ReadOptions, Result as VfResult, Vfsi,
-    VfsiExt,
-};
+use vnfs::files::{Capabilities, CopyOption, ReadOptions, StreamOptions, Vfsi, VfsiExt};
+use vnfs::helpers::{PathMapper, ResolvePath};
+use vnfs::nfs::{Nfs, NfsBuilder, NfsClient};
+use vnfs::posix::Posix;
+use vnfs::{Error as VfError, Result as VfResult};
 
 const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
 
@@ -53,7 +54,7 @@ fn nfs_mount(path: &Path) -> Option<Mount> {
     } else {
         path.parent()?
     };
-    let mount = vnfs::Nfs::discover_mount(directory).ok()?;
+    let mount = Nfs::discover_mount(directory).ok()?;
     Some(Mount {
         server: mount.host().to_owned(),
         export: mount.export_root().to_path_buf(),
@@ -62,7 +63,7 @@ fn nfs_mount(path: &Path) -> Option<Mount> {
 }
 
 enum Backend {
-    Dummy(Mounted),
+    Dummy(Posix),
     Nfs { fs: NfsClient, supports_copy: bool },
 }
 
@@ -80,10 +81,10 @@ impl Backend {
     fn copy_to_writer(&self, path: &Path, writer: &mut impl Write) -> VfResult<u64> {
         match self {
             Self::Dummy(fs) => {
-                vnfs::helpers::copy_to_writer(fs, path, writer, vnfs::StreamOptions::default())
+                vnfs::helpers::copy_to_writer(fs, path, writer, StreamOptions::default())
             }
             Self::Nfs { fs, .. } => {
-                vnfs::helpers::copy_to_writer(fs, path, writer, vnfs::StreamOptions::default())
+                vnfs::helpers::copy_to_writer(fs, path, writer, StreamOptions::default())
             }
         }
     }
@@ -106,7 +107,7 @@ struct PreparedCopy {
 
 struct Context {
     mount: Mount,
-    paths: vnfs::helpers::PathMapper,
+    paths: PathMapper,
     backend: Backend,
     prefetched: HashMap<PathBuf, Vec<u8>>,
     prepared_copies: HashMap<PathBuf, PreparedCopy>,
@@ -126,23 +127,23 @@ thread_local! {
 
 fn make_context(mount: Mount) -> io::Result<Context> {
     let backend = match impl_choice() {
-        Some("dummy") => Backend::Dummy(Mounted::new(&mount.point).map_err(vf_io_error)?),
+        Some("dummy") => Backend::Dummy(Posix::new(&mount.point).map_err(vf_io_error)?),
         Some("nfs") => {
             // Inherit and retain the mount's security/version/port and root.
-            let fs = vnfs::NfsBuilder::from_mount(&mount.point)
+            let fs = NfsBuilder::from_mount(&mount.point)
                 .map_err(vf_io_error)?
                 .connect()
                 .map_err(vf_io_error)?;
             let supports_copy = fs
                 .capabilities()
                 .map_err(vf_io_error)?
-                .contains(vnfs::Capabilities::SERVER_COPY);
+                .contains(Capabilities::SERVER_COPY);
             Backend::Nfs { fs, supports_copy }
         }
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
     Ok(Context {
-        paths: vnfs::helpers::PathMapper::new(&mount.point)?,
+        paths: PathMapper::new(&mount.point)?,
         mount,
         backend,
         prefetched: HashMap::new(),
@@ -174,7 +175,7 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
     let mut seen_destinations = HashSet::new();
     let mut plans = Vec::with_capacity(sources.len());
     let mut pairs = Vec::with_capacity(sources.len());
-    let paths = vnfs::helpers::PathMapper::new(&target_mount.point)?;
+    let paths = PathMapper::new(&target_mount.point)?;
     for (i, source) in sources.iter().enumerate() {
         if !source.metadata().is_ok_and(|metadata| metadata.is_file()) {
             return Ok(false);
@@ -194,8 +195,8 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
         }
         let temp = target.join(format!(".vfsi-cp-{}-{nonce}-{i}", std::process::id()));
         pairs.push((
-            paths.map(source, vnfs::helpers::ResolvePath::Follow)?,
-            paths.map(&temp, vnfs::helpers::ResolvePath::NoFollow)?,
+            paths.map(source, ResolvePath::Follow)?,
+            paths.map(&temp, ResolvePath::NoFollow)?,
         ));
         plans.push((source.clone(), PreparedCopy { dest, temp }));
     }
@@ -301,7 +302,7 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
                 .iter()
                 .map(|source| {
                     ctx.paths
-                        .map(source, vnfs::helpers::ResolvePath::Follow)
+                        .map(source, ResolvePath::Follow)
                         .map_err(Into::into)
                 })
                 .collect()
@@ -369,8 +370,8 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
                 .mode(0o600)
                 .open(dest)?;
             let pair = (
-                ctx.paths.map(source, vnfs::helpers::ResolvePath::Follow)?,
-                ctx.paths.map(dest, vnfs::helpers::ResolvePath::Follow)?,
+                ctx.paths.map(source, ResolvePath::Follow)?,
+                ctx.paths.map(dest, ResolvePath::Follow)?,
             );
             if let Some(result) = ctx.backend.copy_files(std::slice::from_ref(&pair)) {
                 match result {
@@ -401,7 +402,7 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
             output.write_all(&contents)?;
             return Ok(Some("vfsi-client-read"));
         }
-        let source_path = ctx.paths.map(source, vnfs::helpers::ResolvePath::Follow)?;
+        let source_path = ctx.paths.map(source, ResolvePath::Follow)?;
         let mut output = OpenOptions::new()
             .write(true)
             .create(true)
@@ -432,10 +433,10 @@ mod tests {
             export: PathBuf::from("/different-server-export"),
             point: root.path().to_path_buf(),
         };
-        let backend = Backend::Dummy(Mounted::new(root.path()).unwrap());
-        let mapped = vnfs::helpers::PathMapper::new(&mount.point)
+        let backend = Backend::Dummy(Posix::new(root.path()).unwrap());
+        let mapped = PathMapper::new(&mount.point)
             .unwrap()
-            .map(&file, vnfs::helpers::ResolvePath::Follow)
+            .map(&file, ResolvePath::Follow)
             .unwrap();
         assert_eq!(mapped, Path::new("/file"));
         assert_eq!(

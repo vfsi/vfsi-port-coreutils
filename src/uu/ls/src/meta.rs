@@ -21,7 +21,7 @@ use std::time::SystemTime;
 #[cfg(any(unix, all(feature = "vnfs", target_os = "linux")))]
 use std::time::UNIX_EPOCH;
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
-use vnfs::{Attrs as VnfsMetadata, FileType as VfType};
+use vnfs::directory::{Attrs as VnfsMetadata, FileType as VfType};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -381,7 +381,7 @@ pub enum LsDirEntry {
     Vf {
         path: PathBuf,
         name: OsString,
-        entry: vnfs::DirEntry,
+        entry: vnfs::directory::DirEntry,
     },
 }
 

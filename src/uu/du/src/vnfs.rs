@@ -27,10 +27,12 @@ use uucore::fsext::MetadataTimeField;
 use uucore::libc;
 use uucore::translate;
 
-use vnfs::{
-    Attributes, Attrs as Metadata, AttrsOptions, FileType as VfType, Mounted, Nfs, Vfsi, VfsiExt,
-    WalkControl, WalkEventKind,
+use vnfs::directory::{
+    Attributes, Attrs as Metadata, AttrsOptions, FileType as VfType, WalkControl, WalkEventKind,
 };
+use vnfs::files::{Vfsi, VfsiExt};
+use vnfs::nfs::Nfs;
+use vnfs::posix::Posix;
 
 use crate::{Deref, FileInfo, StatPrintInfo, TraversalOptions, Usage};
 
@@ -251,7 +253,7 @@ pub fn try_du(
 
     let result = match std::env::var("VNFS_IMPL").as_deref() {
         Ok("dummy") => traverse(
-            &Mounted::new(&mount.point).map_err(io::Error::other)?,
+            &Posix::new(&mount.point).map_err(io::Error::other)?,
             path,
             &vroot,
             options,
@@ -328,7 +330,7 @@ mod tests {
     fn missing_size_is_an_error_but_empty_file_is_zero() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("empty"), b"").unwrap();
-        let fs = Mounted::new(root.path()).unwrap();
+        let fs = Posix::new(root.path()).unwrap();
         let partial = fs
             .attrs_with_options("/empty", AttrsOptions::new().fields(Attributes::MODE))
             .unwrap();
@@ -362,7 +364,7 @@ mod tests {
     /// `(path, size, inodes, depth)` for every emitted entry plus the root
     /// total.
     fn run(root: &Path, options: &TraversalOptions) -> (Vec<(PathBuf, u64, u64, usize)>, Usage) {
-        let backend = Mounted::new(root).expect("dummy root");
+        let backend = Posix::new(root).expect("dummy root");
         let (tx, rx) = mpsc::channel();
         let total = traverse(&backend, root, Path::new("/"), options, &tx).expect("traverse");
         drop(tx);

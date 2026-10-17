@@ -29,7 +29,7 @@ use std::{
 };
 use thiserror::Error;
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
-use vnfs::DirEntry as VnfsDirEntry;
+use vnfs::directory::DirEntry as VnfsDirEntry;
 
 #[cfg(unix)]
 use uucore::libc::{S_IXGRP, S_IXOTH, S_IXUSR};
@@ -1794,8 +1794,8 @@ pub(crate) fn vf_entry_order(
             order
         };
         if config.group_directories_first && config.sort != Sort::None {
-            (a.file_type() != vnfs::FileType::Directory)
-                .cmp(&(b.file_type() != vnfs::FileType::Directory))
+            (a.file_type() != vnfs::directory::FileType::Directory)
+                .cmp(&(b.file_type() != vnfs::directory::FileType::Directory))
                 .then(order)
         } else {
             order

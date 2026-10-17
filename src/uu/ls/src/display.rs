@@ -1584,13 +1584,15 @@ fn write_os_str<W: Write>(writer: &mut W, string: &OsStr) -> std::io::Result<()>
 #[cfg(all(test, feature = "vnfs", target_os = "linux"))]
 mod vfsi_size_tests {
     use super::*;
-    use vnfs::{Attributes, AttrsOptions, Mounted, VfsiExt};
+    use vnfs::directory::{Attributes, AttrsOptions};
+    use vnfs::files::VfsiExt;
+    use vnfs::posix::Posix;
 
     #[test]
     fn missing_size_is_displayed_as_unknown_not_zero() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("empty"), b"").unwrap();
-        let fs = Mounted::new(root.path()).unwrap();
+        let fs = Posix::new(root.path()).unwrap();
         let config = Config::from(&crate::uu_app().get_matches_from(["ls"]), None).unwrap();
         for (fields, expected) in [
             (Attributes::MODE, "?"),

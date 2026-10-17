@@ -14,10 +14,12 @@ use std::path::{Path, PathBuf};
 
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
-use vnfs::{
-    Attributes, DirEntry, DirectoryListing, Error as VfError, ListDirOptions, Mounted, Nfs,
-    NfsClient, VfsiExt,
-};
+use vnfs::Error as VfError;
+use vnfs::directory::{Attributes, DirEntry, DirectoryListing, ListDirOptions};
+use vnfs::files::VfsiExt;
+use vnfs::helpers::{PathMapper, ResolvePath};
+use vnfs::nfs::{Nfs, NfsClient};
+use vnfs::posix::Posix;
 
 pub(crate) struct WalkEntry {
     pub path: PathBuf,
@@ -47,7 +49,7 @@ fn vf_io_error(e: VfError) -> io::Error {
 /// access-indicator), and costs the server a per-entry xattr enumeration, so
 /// it is only requested then.
 fn full_mask(config: &crate::config::Config) -> Attributes {
-    use vnfs::Attributes as AttrMask;
+    use Attributes as AttrMask;
     let mut mask = AttrMask::MODE
         | AttrMask::SIZE
         | AttrMask::NLINK
@@ -67,7 +69,7 @@ fn full_mask(config: &crate::config::Config) -> Attributes {
 
 /// The application-facing clients selected for this mount.
 enum Backend {
-    Dummy(Mounted),
+    Dummy(Posix),
     Nfs(NfsClient),
 }
 
@@ -86,7 +88,7 @@ impl Backend {
 struct VfContext {
     backend: Backend,
     mount: NfsMount,
-    paths: vnfs::helpers::PathMapper,
+    paths: PathMapper,
 }
 
 impl Drop for VfContext {
@@ -133,11 +135,11 @@ fn nfs_mountpoint(path: &Path) -> Option<NfsMount> {
 
 fn make_ctx(mount: NfsMount) -> io::Result<VfContext> {
     let backend = match impl_choice() {
-        Some("dummy") => Backend::Dummy(Mounted::new(&mount.point).map_err(vf_io_error)?),
+        Some("dummy") => Backend::Dummy(Posix::new(&mount.point).map_err(vf_io_error)?),
         Some("nfs") => Backend::Nfs(Nfs::from_mount(&mount.point).map_err(vf_io_error)?),
         _ => return Err(io::Error::other("VNFS_IMPL disabled")),
     };
-    let paths = vnfs::helpers::PathMapper::new(&mount.point)?;
+    let paths = PathMapper::new(&mount.point)?;
     Ok(VfContext {
         backend,
         mount,
@@ -168,7 +170,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         }
         let ctx = ctx.as_mut().unwrap();
 
-        let vpath = ctx.paths.map(path, vnfs::helpers::ResolvePath::Follow)?;
+        let vpath = ctx.paths.map(path, ResolvePath::Follow)?;
         let listing = match ctx.backend.read_dirs(&[&vpath], full_mask(config)) {
             Ok(mut listings) => match listings.pop() {
                 Some(listing) => listing,
@@ -205,7 +207,7 @@ fn ctx_open_many(
 ) -> Vec<Option<LsReadDir>> {
     let vpaths: vnfs::Result<Vec<PathBuf>> = kernel_dirs
         .iter()
-        .map(|d| ctx.paths.map(d, vnfs::helpers::ResolvePath::Follow))
+        .map(|d| ctx.paths.map(d, ResolvePath::Follow))
         .collect();
     let Ok(vpaths) = vpaths else {
         return std::iter::repeat_with(|| None)
@@ -340,10 +342,7 @@ fn visit_ordered<F: vnfs::Vfsi>(
     config: &crate::config::Config,
     callback: &mut impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
 ) -> uucore::error::UResult<()> {
-    use vnfs::{
-        WalkControl,
-        helpers::{PathMapper, ResolvePath},
-    };
+    use vnfs::directory::WalkControl;
     let session = PathMapper::new(mount).map_err(vf_io_error)?;
     let root = session
         .map(path, ResolvePath::Follow)
@@ -389,8 +388,8 @@ mod tests {
 
     fn dummy_ctx(root: &Path) -> VfContext {
         VfContext {
-            paths: vnfs::helpers::PathMapper::new(root).unwrap(),
-            backend: Backend::Dummy(Mounted::new(root).unwrap()),
+            paths: PathMapper::new(root).unwrap(),
+            backend: Backend::Dummy(Posix::new(root).unwrap()),
             mount: NfsMount {
                 server: "dummy".to_string(),
                 export: PathBuf::from("/"),
@@ -507,7 +506,7 @@ mod tests {
             std::fs::create_dir(root.path().join(name)).unwrap();
             std::fs::write(root.path().join(name).join("file"), b"data").unwrap();
         }
-        let backend = Mounted::new(root.path()).unwrap();
+        let backend = Posix::new(root.path()).unwrap();
         let fields = Attributes::MODE | Attributes::SIZE | Attributes::BLOCKS;
         let mut tree = Vec::new();
         backend
@@ -521,7 +520,7 @@ mod tests {
                         path: listing.path,
                         entries: listing.entries,
                     });
-                    Ok(vnfs::WalkControl::Continue)
+                    Ok(vnfs::directory::WalkControl::Continue)
                 },
             )
             .unwrap();
@@ -541,7 +540,7 @@ mod tests {
         for (name, contents) in [("a10.txt", "x"), ("a2.rs", "longer"), ("bb.txt", "zz")] {
             std::fs::write(root.path().join(name), contents).unwrap();
         }
-        let fs = Mounted::new(root.path()).unwrap();
+        let fs = Posix::new(root.path()).unwrap();
         let entries = fs.read_dir("/").unwrap();
         let matches = crate::uu_app().get_matches_from(["ls"]);
         let mut config = crate::config::Config::from(&matches, None).unwrap();

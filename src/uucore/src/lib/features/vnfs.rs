@@ -7,8 +7,12 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use vnfs::Result as VfResult;
+use vnfs::directory::{RemoveMode, RemoveOptions};
+use vnfs::files::Vfsi;
 use vnfs::helpers::{PathMapper, ResolvePath};
-use vnfs::{Mounted, Nfs, NfsClient, RemoveMode, RemoveOptions, Result as VfResult, Vfsi};
+use vnfs::nfs::{Nfs, NfsClient};
+use vnfs::posix::Posix;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Mount {
@@ -39,7 +43,7 @@ pub fn nfs_mount(path: &Path) -> Option<NfsMount> {
 }
 
 enum Backend {
-    Dummy(Mounted),
+    Dummy(Posix),
     Nfs(NfsClient),
 }
 
@@ -102,7 +106,7 @@ pub fn try_remove(path: &Path, recursive: bool) -> Option<std::io::Result<()>> {
 
     let backend = match std::env::var("VNFS_IMPL").as_deref() {
         Ok("dummy") => {
-            let Ok(client) = Mounted::new(&mount.point) else {
+            let Ok(client) = Posix::new(&mount.point) else {
                 return None;
             };
             Backend::Dummy(client)
@@ -132,7 +136,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let empty = root.path().join("empty");
         std::fs::create_dir(&empty).unwrap();
-        let fs = Mounted::new(root.path()).unwrap();
+        let fs = Posix::new(root.path()).unwrap();
 
         fs.vremove(&["/empty"], RemoveMode::Entry, RemoveOptions::default())
             .unwrap();
@@ -146,7 +150,7 @@ mod tests {
         let tree = root.path().join("tree");
         std::fs::create_dir_all(tree.join("child")).unwrap();
         std::fs::write(tree.join("child/file"), b"data").unwrap();
-        let fs = Mounted::new(root.path()).unwrap();
+        let fs = Posix::new(root.path()).unwrap();
 
         fs.vremove(&["/tree"], RemoveMode::Tree, RemoveOptions::default())
             .unwrap();
@@ -160,7 +164,7 @@ mod tests {
         let dir = root.path().join("dir");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("file"), b"data").unwrap();
-        let fs = Mounted::new(root.path()).unwrap();
+        let fs = Posix::new(root.path()).unwrap();
 
         assert!(
             fs.vremove(&["/dir"], RemoveMode::Entry, RemoveOptions::default())
