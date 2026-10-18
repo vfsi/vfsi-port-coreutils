@@ -23,7 +23,7 @@ use fluent_syntax::{
     },
     parser,
 };
-use jiff::Zoned;
+use jiff::{Timestamp, Zoned, tz::TimeZone};
 use regex::Regex;
 use textwrap::{fill, indent, termwidth};
 use zip::ZipArchive;
@@ -33,6 +33,8 @@ use uucore::Args;
 use uucore::locale::get_message;
 
 include!(concat!(env!("OUT_DIR"), "/uutils_map.rs"));
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Post-process a generated manpage to fix mandoc lint issues
 ///
@@ -161,14 +163,21 @@ fn gen_manpage<T: Args>(
 
     // Generate the manpage to a buffer first so we can post-process it
     let mut buffer = Vec::new();
-    let man = Man::new(command);
+    let man = Man::new(command.version(VERSION));
     man.render(&mut buffer).expect("Man page generation failed");
 
     // Convert to string for processing
     let manpage = String::from_utf8(buffer).expect("Invalid UTF-8 in manpage");
 
+    // Use `SOURCE_DATE_EPOCH` for reproducible builds if set and valid; otherwise use the current time.
+    let now = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .and_then(|s| Timestamp::new(s, 0).ok())
+        .map_or_else(Zoned::now, |t| t.to_zoned(TimeZone::UTC));
+
     // Post-process the manpage to fix mandoc lint issues
-    let date = Zoned::now().strftime("%Y-%m-%d").to_string();
+    let date = now.strftime("%Y-%m-%d").to_string();
     let processed_manpage = post_process_manpage(manpage, &date);
 
     // Write the processed manpage to stdout
@@ -511,14 +520,8 @@ impl MDWriter<'_, '_> {
 
     /// # Errors
     /// Returns an error if the writer fails.
-    /// # Panics
-    /// Panics if the version is not found.
     fn version(&mut self) -> io::Result<()> {
-        writeln!(
-            self.w,
-            "<div class=\"version\">v{}</div>",
-            self.command.render_version().split_once(' ').unwrap().1
-        )
+        writeln!(self.w, "<div class=\"version\">v{VERSION}</div>")
     }
 
     /// # Errors

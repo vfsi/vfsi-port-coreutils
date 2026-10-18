@@ -345,7 +345,30 @@ fn test_timestamp_format_before_epoch() {
     ts.ucmd()
         .args(&["-c", "%.1X %.3X %.9X %.1Y %.3Y %.9Y", "timestamp"])
         .succeeds()
-        .stdout_is("-0.9 -0.877 -0.876543211 -0.9 -0.877 -0.876543211\n");
+        .stdout_is("-0.8 -0.876 -0.876543211 -0.8 -0.876 -0.876543211\n");
+}
+
+#[test]
+fn test_timestamp_format_before_epoch_truncation() {
+    let ts = TestScenario::new(util_name!());
+    let file = File::create(ts.fixtures.plus("fractional-time")).unwrap();
+    let timestamp = UNIX_EPOCH - Duration::new(2, 234_567_891);
+    file.set_times(
+        FileTimes::new()
+            .set_accessed(timestamp)
+            .set_modified(timestamp),
+    )
+    .unwrap();
+
+    for directive in ['X', 'Y'] {
+        let format = format!(
+            "%{directive}|%.0{directive}|%.{directive}|%.2{directive}|%.6{directive}|%.12{directive}"
+        );
+        ts.ucmd()
+            .args(&["-c", &format, "fractional-time"])
+            .succeeds()
+            .stdout_is("-3|-3|-2.234567891|-2.23|-2.234567|-2.234567891000\n");
+    }
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
@@ -752,6 +775,64 @@ fn test_printf_invalid_directive() {
 }
 
 #[test]
+fn test_format_flags_closed_by_percent_are_invalid() {
+    // GNU rejects flag-only fragments ended by another '%', e.g. `%++-+%`.
+    new_ucmd!()
+        .args(&["--format=%++-+%1212x", "/"])
+        .fails_with_code(1)
+        .stderr_is("stat: '%++-+%': invalid directive\n");
+}
+
+#[test]
+fn test_format_adds_newline_after_trailing_newline() {
+    let ts = TestScenario::new(util_name!());
+    // `--format` prints a newline after the output even when the format
+    // already ends with one.
+    for (fmt, expected) in [
+        ("%n\n", ".\n\n"),
+        ("\n", "\n\n"),
+        ("%n\n\n", ".\n\n\n"),
+        ("%%\n", "%\n\n"),
+        // a directive that takes the newline as its conversion char
+        ("%\n", "?\n"),
+    ] {
+        ts.ucmd()
+            .args(&["-c", fmt, "."])
+            .succeeds()
+            .stdout_only(expected);
+    }
+    ts.ucmd()
+        .args(&["--format=%n\n", ".", "."])
+        .succeeds()
+        .stdout_only(".\n\n.\n\n");
+    ts.ucmd()
+        .args(&["-t", "-c", "%n\n", "."])
+        .succeeds()
+        .stdout_only(".\n\n");
+    // `--printf` adds nothing.
+    ts.ucmd()
+        .args(&["--printf=%n\n", "."])
+        .succeeds()
+        .stdout_only(".\n");
+}
+
+#[test]
+fn test_default_formats_end_with_a_single_newline() {
+    let ts = TestScenario::new(util_name!());
+    let mut cases: Vec<&[&str]> = vec![&["."], &["-t", "."]];
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        cases.extend([&["-f", "."][..], &["-f", "-t", "."]]);
+    }
+    for args in cases {
+        let out = ts.ucmd().args(args).succeeds().stdout_move_str();
+        assert!(
+            out.ends_with('\n') && !out.ends_with("\n\n"),
+            "{args:?}: {out:?}"
+        );
+    }
+}
+
+#[test]
 fn test_invalid_directive_after_multibyte_char() {
     let ts = TestScenario::new(util_name!());
     // The text before the directive is printed, as GNU does. What is checked
@@ -764,6 +845,29 @@ fn test_invalid_directive_after_multibyte_char() {
             .stdout_is(before)
             .stderr_is(format!("stat: '{directive}': invalid directive\n"));
     }
+}
+
+#[test]
+fn test_unknown_multibyte_directive_keeps_trailing_bytes() {
+    let ts = TestScenario::new(util_name!());
+    // Only the first byte of a multibyte char after `%` is taken as the
+    // (unknown) directive, so the remaining bytes are still printed.
+    for (fmt, expected) in [
+        ("%\u{bf}", &b"?\xbf"[..]),
+        ("a%\u{e9}b", &b"a?\xa9b"[..]),
+        ("%\u{20ac}%n", &b"?\x82\xac."[..]),
+        ("%5\u{20ac}", &b"?\x82\xac"[..]),
+    ] {
+        ts.ucmd()
+            .arg(format!("--printf={fmt}"))
+            .arg(".")
+            .succeeds()
+            .stdout_only_bytes(expected);
+    }
+    ts.ucmd()
+        .args(&["-c", "%\u{bf}", "."])
+        .succeeds()
+        .stdout_only_bytes(b"?\xbf\n");
 }
 
 #[test]
@@ -964,5 +1068,27 @@ stat: '%.3': invalid directive
             .args(&["-c", "%d%.3", "/dev/null"])
             .fails_with_code(1)
             .stderr_is("stat: '%.3': invalid directive\n");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn test_error_message_preserves_non_utf8_filename() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    for (bytes, quoted) in [
+        (b"missing-\xff".as_slice(), "'missing-'$'\\377'"),
+        (b"missing-\xc3\xa9".as_slice(), "'missing-'$'\\303\\251'"),
+    ] {
+        let name = OsStr::from_bytes(bytes);
+        for args in [vec![], vec!["-L"], vec!["-f"]] {
+            new_ucmd!()
+                .env("LC_ALL", "C")
+                .args(&args)
+                .arg(name)
+                .fails_with_code(1)
+                .stderr_contains(quoted);
+        }
     }
 }

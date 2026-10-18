@@ -32,7 +32,7 @@ uucore = { workspace = true, features = [
 ] }
 vnfs = { workspace = true, optional = true }
 
-[target.'cfg(all(unix, not(any(target_os = "aix", target_os = "hurd", target_os = "redox"))))'.dependencies]
+[target.'cfg(all(unix, not(target_os = "redox")))'.dependencies]
 uucore = { workspace = true, features = ["safe-traversal"] }
 
 [target.'cfg(windows)'.dependencies]
