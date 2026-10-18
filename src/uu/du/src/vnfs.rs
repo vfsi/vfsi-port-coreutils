@@ -140,7 +140,9 @@ fn traverse<F: Vfsi>(
     let root_attrs = backend
         .attrs_with_options(
             vroot,
-            AttrsOptions::new().fields(masks).follow_symlinks(false),
+            AttrsOptions::new()
+                .with_fields(masks)
+                .with_follow_final_symlink(false),
         )
         .map_err(io::Error::other)?;
 
@@ -157,9 +159,9 @@ fn traverse<F: Vfsi>(
             backend
                 .limits()
                 .walk_options()
-                .fields(masks)
-                .recursive(true)
-                .enter_leave(true),
+                .with_fields(masks)
+                .with_recursive(true)
+                .with_enter_leave(true),
             |event| {
                 let rendered = print_path(event.entry.path());
                 if event.kind == WalkEventKind::Leave {
@@ -332,7 +334,7 @@ mod tests {
         std::fs::write(root.path().join("empty"), b"").unwrap();
         let fs = Posix::new(root.path()).unwrap();
         let partial = fs
-            .attrs_with_options("/empty", AttrsOptions::new().fields(Attributes::MODE))
+            .attrs_with_options("/empty", AttrsOptions::new().with_fields(Attributes::MODE))
             .unwrap();
         assert_eq!(
             usage_from_attrs(Path::new("empty"), &partial, &options())
@@ -342,7 +344,10 @@ mod tests {
             io::ErrorKind::Unsupported
         );
         let full = fs
-            .attrs_with_options("/empty", AttrsOptions::new().fields(attr_mask(&options())))
+            .attrs_with_options(
+                "/empty",
+                AttrsOptions::new().with_fields(attr_mask(&options())),
+            )
             .unwrap();
         assert_eq!(
             usage_from_attrs(Path::new("empty"), &full, &options())

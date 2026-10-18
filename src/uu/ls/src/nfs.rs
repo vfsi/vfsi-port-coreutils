@@ -77,9 +77,11 @@ impl Backend {
     fn read_dirs(&self, dirs: &[&Path], fields: Attributes) -> vnfs::Result<Vec<DirectoryListing>> {
         match self {
             Self::Dummy(fs) => {
-                fs.read_dirs_with_options(dirs, ListDirOptions::new().fields(fields))
+                fs.read_dirs_with_options(dirs, ListDirOptions::new().with_fields(fields))
             }
-            Self::Nfs(fs) => fs.read_dirs_with_options(dirs, ListDirOptions::new().fields(fields)),
+            Self::Nfs(fs) => {
+                fs.read_dirs_with_options(dirs, ListDirOptions::new().with_fields(fields))
+            }
         }
         .map(|trees| trees.into_iter().flatten().collect())
     }
@@ -176,7 +178,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
                 Some(listing) => listing,
                 None => return Err(io::Error::other("vnfs returned no directory listing")),
             },
-            Err(error) if error.err_no() == uucore::libc::EFBIG as u32 => return Ok(None),
+            Err(error) if error.raw_code() == uucore::libc::EFBIG as u32 => return Ok(None),
             Err(error) => return Err(vf_io_error(error)),
         };
 
@@ -350,7 +352,7 @@ fn visit_ordered<F: vnfs::Vfsi>(
     let mut output_error = None;
     let result = fs.visit_dirs_ordered(
         root,
-        fs.limits().walk_options().fields(full_mask(config)),
+        fs.limits().walk_options().with_fields(full_mask(config)),
         crate::vf_entry_order(config),
         |entry| {
             entry
@@ -512,7 +514,7 @@ mod tests {
         backend
             .visit_dirs_ordered(
                 "/",
-                backend.limits().walk_options().fields(fields),
+                backend.limits().walk_options().with_fields(fields),
                 |a, b| b.path().cmp(a.path()),
                 |_| true,
                 |listing, _| {

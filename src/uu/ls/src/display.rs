@@ -1599,7 +1599,7 @@ mod vfsi_size_tests {
             (Attributes::MODE | Attributes::SIZE, "0"),
         ] {
             let metadata = LsMeta::Vf(
-                fs.attrs_with_options("/empty", AttrsOptions::new().fields(fields))
+                fs.attrs_with_options("/empty", AttrsOptions::new().with_fields(fields))
                     .unwrap(),
             );
             match display_len_or_rdev(&metadata, &config) {

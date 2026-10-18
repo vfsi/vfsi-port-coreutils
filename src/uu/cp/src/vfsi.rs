@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use vnfs::files::{Capabilities, CopyOption, ReadOptions, StreamOptions, Vfsi, VfsiExt};
+use vnfs::files::{Capabilities, CopyOptions, ReadOptions, StreamOptions, Vfsi, VfsiExt};
 use vnfs::helpers::{PathMapper, ResolvePath};
 use vnfs::nfs::{Nfs, NfsBuilder, NfsClient};
 use vnfs::posix::Posix;
@@ -71,7 +71,7 @@ impl Backend {
     fn read_files(&self, paths: &[PathBuf], limit: usize) -> VfResult<Vec<Vec<u8>>> {
         let limit = std::num::NonZeroUsize::new(limit)
             .ok_or_else(|| VfError::failure(0, libc::EINVAL as u32))?;
-        let options = ReadOptions::new().max_total_bytes(Some(limit));
+        let options = ReadOptions::new().with_max_total_bytes(limit);
         match self {
             Self::Dummy(fs) => fs.read_files_with_options(paths, options),
             Self::Nfs { fs, .. } => fs.read_files_with_options(paths, options),
@@ -94,7 +94,7 @@ impl Backend {
             Self::Nfs {
                 fs,
                 supports_copy: true,
-            } => Some(fs.vcopy(pairs, CopyOption::default())),
+            } => Some(fs.vcopy(pairs, CopyOptions::default())),
             _ => None,
         }
     }
