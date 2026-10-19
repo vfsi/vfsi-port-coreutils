@@ -29,6 +29,7 @@ use uucore::translate;
 
 use vnfs::directory::{
     Attributes, Attrs as Metadata, AttrsOptions, FileType as VfType, WalkControl, WalkEventKind,
+    WalkOptions,
 };
 use vnfs::files::{Vfsi, VfsiExt};
 use vnfs::nfs::Nfs;
@@ -156,12 +157,14 @@ fn traverse<F: Vfsi>(
     backend
         .listdir(
             vroot,
-            backend
-                .limits()
-                .walk_options()
-                .with_fields(masks)
-                .with_recursive(true)
-                .with_enter_leave(true),
+            WalkOptions::new(
+                backend
+                    .limits()
+                    .walk_options()
+                    .with_fields(masks)
+                    .with_recursive(true),
+            )
+            .with_enter_leave(true),
             |event| {
                 let rendered = print_path(event.entry.path());
                 if event.kind == WalkEventKind::Leave {
