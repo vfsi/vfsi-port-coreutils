@@ -45,7 +45,7 @@ fn vf_io_error(e: VfError) -> io::Error {
 }
 
 /// Attributes requested for every entry (all supported fields). The
-/// FATTR4_NAMED_ATTR boolean is only needed by the long format (for the `+`
+/// `FATTR4_NAMED_ATTR` boolean is only needed by the long format (for the `+`
 /// access-indicator), and costs the server a per-entry xattr enumeration, so
 /// it is only requested then.
 fn full_mask(config: &crate::config::Config) -> Attributes {

@@ -150,7 +150,7 @@ fn std_ctime(_: &std::fs::Metadata) -> Option<SystemTime> {
     None
 }
 
-/// A coarse file type, derived from `std::fs::FileType` or an NFSv4 type code.
+/// A coarse file type, derived from `std::fs::FileType` or an `NFSv4` type code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LsFileType {
     Dir,
