@@ -7,11 +7,13 @@
 
 use crate::args::Settings;
 use crate::chunks::BytesChunkBuffer;
+use crate::open_file;
 use crate::paths::{HeaderPrinter, PathExtTail};
+use crate::read::ReadAvailable;
 use crate::text;
 use std::collections::HashMap;
 use std::collections::hash_map::Keys;
-use std::fs::{File, Metadata};
+use std::fs::Metadata;
 use std::io::{BufRead, BufReader, BufWriter, Write, stdout};
 use std::path::{Path, PathBuf};
 use uucore::error::UResult;
@@ -25,6 +27,7 @@ pub struct FileHandling {
     map: HashMap<PathBuf, PathData>,
     last: Option<PathBuf>,
     header_printer: HeaderPrinter,
+    pub(super) nonblocking: bool,
 }
 
 impl FileHandling {
@@ -33,6 +36,7 @@ impl FileHandling {
             map: HashMap::with_capacity(settings.inputs.len()),
             last: None,
             header_printer: HeaderPrinter::new(settings.verbose, false),
+            nonblocking: settings.use_nonblocking(),
         }
     }
 
@@ -120,9 +124,19 @@ impl FileHandling {
         As a workaround, we always reopen the file even though this might not always
         be necessary.
         */
-        self.get_mut(path)
-            .reader
-            .replace(Box::new(BufReader::new(File::open(path)?)));
+        // A FIFO without a writer must not block the thread serving all files.
+        let file = open_file(path, true)?;
+        #[cfg(unix)]
+        if !self.nonblocking {
+            use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+            // Without --pid, preserve blocking reads after the nonblocking open.
+            let flags = fcntl_getfl(&file).map_err(std::io::Error::from)?;
+            fcntl_setfl(&file, flags & !OFlags::NONBLOCK).map_err(std::io::Error::from)?;
+        }
+        let data = self.get_mut(path);
+        data.reader.replace(Box::new(BufReader::new(file)));
+        data.symlink = path.is_symlink();
         Ok(())
     }
 
@@ -139,12 +153,12 @@ impl FileHandling {
     pub fn tail_file(&mut self, path: &Path, verbose: bool) -> UResult<bool> {
         let mut chunks = BytesChunkBuffer::new(u64::MAX);
         if let Some(reader) = self.get_mut(path).reader.as_mut() {
-            chunks.fill(reader)?;
+            chunks.fill(&mut ReadAvailable::new(reader))?;
         }
         if chunks.has_data() {
             if self.needs_header(path, verbose) {
                 let display_name = self.get(path).display_name.clone();
-                self.header_printer.print(display_name.as_str());
+                self.header_printer.print(display_name.as_str())?;
             }
 
             let mut writer = BufWriter::new(stdout().lock());
@@ -179,6 +193,11 @@ pub struct PathData {
     pub reader: Option<Box<dyn BufRead>>,
     pub metadata: Option<Metadata>,
     pub display_name: String,
+    /// Whether the path was a symbolic link when it was last opened. Under
+    /// `--follow=name`, a link named on the command line is followed to
+    /// whatever it points at, while a regular file that turns into a link is
+    /// not: its target could be any file.
+    pub symlink: bool,
 }
 
 impl PathData {
@@ -186,20 +205,22 @@ impl PathData {
         reader: Option<Box<dyn BufRead>>,
         metadata: Option<Metadata>,
         display_name: &str,
+        symlink: bool,
     ) -> Self {
         Self {
             reader,
             metadata,
             display_name: display_name.to_owned(),
+            symlink,
         }
     }
-    pub fn from_other_with_path(data: Self, path: &Path) -> Self {
+    pub fn from_other_with_path(data: Self, path: &Path, nonblocking: bool) -> Self {
         // Remove old reader
         let old_reader = data.reader;
         let reader = if old_reader.is_some() {
             // Use old reader with the same file descriptor if there is one
             old_reader
-        } else if let Ok(file) = File::open(path) {
+        } else if let Ok(file) = open_file(path, nonblocking) {
             // Open new file tail from start
             Some(Box::new(BufReader::new(file)) as Box<dyn BufRead>)
         } else {
@@ -207,6 +228,11 @@ impl PathData {
             None
         };
 
-        Self::new(reader, path.metadata().ok(), data.display_name.as_str())
+        Self::new(
+            reader,
+            path.metadata().ok(),
+            data.display_name.as_str(),
+            path.is_symlink(),
+        )
     }
 }

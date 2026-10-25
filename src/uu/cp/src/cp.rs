@@ -60,6 +60,10 @@ mod vfsi;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CpError {
+    /// Permission denied.
+    #[error("{}", translate!("cp-error-cannot-open-for-reading", "source" => .0.quote()))]
+    CannotOpenForReading(PathBuf),
+
     /// Simple [`io::Error`] wrapper
     #[error("{0}")]
     IoErr(#[from] io::Error),
@@ -1030,7 +1034,7 @@ impl Attributes {
 
 /// Flags in the mutual-exclusion group for symlink handling.
 /// The last one on the command line determines dereference behavior.
-/// Note: CLI_SYMBOLIC_LINKS (-H) is excluded here — it only affects
+/// Note: `CLI_SYMBOLIC_LINKS` (-H) is excluded here — it only affects
 /// CLI-level symlinks, not recursive traversal.
 const DEREF_FLAGS: &[&str] = &[
     options::DEREFERENCE,
@@ -1578,7 +1582,7 @@ fn construct_dest_path(
     if options.no_target_dir && target.is_dir() {
         return Err(
             translate!("cp-error-cannot-overwrite-directory-with-non-directory",
-                              "dir" => target.quote())
+                              "dir" => target.quote(), "source" => source_path.quote())
             .into(),
         );
     }
@@ -1623,6 +1627,12 @@ fn copy_source(
     created_parent_dirs: &mut HashSet<PathBuf>,
 ) -> CopyResult<()> {
     let source_path = Path::new(&source);
+    // WASI resolves an empty path to the preopened directory instead of
+    // failing with ENOENT, so report the failed stat here.
+    #[cfg(target_os = "wasi")]
+    if source_path.as_os_str().is_empty() {
+        return Err(translate!("cp-error-cannot-stat", "source" => source.quote()).into());
+    }
     if source_path.is_dir() && (options.dereference || !source_path.is_symlink()) {
         // Copy as directory
         copy_directory(
@@ -1971,13 +1981,10 @@ pub(crate) fn copy_attributes(
             let source_perms = {
                 use std::os::unix::fs::PermissionsExt;
                 let mut perms = source_metadata.permissions();
-                if !ownership_preserved.get() {
-                    // GNU cp strips setuid (04000) and setgid (02000) when
-                    // ownership could not be preserved. Keep the sticky bit
-                    // (01000) and all rwx bits.
-                    let mode = perms.mode() & !0o6000;
-                    perms.set_mode(mode);
-                }
+                perms.set_mode(uucore::safe_copy::preserved_mode(
+                    perms.mode(),
+                    ownership_preserved.get(),
+                ));
                 if apply_umask_to_mode {
                     // The umask never covers setuid/setgid, so clear them
                     // explicitly: a non-preserving copy must not carry the
@@ -1996,7 +2003,9 @@ pub(crate) fn copy_attributes(
             // so we keep ACL parity with GNU without preserving user xattrs
             // (which are intentionally excluded from the default -p set per
             // issue #9704). Best-effort: ignore failures on filesystems that
-            // do not support ACL xattrs.
+            // do not support ACL xattrs. A directory created without an
+            // explicit preserve only gets the source mode bits; GNU `cp -r`
+            // does not copy its ACLs.
             #[cfg(any(
                 target_os = "freebsd",
                 target_os = "hurd",
@@ -2004,7 +2013,9 @@ pub(crate) fn copy_attributes(
                 target_os = "macos",
                 target_os = "netbsd"
             ))]
-            copy_acls(source, dest);
+            if matches!(attributes.mode, Preserve::Yes { .. }) {
+                copy_acls(source, dest);
+            }
         }
 
         Ok(())
@@ -2108,39 +2119,22 @@ fn symlink_file(
     dest: &Path,
     symlinked_files: &mut HashSet<FileInformation>,
 ) -> CopyResult<()> {
-    #[cfg(not(any(windows, target_os = "wasi")))]
-    {
-        std::os::unix::fs::symlink(source, dest).map_err(|e| {
-            CpError::IoErrContext(
-                e,
-                translate!("cp-error-cannot-create-symlink",
-                           "dest" => get_filename(dest).unwrap_or("?").quote(),
-                           "source" => get_filename(source).unwrap_or("?").quote()),
-            )
-        })?;
-    }
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::symlink_file(source, dest).map_err(|e| {
-            CpError::IoErrContext(
-                e,
-                translate!("cp-error-cannot-create-symlink",
-                           "dest" => get_filename(dest).unwrap_or("?").quote(),
-                           "source" => get_filename(source).unwrap_or("?").quote()),
-            )
-        })?;
-    }
+    #[cfg(unix)]
+    let res = std::os::unix::fs::symlink(source, dest);
     #[cfg(target_os = "wasi")]
-    {
-        platform::create_symlink(source, dest).map_err(|e| {
-            CpError::IoErrContext(
-                e,
-                translate!("cp-error-cannot-create-symlink",
+    // <https://doc.rust-lang.org/std/os/wasi/fs/fn.symlink_path.html> is nightly API
+    let res = rustix::fs::symlink(source, dest).map_err(io::Error::from);
+    #[cfg(windows)]
+    let res = std::os::windows::fs::symlink_file(source, dest);
+
+    res.map_err(|e| {
+        CpError::IoErrContext(
+            e,
+            translate!("cp-error-cannot-create-symlink",
                            "dest" => get_filename(dest).unwrap_or("?").quote(),
                            "source" => get_filename(source).unwrap_or("?").quote()),
-            )
-        })?;
-    }
+        )
+    })?;
     if let Ok(file_info) = FileInformation::from_path(dest, false) {
         symlinked_files.insert(file_info);
     }
@@ -2224,6 +2218,41 @@ fn is_forbidden_to_copy_to_same_file(
         && source_is_symlink
         && source.file_name() != dest.file_name()
         && !options.dereference)
+}
+
+/// Whether `dest` is directly inside the current directory,
+/// it compares the parent with "." by name first, then by device and inode, so
+/// `../<cwd>/b2` or a symlink to the cwd also count.
+fn dest_is_in_cwd(dest: &Path) -> bool {
+    let parent = match dest.parent() {
+        None => return true,
+        Some(p) if p.as_os_str().is_empty() || p == Path::new(".") => return true,
+        Some(p) => p,
+    };
+    match (
+        FileInformation::from_path(Path::new("."), true),
+        FileInformation::from_path(parent, true),
+    ) {
+        (Ok(cwd), Ok(parent)) => cwd == parent,
+        _ => false,
+    }
+}
+
+/// Refuse `cp -s` with a relative source unless the destination is in
+/// the current directory, because a relative symlink target is resolved from
+/// the link's own directory.
+fn verify_relative_symlink_in_cwd(source: &Path, dest: &Path, options: &Options) -> CopyResult<()> {
+    if options.copy_mode != CopyMode::SymLink || source.is_absolute() {
+        return Ok(());
+    }
+    if dest_is_in_cwd(dest) {
+        Ok(())
+    } else {
+        Err(CpError::Error(translate!(
+            "cp-error-relative-symlink-not-in-cwd",
+            "dest" => dest.maybe_quote()
+        )))
+    }
 }
 
 /// Back up, remove, or leave intact the destination file, depending on the options.
@@ -2321,7 +2350,7 @@ fn delete_dest_if_needed_and_allowed(
                                 &FileInformation::from_path(
                                     source,
                                     options.dereference(source_in_command_line)
-                                ).map_err(|e| CpError::IoErrContext(e, format!("cannot stat {}", source.quote())))?
+                                ).map_err(|e| CpError::IoErrContext(e, translate!("cp-error-cannot-stat-context", "source" => source.quote())))?
                             )
                 }
             }
@@ -2726,8 +2755,10 @@ fn calculate_dest_permissions(
             let mut permissions = source_metadata.permissions();
             let mode = handle_no_preserve_mode(options, permissions.mode());
 
-            // Apply umask
-            let mode = mode & !uucore::mode::get_umask();
+            // Apply umask. Never put the setuid/setgid bits on the copy
+            // before its ownership is set: when the mode is preserved,
+            // copy_attributes() restores them after the chown.
+            let mode = mode & !0o6000 & !uucore::mode::get_umask();
             permissions.set_mode(mode);
             permissions
         }
@@ -2760,6 +2791,9 @@ fn copy_file(
     created_parent_dirs: &mut HashSet<PathBuf>,
     source_in_command_line: bool,
 ) -> CopyResult<()> {
+    // Must run before anything below can remove or back up `dest`.
+    verify_relative_symlink_in_cwd(source, dest, options)?;
+
     let source_is_symlink = source.is_symlink();
     let initial_dest_metadata = dest.symlink_metadata().ok();
     let dest_is_symlink = initial_dest_metadata
@@ -2891,7 +2925,12 @@ fn copy_file(
         // in the destination tree.
         if let Some(new_source) = copied_files.get(
             &FileInformation::from_path(source, options.dereference(source_in_command_line))
-                .map_err(|e| CpError::IoErrContext(e, format!("cannot stat {}", source.quote())))?,
+                .map_err(|e| {
+                    CpError::IoErrContext(
+                        e,
+                        translate!("cp-error-cannot-stat-context", "source" => source.quote()),
+                    )
+                })?,
         ) {
             fs::hard_link(new_source, dest)?;
 
@@ -2913,12 +2952,11 @@ fn copy_file(
         } else {
             fs::symlink_metadata(source)
         };
-        // this is just for gnu tests compatibility
         result.map_err(|err| {
-            if err.to_string().contains("No such file or directory") {
-                return translate!("cp-error-cannot-stat", "source" => source.quote());
-            }
-            err.to_string()
+            CpError::IoErrContext(
+                err,
+                translate!("cp-error-cannot-stat-context", "source" => source.quote()),
+            )
         })?
     };
 

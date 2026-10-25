@@ -86,8 +86,7 @@ where COMMAND is one of:
                 host; by default, REPO is: $this_repo
   build         run \`cargo build --features feat_os_unix_android\` on the
                 device
-  tests         run \`cargo test --features feat_os_unix_android\` on the
-                device
+  tests [SUITE] run tests on the device (SUITE: all or cksum-wc; default: all)
 
 If you have multiple devices, use the ANDROID_SERIAL environment variable to
 specify which to connect to."
@@ -121,8 +120,9 @@ take_screen_shot() {
 
 get_app_user() {
     app="$1"
-    app_user="$(adb shell dumpsys package $app | grep 'userId=' | cut -d= -f2 | sort -u)"
-    if [[ -z "$app_user" ]]; then
+    app_user="$(adb shell cmd package list packages -U "$app" | tr -d '\r' |
+        awk -v app="$app" '$1 == "package:" app { sub(/^uid:/, "", $2); print $2 }')"
+    if [[ ! "$app_user" =~ ^[0-9]+$ ]]; then
         echo "Couldn't find user for app: $app">&2
         exit 1
     fi
@@ -393,7 +393,14 @@ test_ssh_connection() {
 # takes a local (on runner side) script file and runs it via ssh on the virtual android device. forwards return code.
 # adds a timestamp to every line to be able to see where delays are
 run_script_file_via_ssh() {
-    ssh -p 9022 "$(termux_user)@127.0.0.1" -o StrictHostKeyChecking=accept-new "bash -s" < "$1" 2>&1 | add_timestamp_to_lines
+    local script=$1
+    shift
+    local command="bash -s --"
+    local arg
+    for arg in "$@"; do
+        printf -v command '%s %q' "$command" "$arg"
+    done
+    ssh -p 9022 "$(termux_user)@127.0.0.1" -o StrictHostKeyChecking=accept-new "$command" < "$script" 2>&1 | add_timestamp_to_lines
     return "${PIPESTATUS[0]}"
 }
 
@@ -553,6 +560,8 @@ sync_host() {
     cache_dest="$dev_home_dir/${cache_dir_name}"
     repo_dest="$dev_home_dir/coreutils"
 
+    # Keep Termux in the foreground so Android does not freeze its SSH processes.
+    adb shell am start -n com.termux/.HomeActivity || return
     reinit_ssh_connection || return
 
     echo "Running sync host -> image: ${repo}"
@@ -613,7 +622,7 @@ tests() {
 
     run_script_file_via_ssh "$this_repo/util/android-scripts/collect-info.sh"
 
-    run_script_file_via_ssh "$this_repo/util/android-scripts/run-tests.sh" || return
+    run_script_file_via_ssh "$this_repo/util/android-scripts/run-tests.sh" "${1:-all}" || return
 
     echo "Finished tests"
 }
@@ -662,6 +671,10 @@ if [ $# -eq 1 ]; then
     esac
 elif [ $# -eq 2 ]; then
     case "$1" in
+        tests)
+            tests "$2"
+            exit_code=$?
+            ;;
         snapshot)
             snapshot "$2"
             exit_code=$?

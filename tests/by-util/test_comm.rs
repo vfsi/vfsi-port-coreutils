@@ -5,6 +5,7 @@
 
 // spell-checker:ignore (words) defaultcheck nocheck helpb helpz nwordb nwordwordz wordtotal
 
+use rstest::rstest;
 use uutests::util::TestScenario;
 #[cfg(unix)]
 use uutests::util::is_locale_available;
@@ -322,7 +323,50 @@ fn check_order() {
         .args(&["--check-order", "bad_order_1", "bad_order_2"])
         .fails()
         .stdout_is("\t\te\n")
-        .stderr_is("comm: file 2 is not in sorted order\n");
+        .stderr_is("comm: file 1 is not in sorted order\n");
+}
+
+#[test]
+fn check_order_reports_file_1_first() {
+    // After a common line both files move on. If both next lines are out of
+    // order, file 1 is the one reported, whichever line sorts first.
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.write("d", "e\nd\n");
+    at.write("c", "e\nc\n");
+    at.write("ok", "e\nf\n");
+    for (file1, file2, expected) in [
+        ("d", "c", "1"),
+        ("c", "d", "1"),
+        ("d", "ok", "1"),
+        ("ok", "d", "2"),
+    ] {
+        scene
+            .ucmd()
+            .args(&["--check-order", file1, file2])
+            .fails_with_code(1)
+            .stdout_is("\t\te\n")
+            .stderr_is(format!("comm: file {expected} is not in sorted order\n"));
+    }
+}
+
+#[test]
+fn check_order_failure_prints_no_total() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.write("unsorted", "a\nc\nb\nd\n");
+    at.write("sorted", "a\nb\nc\nd\n");
+    scene
+        .ucmd()
+        .args(&["--total", "--check-order", "unsorted", "sorted"])
+        .fails_with_code(1)
+        .stdout_is("\t\ta\n\tb\n\t\tc\n")
+        .stderr_is("comm: file 1 is not in sorted order\n");
+    scene
+        .ucmd()
+        .args(&["--total", "--check-order", "sorted", "sorted"])
+        .succeeds()
+        .stdout_is("\t\ta\n\t\tb\n\t\tc\n\t\td\n0\t0\t4\ttotal\n");
 }
 
 #[test]
@@ -677,8 +721,8 @@ fn test_comm_eintr_handling() {
         .stdout_contains("line3");
 }
 
+#[uutests::wasi_ignore(NonUtf8ArgsUnsupported)]
 #[test]
-#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_output_lossy_utf8() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
@@ -702,9 +746,9 @@ fn test_output_lossy_utf8() {
         .stdout_is_bytes(b"\xfe\n\t\t\xff\n\t\xfe\n");
 }
 
+#[uutests::wasi_ignore(HostPathsNotVisible)]
 #[test]
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_comm_anonymous_pipes() {
     use std::fmt::Write as _;
     use std::{io::Write, os::fd::AsRawFd, process};
@@ -742,9 +786,9 @@ fn test_comm_anonymous_pipes() {
         .stdout_is("99999\n");
 }
 
+#[uutests::wasi_ignore(HostPathsNotVisible)]
 #[test]
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_read_error() {
     new_ucmd!()
         .arg("/proc/self/mem")
@@ -759,9 +803,9 @@ fn test_read_error() {
         .stderr_contains("comm: /proc/self/mem: Input/output error");
 }
 
+#[uutests::wasi_ignore(NoLocaleData)]
 #[test]
 #[cfg(unix)]
-#[cfg_attr(wasi_runner, ignore = "WASI: the guest does not inherit LC_ALL")]
 fn test_locale_collation() {
     // In a UTF-8 locale the collation puts `a1` before `a-b` and the byte order
     // puts them the other way round. Reading a file `sort` produced with a byte
@@ -858,4 +902,54 @@ fn test_both_inputs_stdin() {
         .succeeds()
         .stdout_is("\ta\nb\n\t\tc\n")
         .no_stderr();
+}
+
+#[rstest]
+fn test_prefix_lines_remain_sorted(
+    #[values("", "--check-order", "--nocheck-order")] order: &str,
+    #[values(false, true)] reverse: bool,
+    #[values("\n", "\0")] ending: &str,
+) {
+    let scene = TestScenario::new(util_name!());
+    scene.fixtures.touch("empty");
+    scene
+        .fixtures
+        .write("sorted", &format!("{ending}\t{ending}"));
+    let mut cmd = scene.ucmd();
+    cmd.env("LC_ALL", "C");
+    if !order.is_empty() {
+        cmd.arg(order);
+    }
+    if ending == "\0" {
+        cmd.arg("-z");
+    }
+    let (files, expected) = if reverse {
+        (["sorted", "empty"], format!("{ending}\t{ending}"))
+    } else {
+        (["empty", "sorted"], format!("\t{ending}\t\t{ending}"))
+    };
+    cmd.args(&files).succeeds().stdout_only(expected);
+}
+
+#[rstest]
+fn test_merge_prefix_lines(
+    #[values(false, true)] reverse: bool,
+    #[values(false, true)] terminated: bool,
+    #[values("\n", "\0")] ending: &str,
+) {
+    let scene = TestScenario::new(util_name!());
+    let suffix = if terminated { ending } else { "" };
+    scene.fixtures.write("short", &format!("a{suffix}"));
+    scene.fixtures.write("long", &format!("a\tb{suffix}"));
+    let mut cmd = scene.ucmd();
+    cmd.env("LC_ALL", "C");
+    if ending == "\0" {
+        cmd.arg("-z");
+    }
+    let (files, expected) = if reverse {
+        (["long", "short"], format!("\ta{ending}a\tb{ending}"))
+    } else {
+        (["short", "long"], format!("a{ending}\ta\tb{ending}"))
+    };
+    cmd.args(&files).succeeds().stdout_only(expected);
 }

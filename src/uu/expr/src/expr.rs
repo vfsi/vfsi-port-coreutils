@@ -3,6 +3,22 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
+#![cfg_attr(
+    any(
+        target_os = "android",
+        target_os = "haiku",
+        target_os = "illumos",
+        all(target_os = "linux", target_env = "ohos"),
+        target_os = "openbsd",
+        target_os = "solaris",
+        all(target_os = "windows", target_env = "gnu", not(target_abi = "llvm"))
+    ),
+    allow(
+        clippy::missing_const_for_thread_local,
+        reason = "https://github.com/rust-lang/rust-clippy/issues/13422"
+    )
+)]
+
 use clap::{Arg, ArgAction, Command};
 use std::io::{Write, stdout};
 use syntax_tree::{AstNode, is_truthy};
@@ -32,6 +48,8 @@ pub enum ExprError {
     UnexpectedArgument(String),
     #[error("{}", translate!("expr-error-missing-argument", "arg" => _0.quote()))]
     MissingArgument(String),
+    #[error("{}", translate!("expr-error-unexpected-closing-parenthesis"))]
+    UnexpectedClosingParenthesis,
     // The offending operand is carried for diagnostics only; GNU prints the bare
     // message, so it is deliberately absent from `Display`. Raw bytes, so that a
     // non-UTF-8 operand can still be matched back to its argument.
