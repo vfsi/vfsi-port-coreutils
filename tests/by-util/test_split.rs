@@ -3,12 +3,13 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-// spell-checker:ignore xzaaa sixhundredfiftyonebytes ninetyonebytes threebytes asciilowercase ghijkl mnopq rstuv wxyz fivelines twohundredfortyonebytes onehundredlines nbbbb dxen ncccc rlimit Nofile
+// spell-checker:ignore xzaaa sixhundredfiftyonebytes ninetyonebytes threebytes asciilowercase ghijkl mnopq rstuv wxyz fivelines twohundredfortyonebytes onehundredlines nbbbb dxen ncccc rlimit NOFILE
 
 use rand::{RngExt as _, SeedableRng, rng};
 use regex::Regex;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use rustix::process::Resource;
+#[cfg(target_os = "linux")]
+use rlimit::Resource;
+use rstest::rstest;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
@@ -919,6 +920,24 @@ fn test_suffix_length_zero() {
 }
 
 #[test]
+fn test_suffix_length_zero_with_number_uses_default_length() {
+    // `-a 0` is the same as no `-a`, so the suffixes start at length 2
+    // even when a shorter suffix would fit the number of chunks.
+    let (at, mut ucmd) = at_and_ucmd!();
+    ucmd.args(&["-n2", "-a0", "fivelines.txt"]).succeeds();
+    assert!(at.file_exists("xaa"));
+    assert!(at.file_exists("xab"));
+    assert!(!at.file_exists("xa"));
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    let args = ["-d", "-n10", "-a0", "fivelines.txt"];
+    ucmd.args(&args).succeeds();
+    assert!(at.file_exists("x00"));
+    assert!(at.file_exists("x09"));
+    assert!(!at.file_exists("x0"));
+}
+
+#[test]
 fn test_suffixes_exhausted() {
     new_ucmd!()
         .args(&["-b", "1", "-a", "1", "asciilowercase.txt"])
@@ -1279,6 +1298,22 @@ fn test_elide_dev_null_l_chunks() {
     assert!(!at.plus("xaa").exists());
     assert!(!at.plus("xab").exists());
     assert!(!at.plus("xac").exists());
+}
+
+#[test]
+fn test_elide_empty_files_preserves_line_chunks() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("input", "aaaaaa\nb\nc\nd\ne\n");
+    ucmd.args(&["-e", "-n", "l/6", "input"])
+        .succeeds()
+        .no_output();
+
+    assert_eq!(at.read("xaa"), "aaaaaa\n");
+    assert_eq!(at.read("xab"), "b\n");
+    assert_eq!(at.read("xac"), "c\n");
+    assert_eq!(at.read("xad"), "d\n");
+    assert_eq!(at.read("xae"), "e\n");
+    assert!(!at.plus("xaf").exists());
 }
 
 #[test]
@@ -1731,12 +1766,11 @@ fn test_round_robin() {
 
 #[test]
 // TODO(#7542): Re-enable on Android once we figure out why rlimit is broken.
-// #[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg(target_os = "linux")]
 fn test_round_robin_limited_file_descriptors() {
     new_ucmd!()
         .args(&["-n", "r/40", "onehundredlines.txt"])
-        .limit(Resource::Nofile, 9, 9)
+        .limit(Resource::NOFILE, 9, 9)
         .succeeds();
 }
 
@@ -2335,4 +2369,43 @@ fn test_obsolete_lines_not_read_after_double_dash() {
         .args(&["--", "-1"])
         .fails()
         .stderr_contains("cannot open '-1' for reading");
+}
+
+#[rstest]
+#[case::bytes("+2", &[("xaa", "a\nb\n"), ("xab", "c\nd\n")], "")]
+#[case::lines("l/+2", &[("xaa", "a\nb\n"), ("xab", "c\nd\n")], "")]
+#[case::round_robin("r/+2", &[("xaa", "a\nc\n"), ("xab", "b\nd\n")], "")]
+#[case::bytes_first_half("+1/2", &[], "a\nb\n")]
+#[case::lines_first_half("l/+1/2", &[], "a\nb\n")]
+#[case::round_robin_first_half("r/+1/2", &[], "a\nc\n")]
+fn test_number_with_plus_prefix(
+    #[case] number: &str,
+    #[case] expected_files: &[(&str, &str)],
+    #[case] expected_stdout: &str,
+) {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("a.txt", "a\nb\nc\nd\n");
+
+    let stdout = ucmd
+        .args(&["-n", number, "a.txt"])
+        .succeeds()
+        .stdout_move_str();
+    assert_eq!(stdout, expected_stdout, "-n {number}");
+
+    let mut files: Vec<(String, String)> = fs::read_dir(at.as_string())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with('x'))
+        .map(|name| {
+            let contents = at.read(at.plus(&name));
+            (name.to_string_lossy().into_owned(), contents)
+        })
+        .collect();
+    files.sort();
+
+    let expected_files: Vec<(String, String)> = expected_files
+        .iter()
+        .map(|(name, contents)| (name.to_string(), contents.to_string()))
+        .collect();
+    assert_eq!(files, expected_files, "-n {number}");
 }
