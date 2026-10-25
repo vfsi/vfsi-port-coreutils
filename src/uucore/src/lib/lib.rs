@@ -8,6 +8,21 @@
 //! library ~ (core/bundler file)
 
 // #![deny(missing_docs)] //TODO: enable this
+#![cfg_attr(
+    any(
+        target_os = "android",
+        target_os = "haiku",
+        target_os = "illumos",
+        all(target_os = "linux", target_env = "ohos"),
+        target_os = "openbsd",
+        target_os = "solaris",
+        all(target_os = "windows", target_env = "gnu", not(target_abi = "llvm"))
+    ),
+    allow(
+        clippy::missing_const_for_thread_local,
+        reason = "https://github.com/rust-lang/rust-clippy/issues/13422"
+    )
+)]
 
 // * feature-gated external crates (re-shared as public internal modules)
 #[cfg(feature = "libc")]
@@ -440,14 +455,14 @@ pub trait Args: Iterator<Item = OsString> + Sized {
 impl<T: Iterator<Item = OsString> + Sized> Args for T {}
 
 /// Returns an iterator over the command line arguments as `OsString`s.
-/// args_os() can be expensive to call
+/// [`args_os()`] can be expensive to call
 pub fn args_os() -> impl Iterator<Item = OsString> {
     ARGV.iter().cloned()
 }
 
 /// Returns an iterator over the command line arguments as `OsString`s, filtering out empty arguments.
 /// This is useful for handling cases where extra whitespace or empty arguments are present.
-/// args_os_filtered() can be expensive to call
+/// [`args_os_filtered()`] can be expensive to call
 pub fn args_os_filtered() -> impl Iterator<Item = OsString> {
     ARGV.iter().filter(|arg| !arg.is_empty()).cloned()
 }

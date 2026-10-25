@@ -8,7 +8,6 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 use std::borrow::Borrow;
-use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::io::{self, BufReader};
 use std::{
@@ -369,7 +368,8 @@ impl SplitWriter<'_> {
     ///
     /// In addition to errors reading/writing from/to a file, if the line number
     /// `n` is greater than the total available lines, then a
-    /// [`CsplitError::LineOutOfRange`] error is returned.
+    /// [`CsplitError::LineOutOfRange`] error is returned. With `--suppress-matched`,
+    /// `n` may also be one past the last line, if this split read any lines.
     fn do_to_line<I>(
         &mut self,
         pattern_as_str: &str,
@@ -383,29 +383,25 @@ impl SplitWriter<'_> {
         input_iter.set_size_of_buffer(1);
 
         let mut ret = Err(CsplitError::LineOutOfRange(pattern_as_str.to_string()));
+        let mut last_ln = None;
         while let Some((ln, line)) = input_iter.next() {
             let line = line?;
-            match n.cmp(&(&ln + 1)) {
-                Ordering::Less => {
-                    assert!(
-                        input_iter.add_line_to_buffer(ln, line).is_none(),
-                        "the buffer is big enough to contain 1 line"
-                    );
-                    ret = Ok(());
-                    break;
-                }
-                Ordering::Equal => {
-                    assert!(
-                        self.options.suppress_matched
-                            || input_iter.add_line_to_buffer(ln, line).is_none(),
-                        "the buffer is big enough to contain 1 line"
-                    );
-                    ret = Ok(());
-                    break;
-                }
-                Ordering::Greater => (),
+            last_ln = Some(ln);
+            if n <= ln + 1 {
+                assert!(
+                    self.options.suppress_matched
+                        || input_iter.add_line_to_buffer(ln, line).is_none(),
+                    "the buffer is big enough to contain 1 line"
+                );
+                ret = Ok(());
+                break;
             }
             self.writeln(&line)?;
+        }
+        // With --suppress-matched, a split that ends with the input right before
+        // line `n` is complete: line `n` would have been dropped anyway.
+        if self.options.suppress_matched && last_ln.is_some_and(|ln| ln + 2 == n) {
+            ret = Ok(());
         }
         self.finish_split()?;
         ret

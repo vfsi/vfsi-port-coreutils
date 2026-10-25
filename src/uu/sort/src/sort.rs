@@ -3,7 +3,7 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-// spell-checker:ignore (misc) kKMGTPEZYRQ HFKJFK Mbdfhn getrlimit Nofile rlim bigdecimal extendedbigdecimal hexdigit behaviour keydef GETFD localeconv foldhash
+// spell-checker:ignore (misc) kKMGTPEZYRQ HFKJFK Mbdfhn getrlimit NOFILE rlim bigdecimal extendedbigdecimal hexdigit behaviour keydef GETFD localeconv foldhash
 // spell-checker:ignore (misc) uppercased qsort getmonth juin juil
 
 // Although these links don't always seem to describe reality, check out the POSIX and GNU specs:
@@ -143,23 +143,26 @@ pub enum SortError {
         silent: bool,
     },
 
-    #[error("{}", translate!("sort-open-failed", "path" => format!("{}", .path.maybe_quote()), "error" => strip_errno(.error)))]
+    #[error("{}", translate_text!("sort-open-failed", "path" => format!("{}", .path.maybe_quote()), "error" => strip_errno(.error)))]
     OpenFailed {
         path: PathBuf,
         error: std::io::Error,
     },
 
-    #[error("{}", translate!("sort-truncate-failed", "path" => format!("{}", .path.maybe_quote()), "error" => strip_errno(.error)))]
+    #[error("{}", translate_text!("sort-truncate-failed", "path" => format!("{}", .path.maybe_quote()), "error" => strip_errno(.error)))]
     TruncateFailed {
         path: PathBuf,
         error: std::io::Error,
     },
 
-    #[error("{}", translate!("sort-cannot-read", "path" => format!("{}", .path.maybe_quote()), "error" => strip_errno(.error)))]
+    #[error("{}", translate_text!("sort-cannot-read", "path" => format!("{}", .path.maybe_quote()), "error" => strip_errno(.error)))]
     ReadFailed {
         path: PathBuf,
         error: std::io::Error,
     },
+
+    #[error("{}", translate!("sort-read-failed", "error" => strip_errno(.error)))]
+    ChunkReadFailed { error: std::io::Error },
 
     #[error("{}", translate!("sort-open-tmp-file-failed", "error" => strip_errno(.error)))]
     OpenTmpFileFailed { error: std::io::Error },
@@ -170,10 +173,10 @@ pub enum SortError {
     #[error("{}", translate!("sort-compress-prog-terminated-abnormally", "prog" => .prog.quote()))]
     CompressProgTerminatedAbnormally { prog: String },
 
-    #[error("{}", translate!("sort-cannot-create-tmp-file", "path" => format!("{}", .path.quote())))]
+    #[error("{}", translate_text!("sort-cannot-create-tmp-file", "path" => format!("{}", .path.quote())))]
     TmpFileCreationFailed { path: PathBuf },
 
-    #[error("{}", translate!("sort-file-operands-combined", "file" => format!("{}", .file.quote()), "help" => uucore::execution_phrase()))]
+    #[error("{}", translate_text!("sort-file-operands-combined", "file" => format!("{}", .file.quote()), "help" => uucore::execution_phrase()))]
     FileOperandsCombined { file: PathBuf },
 
     #[error("{error}")]
@@ -182,16 +185,19 @@ pub enum SortError {
     #[error("{}", translate!("sort-multiple-output-files"))]
     MultipleOutputFiles,
 
+    #[error("{}", translate!("sort-incompatible-tabs"))]
+    IncompatibleTabs,
+
     #[error("{}", translate!("sort-minus-in-stdin"))]
     MinusInStdIn,
 
-    #[error("{}", translate!("sort-no-input-from", "file" => format!("{}", .file.quote())))]
+    #[error("{}", translate_text!("sort-no-input-from", "file" => format!("{}", .file.quote())))]
     EmptyInputFile { file: PathBuf },
 
-    #[error("{}", translate!("sort-random-source-end-of-file", "path" => format!("{}", .path.quote())))]
+    #[error("{}", translate_text!("sort-random-source-end-of-file", "path" => format!("{}", .path.quote())))]
     RandomSourceEndOfFile { path: PathBuf },
 
-    #[error("{}", translate!("sort-invalid-zero-length-filename", "file" => .file.maybe_quote(), "line_num" => .line_num))]
+    #[error("{}", translate_text!("sort-invalid-zero-length-filename", "file" => .file.maybe_quote(), "line_num" => .line_num))]
     ZeroLengthFileName { file: PathBuf, line_num: usize },
 }
 
@@ -289,7 +295,7 @@ impl Output {
             .as_output_name()
             .unwrap_or(OsStr::new("standard output"))
             .to_owned();
-        move || translate!("sort-error-write-failed", "output" => output_name.maybe_quote())
+        move || translate_text!("sort-error-write-failed", "output" => output_name.maybe_quote())
     }
 }
 
@@ -336,9 +342,10 @@ impl Default for NumericLocaleSettings {
 }
 
 impl NumericLocaleSettings {
-    fn num_info_settings(self, accept_si_units: bool) -> NumInfoParseSettings {
+    fn num_info_settings(self, accept_si_units: bool, fold_si_units: bool) -> NumInfoParseSettings {
         NumInfoParseSettings {
             accept_si_units,
+            fold_si_units,
             thousands_separator: self.thousands_sep,
             decimal_pt: self.decimal_pt,
         }
@@ -432,15 +439,16 @@ impl GlobalSettings {
     /// looking at any key. That is only the same comparison when the single
     /// key spans the entire line: `-n -k1.2` sorts on the line's second
     /// character onwards, and `-n -t. -k2` on its second field, neither of
-    /// which the line as a whole stands for. A key of its own `r` also has to
-    /// go the long way, since the shortcut only knows the global one.
+    /// which the line as a whole stands for. A key whose `r` differs from the
+    /// global one also has to go the long way, since the shortcut only knows
+    /// the global one.
     fn can_use_whole_line_numeric(&self) -> bool {
         let [selector] = &self.selectors[..] else {
             return false;
         };
         self.mode == SortMode::Numeric
             && selector.settings.mode == SortMode::Numeric
-            && !selector.settings.reverse
+            && selector.settings.reverse == self.reverse
             && selector.from.field == 1
             && selector.from.char == 1
             && selector.to.is_none()
@@ -449,7 +457,7 @@ impl GlobalSettings {
     /// Returns true when the fast lexicographic path can be used safely.
     /// Note: When i18n-collator is enabled, the caller must have already determined
     /// whether locale-aware collation is needed (via checking if we're in a UTF-8 locale).
-    /// This check is performed in uumain() before init_precomputed() is called.
+    /// This check is performed in [`uumain()`] before `init_precomputed()` is called.
     fn can_use_fast_lexicographic(&self) -> bool {
         let [selector] = &self.selectors[..] else {
             return false;
@@ -465,6 +473,7 @@ impl GlobalSettings {
             && !selector.settings.dictionary_order
             && !selector.settings.ignore_non_printing
             && !selector.settings.ignore_blanks
+            && selector.settings.reverse == self.reverse
     }
 
     /// Returns true when the ASCII case-insensitive fast path is valid.
@@ -483,6 +492,7 @@ impl GlobalSettings {
             && !selector.settings.dictionary_order
             && !selector.settings.ignore_non_printing
             && !selector.settings.ignore_blanks
+            && selector.settings.reverse == self.reverse
     }
 }
 
@@ -788,9 +798,10 @@ impl<'a> Line<'a> {
             match selector.settings.mode {
                 SortMode::Numeric | SortMode::HumanNumeric => {
                     // find out which range is used for numeric comparisons
+                    // GNU marks a lowercase unit as not part of the key, even with -f.
                     let mut parse_settings = settings
                         .numeric_locale
-                        .num_info_settings(selector.settings.mode == SortMode::HumanNumeric);
+                        .num_info_settings(selector.settings.mode == SortMode::HumanNumeric, false);
                     // Debug annotations should ignore thousands separators to match GNU output.
                     parse_settings.thousands_separator = None;
                     let (_, num_range) =
@@ -842,7 +853,7 @@ impl<'a> Line<'a> {
                     let initial_selection = &self.line[selection.clone()];
                     let first_non_blank = initial_selection
                         .iter()
-                        .position(|c| !c.is_ascii_whitespace())
+                        .position(|&c| !is_blank(c))
                         .unwrap_or(initial_selection.len());
 
                     let (parsed, match_len) = month_parse(initial_selection);
@@ -1369,7 +1380,10 @@ impl FieldSelector {
             // Parse NumInfo for this number.
             let (info, num_range) = NumInfo::parse(
                 range_str,
-                &numeric_locale.num_info_settings(self.settings.mode == SortMode::HumanNumeric),
+                &numeric_locale.num_info_settings(
+                    self.settings.mode == SortMode::HumanNumeric,
+                    self.settings.ignore_case,
+                ),
             );
             // Shorten the range to what we need to pass to numeric_str_cmp later.
             range_str = &range_str[num_range];
@@ -1430,7 +1444,7 @@ impl FieldSelector {
                     idx += line[idx..]
                         .iter()
                         .enumerate()
-                        .find(|(_, c)| !c.is_ascii_whitespace())
+                        .find(|(_, c)| !is_blank(**c))
                         .map_or(line[idx..].len(), |(idx, _)| idx);
                 }
                 // apply the character index
@@ -1518,49 +1532,23 @@ fn make_sort_mode_arg(mode: &'static str, short: char, help: String) -> Arg {
         .action(ArgAction::SetTrue)
 }
 
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "redox",
-        target_os = "fuchsia",
-        target_os = "haiku",
-        target_os = "solaris",
-        target_os = "illumos"
-    ))
-))]
+#[cfg(unix)]
 fn get_rlimit() -> UResult<usize> {
-    use rustix::process::{Resource, getrlimit};
+    use rlimit::{Resource, getrlimit};
 
-    let rlim_cur = getrlimit(Resource::Nofile)
-        .current
-        .ok_or_else(|| UUsageError::new(2, translate!("sort-failed-fetch-rlimit")))?;
+    let (rlim_cur, _) = getrlimit(Resource::NOFILE)
+        .map_err(|_| UUsageError::new(2, translate!("sort-failed-fetch-rlimit")))?;
 
     usize::try_from(rlim_cur)
         .map_err(|_| UUsageError::new(2, translate!("sort-failed-fetch-rlimit")))
 }
 
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "redox",
-        target_os = "fuchsia",
-        target_os = "haiku",
-        target_os = "solaris",
-        target_os = "illumos"
-    ))
-))]
+#[cfg(unix)]
 pub(crate) fn fd_soft_limit() -> Option<usize> {
     get_rlimit().ok()
 }
 
-#[cfg(any(
-    not(unix),
-    target_os = "redox",
-    target_os = "fuchsia",
-    target_os = "haiku",
-    target_os = "solaris",
-    target_os = "illumos"
-))]
+#[cfg(not(unix))]
 pub(crate) fn fd_soft_limit() -> Option<usize> {
     None
 }
@@ -2134,6 +2122,19 @@ fn emit_debug_warnings(
     }
 }
 
+/// Whether option `id` was given several times with differing values.
+/// Repeating an option is fine as long as every occurrence has the same value.
+fn has_conflicting_values<T>(matches: &ArgMatches, id: &str) -> bool
+where
+    T: Clone + PartialEq + Send + Sync + 'static,
+{
+    matches.get_many::<T>(id).is_some_and(|mut values| {
+        values
+            .next()
+            .is_some_and(|first| values.any(|value| value != first))
+    })
+}
+
 #[uucore::main]
 #[allow(clippy::cognitive_complexity)]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
@@ -2174,16 +2175,14 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), processed_args, 2)?;
 
     // Prevent -o/--output to be specified multiple times
-    if matches
-        .get_many::<OsString>(options::OUTPUT)
-        .is_some_and(|mut outputs| {
-            outputs
-                .next()
-                .as_ref()
-                .is_some_and(|first| outputs.any(|out| out != *first))
-        })
-    {
+    if has_conflicting_values::<OsString>(&matches, options::OUTPUT) {
         return Err(SortError::MultipleOutputFiles.into());
+    }
+
+    // Prevent -t/--field-separator from being given different values. Raw
+    // values suffice: `\0` is the only spelling rewritten later, and argv cannot hold a NUL.
+    if has_conflicting_values::<OsString>(&matches, options::SEPARATOR) {
+        return Err(SortError::IncompatibleTabs.into());
     }
 
     settings.debug = matches.get_flag(options::DEBUG);
@@ -2282,17 +2281,17 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     settings.ignore_non_printing = ignore_non_printing;
     settings.ignore_case = ignore_case;
 
-    // WASI doesn't support threads, so we ignore the corresponding option
+    let threads = match matches.get_one::<String>(options::PARALLEL) {
+        Some(value) => parse_parallel(value)?,
+        None => std::thread::available_parallelism().map_or(1, |n| n.get() as u64),
+    };
+    // WASI doesn't support threads, so the value is only validated there
     #[cfg(not(target_os = "wasi"))]
-    {
-        let threads = matches
-            .get_one::<u64>(options::PARALLEL)
-            .copied()
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u64));
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads as usize)
-            .build_global();
-    }
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads as usize)
+        .build_global();
+    #[cfg(target_os = "wasi")]
+    let _ = threads;
 
     if let Some(size_str) = matches.get_one::<String>(options::BUF_SIZE) {
         settings.buffer_size = GlobalSettings::parse_byte_count(size_str).map_err(|error| {
@@ -2416,7 +2415,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     } else if settings.check && files.len() != 1 {
         return Err(UUsageError::new(
             2,
-            translate!("sort-extra-operand-not-allowed-with-c", "operand" => files[1].quote()),
+            translate_text!("sort-extra-operand-not-allowed-with-c", "operand" => files[1].quote()),
         ));
     }
 
@@ -2688,7 +2687,9 @@ pub fn uu_app() -> Command {
             .short('t')
             .long(options::SEPARATOR)
             .help(translate!("sort-help-separator"))
-            .value_parser(ValueParser::os_string()),
+            .value_parser(ValueParser::os_string())
+            // To detect differing occurrences and raise an error
+            .action(ArgAction::Append),
     )
     .arg(
         Arg::new(options::ZERO_TERMINATED)
@@ -2701,7 +2702,7 @@ pub fn uu_app() -> Command {
         Arg::new(options::PARALLEL)
             .long(options::PARALLEL)
             .help(translate!("sort-help-parallel"))
-            .value_parser(clap::value_parser!(u64).range(1..))
+            .allow_hyphen_values(true)
             .value_name("NUM_THREADS"),
     )
     .arg(
@@ -3260,7 +3261,7 @@ enum Month {
 }
 
 /// Cached locale month lookup table.
-/// Each entry is (uppercased_name, month_value).
+/// Each entry is (`uppercased_name`, `month_value`).
 type MonthTable = Vec<(Vec<u8>, Month)>;
 
 fn get_locale_month_table() -> Option<&'static MonthTable> {
@@ -3300,7 +3301,12 @@ fn get_locale_month_table() -> Option<&'static MonthTable> {
 /// Comparison against input is case-insensitive but NOT blank-insensitive:
 /// the input must match the stored name exactly (after leading blank trimming).
 fn month_parse(line: &[u8]) -> (Month, usize) {
-    let line = line.trim_ascii_start();
+    let mut line = line;
+    while let [first, rest @ ..] = line
+        && is_blank(*first)
+    {
+        line = rest;
+    }
 
     // Try locale-specific month names, keeping the longest match.
     // This handles cases where one name is a prefix of another
@@ -3426,6 +3432,33 @@ fn open_with_open_failed_error(path: impl AsRef<OsStr>) -> UResult<Box<dyn Read 
             error,
         }
         .into()),
+    }
+}
+
+/// The thread count of `--parallel`, reported as GNU does: a leading `+`
+/// is accepted, zero is refused, and a value that is not a number, or has
+/// a suffix, is an invalid argument.
+fn parse_parallel(value: &str) -> UResult<u64> {
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    let invalid = |key: &str| {
+        USimpleError::new(
+            2,
+            translate!(key, "option" => options::PARALLEL, "arg" => value.quote()),
+        )
+    };
+    if !digits.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(invalid("sort-invalid-option-arg"));
+    }
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid("sort-invalid-suffix-in-option-arg"));
+    }
+    match digits.parse::<u64>() {
+        Ok(0) => Err(USimpleError::new(
+            2,
+            translate!("sort-parallel-must-be-nonzero"),
+        )),
+        Ok(threads) => Ok(threads),
+        Err(_) => Err(invalid("sort-option-arg-too-large")),
     }
 }
 

@@ -1000,6 +1000,24 @@ fn test_raw_multiple_files() {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+fn test_write_error() {
+    // A normal line fails at its newline. The raw digest has no newline, so
+    // only a flush reports its write error.
+    for args in [&["lorem_ipsum.txt"][..], &["--raw", "lorem_ipsum.txt"]] {
+        let dev_full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        new_ucmd!()
+            .args(args)
+            .set_stdout(dev_full)
+            .fails_with_code(1)
+            .stderr_is("cksum: write error: No space left on device\n");
+    }
+}
+
+#[test]
 fn test_base64_raw_conflicts() {
     new_ucmd!()
         .arg("--base64")
@@ -3888,4 +3906,17 @@ fn test_locale_aware_error_filename_escaping() {
             .fails_with_code(1)
             .stderr_is("cksum: 'file_x(y': No such file or directory\n");
     }
+}
+
+#[test]
+#[cfg(not(windows))]
+fn test_numeric_looking_directory_names_are_kept_verbatim() {
+    // Names such as "007" or "1e3" must not be reformatted as numbers
+    // in error messages.
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("007");
+    at.mkdir("1e3");
+    ucmd.args(&["007", "1e3"])
+        .fails_with_code(1)
+        .stderr_is("cksum: 007: Is a directory\ncksum: 1e3: Is a directory\n");
 }

@@ -45,18 +45,22 @@ use flags::{CONTROL_CHARS, CONTROL_FLAGS, INPUT_FLAGS, LOCAL_FLAGS, OUTPUT_FLAGS
 const ASCII_DEL: u8 = 127;
 
 // Sane defaults for control characters.
-const SANE_CONTROL_CHARS: [(S, u8); 12] = [
-    (S::VINTR, 3),     // ^C
-    (S::VQUIT, 28),    // ^\
-    (S::VERASE, 127),  // DEL
-    (S::VKILL, 21),    // ^U
-    (S::VEOF, 4),      // ^D
-    (S::VSTART, 17),   // ^Q
-    (S::VSTOP, 19),    // ^S
-    (S::VSUSP, 26),    // ^Z
+const SANE_CONTROL_CHARS: &[(S, u8)] = &[
+    (S::VINTR, 3),    // ^C
+    (S::VQUIT, 28),   // ^\
+    (S::VERASE, 127), // DEL
+    (S::VKILL, 21),   // ^U
+    (S::VEOF, 4),     // ^D
+    (S::VSTART, 17),  // ^Q
+    (S::VSTOP, 19),   // ^S
+    (S::VSUSP, 26),   // ^Z
+    #[cfg(not(target_os = "haiku"))]
     (S::VREPRINT, 18), // ^R
-    (S::VWERASE, 23),  // ^W
-    (S::VLNEXT, 22),   // ^V
+    #[cfg(not(target_os = "haiku"))]
+    (S::VWERASE, 23), // ^W
+    #[cfg(not(target_os = "haiku"))]
+    (S::VLNEXT, 22), // ^V
+    #[cfg(not(target_os = "haiku"))]
     (S::VDISCARD, 15), // ^O
 ];
 
@@ -459,7 +463,7 @@ fn invalid_speed<T>(arg: &str, speed: &str) -> Result<T, Box<dyn UError>> {
 /// this function returns the appropriate error message in the case of overflow or underflow, or u8 on success
 fn parse_u8_or_err(arg: &str) -> Result<u8, String> {
     arg.parse::<u8>().map_err(|e| {
-        if let IntErrorKind::PosOverflow = e.kind() {
+        if *e.kind() == IntErrorKind::PosOverflow {
             translate!("stty-error-invalid-integer-argument-value-too-large", "value" => format!("'{arg}'"))
         } else {
             translate!("stty-error-invalid-integer-argument", "value" => format!("'{arg}'"))
@@ -470,7 +474,7 @@ fn parse_u8_or_err(arg: &str) -> Result<u8, String> {
 /// Parse an integer with hex (0x/0X) and octal (0) prefix support, wrapping to u16.
 ///
 /// GNU stty uses an unsigned 32-bit integer for row/col sizes, then wraps to 16 bits.
-/// Returns `None` if parsing fails or value exceeds u32::MAX.
+/// Returns [`None`] if parsing fails or value exceeds [`u32::MAX`].
 fn parse_rows_cols(arg: &str) -> Option<u16> {
     u64::extended_parse(arg)
         .ok()
@@ -538,7 +542,7 @@ struct WrappedPrinter {
 
 impl WrappedPrinter {
     /// Creates a new printer with the specified terminal width.
-    /// If term_size is None (typically when output is piped), falls back to
+    /// If `term_size` is None (typically when output is piped), falls back to
     /// the COLUMNS environment variable or a default width of 80 columns.
     fn new(term_size: Option<&Winsize>) -> Self {
         let columns = if let Some(term_size) = term_size {
@@ -585,19 +589,13 @@ impl WrappedPrinter {
     }
 }
 
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "needed for some platform-specific code"
-)]
 fn print_terminal_size(
-    termios: &Termios,
+    termios: &rustix::termios::Termios,
     opts: &Options,
     window_size: Option<&Winsize>,
     term_size: Option<&Winsize>,
-) -> io::Result<()> {
-    // GNU linked against glibc 2.42 provides us baudrate 51 which panics cfgetospeed
-    // so we repeat syscall... use termios.output_speed() instead if we switched to rustix instead.
-    let speed = rustix::termios::tcgetattr(&opts.file)?.output_speed();
+) {
+    let speed = termios.output_speed();
     let mut printer = WrappedPrinter::new(window_size);
     printer.print(&translate!("stty-output-speed", "speed" => speed));
     if opts.all {
@@ -612,10 +610,7 @@ fn print_terminal_size(
         let line = termios.line_discipline;
         printer.print(&translate!("stty-output-line", "line" => line));
     }
-    #[cfg(not(any(target_os = "linux", target_os = "redox")))]
-    let _ = termios; // remove this hack when we switched to rustix completely
     printer.flush();
-    Ok(())
 }
 
 fn cc_to_index(option: &str) -> Option<S> {
@@ -822,7 +817,15 @@ fn print_settings(termios: &Termios, opts: &Options) -> io::Result<()> {
             &tcgetwinsize(stdout).ok()
         };
 
-        print_terminal_size(termios, opts, window_size.as_ref(), term_size.as_ref())?;
+        // GNU linked against glibc 2.42 provides us baudrate 51 which panics nix::sys::termios::cfgetospeed
+        // so we repeat syscall until we replace nix with rustix...
+        let rustix_termios = rustix::termios::tcgetattr(&opts.file)?;
+        print_terminal_size(
+            &rustix_termios,
+            opts,
+            window_size.as_ref(),
+            term_size.as_ref(),
+        );
         print_control_chars(termios, opts, window_size.as_ref())?;
         print_flags(termios, opts, CONTROL_FLAGS, window_size.as_ref());
         print_flags(termios, opts, INPUT_FLAGS, window_size.as_ref());
@@ -842,14 +845,11 @@ fn print_flags<T: TermiosFlag>(
     for &Flag {
         name,
         flag,
-        show,
         sane,
         group,
-    } in flags
+        ..
+    } in flags.iter().filter(|f| f.show)
     {
-        if !show {
-            continue;
-        }
         let val = flag.is_in(termios, group);
         if group.is_some() {
             if val && (!sane || opts.all) {
@@ -1026,9 +1026,13 @@ fn combo_to_flags(combo: &str) -> Vec<ArgOptions<'_>> {
             (S::VSTART, "^Q"),
             (S::VSTOP, "^S"),
             (S::VSUSP, "^Z"),
+            #[cfg(not(target_os = "haiku"))]
             (S::VREPRINT, "^R"),
+            #[cfg(not(target_os = "haiku"))]
             (S::VWERASE, "^W"),
+            #[cfg(not(target_os = "haiku"))]
             (S::VLNEXT, "^V"),
+            #[cfg(not(target_os = "haiku"))]
             (S::VDISCARD, "^O"),
         ],
         _ => &[],
@@ -1084,16 +1088,11 @@ fn combo_to_flags(combo: &str) -> Vec<ArgOptions<'_>> {
 }
 
 fn get_sane_control_char(cc_index: S) -> u8 {
-    for (sane_index, sane_val) in SANE_CONTROL_CHARS {
-        if sane_index == cc_index {
-            return sane_val;
-        }
-    }
-    // Default values for control chars not in the sane list
-    match cc_index {
-        S::VMIN => 1,
-        _ => 0,
-    }
+    SANE_CONTROL_CHARS
+        .iter()
+        .copied()
+        .find_map(|(i, v)| (i == cc_index).then_some(v))
+        .unwrap_or(u8::from(cc_index == S::VMIN))
 }
 
 pub fn uu_app() -> Command {
