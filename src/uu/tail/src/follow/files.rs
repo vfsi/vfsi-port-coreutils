@@ -138,22 +138,36 @@ impl FileHandling {
 
     /// Read new data from `path` and print it to stdout
     pub fn tail_file(&mut self, path: &Path, verbose: bool) -> UResult<bool> {
+        self.tail_file_with(path, verbose, |chunks| {
+            let mut writer = BufWriter::new(stdout().lock());
+            chunks.write(&mut writer)?;
+            writer.flush()?;
+            Ok(())
+        })
+    }
+
+    fn tail_file_with(
+        &mut self,
+        path: &Path,
+        verbose: bool,
+        output: impl FnOnce(&BytesChunkBuffer) -> UResult<()>,
+    ) -> UResult<bool> {
         let mut chunks = BytesChunkBuffer::new(u64::MAX);
         if let Some(reader) = self.get_mut(path).reader.as_mut() {
             chunks.fill(reader)?;
         }
         if chunks.has_data() {
+            // Output can prompt a producer to truncate immediately. Record the
+            // previous length before publishing bytes, not after that reaction.
+            self.update_metadata(path, None);
             if self.needs_header(path, verbose) {
                 let display_name = self.get(path).display_name.clone();
                 self.header_printer.print(display_name.as_str())?;
             }
 
-            let mut writer = BufWriter::new(stdout().lock());
-            chunks.write(&mut writer)?;
-            writer.flush()?;
+            output(&chunks)?;
 
             self.last.replace(path.to_owned());
-            self.update_metadata(path, None);
             Ok(true)
         } else {
             Ok(false)
@@ -221,5 +235,42 @@ impl PathData {
             data.display_name.as_str(),
             path.is_symlink(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_triggered_truncation_keeps_the_previous_length() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"ready\n").unwrap();
+        let path = file.path();
+        let mut files = FileHandling::from(&Settings::default());
+        files.insert(
+            path,
+            PathData::new(
+                Some(Box::new(BufReader::new(File::open(path).unwrap()))),
+                Some(file.as_file().metadata().unwrap()),
+                "log",
+                false,
+            ),
+            true,
+        );
+
+        let mut output = Vec::new();
+        assert!(
+            files
+                .tail_file_with(path, false, |chunks| {
+                    chunks.write(&mut output)?;
+                    file.as_file().set_len(0)?;
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!(output, b"ready\n");
+        assert_eq!(file.as_file().metadata().unwrap().len(), 0);
+        assert_eq!(files.get(path).metadata.as_ref().unwrap().len(), 6);
     }
 }

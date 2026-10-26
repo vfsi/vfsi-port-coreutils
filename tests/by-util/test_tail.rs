@@ -2283,10 +2283,34 @@ fn test_follow_name_remove() {
     }
 }
 
-#[uutests::wasi_ignore(TailFollowDisabled)]
-#[test]
+fn wait_for_output(child: &mut uutests::util::UChild, stdout: &str, stderr: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child.stdout_all() == stdout && child.stderr_all() == stderr {
+            return;
+        }
+        if !child.is_alive() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        child.delay(10);
+    }
+    // Reap the follower before asserting, including when a phase times out.
+    child
+        .kill()
+        .make_assertion()
+        .with_all_output()
+        .stdout_is(stdout)
+        .stderr_is(stderr);
+    panic!("tail did not produce the expected output before the deadline");
+}
+
+#[rstest]
+#[case::immediate(0, 0)]
+#[case::delayed_truncate(1500, 0)]
+#[case::delayed_restore(0, 1500)]
 #[cfg(all(not(target_os = "android"), not(target_os = "freebsd")))] // FIXME: for currently not working platforms
-fn test_follow_name_truncate1() {
+#[uutests::wasi_ignore(TailFollowDisabled)]
+fn test_follow_name_truncate1(#[case] truncate_delay: u64, #[case] restore_delay: u64) {
     // This test triggers a truncate event while `tail --follow=name file` is running.
     // $ cp file backup && head file > file && sleep 1 && cp backup file
 
@@ -2296,68 +2320,59 @@ fn test_follow_name_truncate1() {
     let source = FOLLOW_NAME_TXT;
     let backup = "backup";
 
-    let expected_stdout = at.read(FOLLOW_NAME_EXP);
-    // `expected_stdout` starts with tail's initial static output (the last 10 lines);
-    // everything after that only appears once the truncate/restore below are observed.
-    let initial_stdout = &expected_stdout[..expected_stdout.find("END(25)\n").unwrap() + 8];
+    let fixture_stdout = at.read(FOLLOW_NAME_EXP);
+    let initial_end = fixture_stdout.find("END(25)\n").unwrap() + 8;
+    let initial_stdout = &fixture_stdout[..initial_end];
+    let ready_stdout = format!("{initial_stdout}ready\n");
+    let expected_stdout = format!("{ready_stdout}{}", &fixture_stdout[initial_end..]);
     let expected_stderr = format!("{}: {source}: file truncated\n", ts.util_name);
 
     let args = ["--follow=name", source];
     let mut p = ts.ucmd().args(&args).run_no_wait();
-    let delay = 1000;
     p.make_assertion().is_alive();
 
-    // Wait for tail's initial read of `source` to finish before mutating it below.
-    // Watch registration happens before this initial output is printed, so once it
-    // appears the truncate/restore below are guaranteed to be observed as events.
-    // A fixed delay isn't enough here: a slow-starting child process (observed on
-    // macOS CI, see #12335) can otherwise race ahead of tail's own startup.
-    for _ in 0..500 {
-        if p.stdout_all() == initial_stdout {
-            break;
-        }
-        p.delay(10);
-    }
-
+    wait_for_output(&mut p, initial_stdout, "");
+    // Save the original contents so restoration does not replay the readiness marker.
     at.copy(source, backup);
-    p.delay(delay);
+    // Initial output is flushed before add_path records the follow state. Only
+    // observing a subsequent append proves the follow loop is ready to truncate.
+    at.append(source, "ready\n");
+    wait_for_output(&mut p, &ready_stdout, "");
 
-    at.touch(source); // trigger truncate
-    p.delay(delay);
+    let source_path = at.plus(source);
+    let backup_path = at.plus(backup);
+    std::thread::scope(|scope| {
+        let (restore, restore_requested) = std::sync::mpsc::channel();
+        // Delay each mutation independently to exercise the waits, not just startup.
+        // The channel prevents restoring before the test observes the truncation.
+        scope.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(truncate_delay));
+            File::create(&source_path).unwrap();
+            if restore_requested.recv().is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(restore_delay));
+                std::fs::copy(backup_path, source_path).unwrap();
+            }
+        });
 
-    at.copy(backup, source);
-    p.delay(delay);
+        // Do not restore until tail has actually observed the shorter file:
+        // notifications alone cannot recover its intermediate length afterward.
+        wait_for_output(&mut p, &ready_stdout, &expected_stderr);
+        restore.send(()).unwrap();
+        wait_for_output(&mut p, &expected_stdout, &expected_stderr);
 
-    p.make_assertion().is_alive();
-    p.kill()
-        .make_assertion()
-        .with_all_output()
-        .stderr_is(expected_stderr)
-        .stdout_is(expected_stdout);
+        p.make_assertion().is_alive();
+        p.kill()
+            .make_assertion()
+            .with_all_output()
+            .stderr_is(&expected_stderr)
+            .stdout_is(&expected_stdout);
+    });
 }
 
 #[uutests::wasi_ignore(TailFollowDisabled)]
 #[test]
 #[cfg(all(not(target_os = "android"), not(target_os = "freebsd")))] // FIXME: for currently not working platforms
 fn test_follow_name_truncate2() {
-    fn wait_for_output(
-        child: &mut uutests::util::UChild,
-        expected_stdout: &str,
-        expected_stderr: &str,
-    ) {
-        for _ in 0..500 {
-            if child.stdout_all() == expected_stdout && child.stderr_all() == expected_stderr {
-                return;
-            }
-            child.delay(10);
-        }
-        child
-            .make_assertion()
-            .with_all_output()
-            .stdout_is(expected_stdout)
-            .stderr_is(expected_stderr);
-    }
-
     // This test triggers a truncate event while `tail --follow=name file` is running.
     // $ ((sleep 1 && echo -n "x\nx\nx\n" >> file && sleep 1 && \
     // echo -n "x\n" > file &)>/dev/null 2>&1 &) ; tail --follow=name file
@@ -2420,7 +2435,7 @@ fn test_follow_name_truncate3() {
     p.make_assertion_with_delay(delay).is_alive();
 
     at.truncate(source, "x\n");
-    p.delay(delay);
+    wait_for_output(&mut p, expected_stdout, "");
 
     p.make_assertion().is_alive();
     p.kill()
