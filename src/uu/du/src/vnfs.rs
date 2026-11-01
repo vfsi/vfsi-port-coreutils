@@ -178,7 +178,7 @@ fn traverse<F: Vfsi>(
                                     max_time(parent.latest_time, child.latest_time);
                             }
                             send(print_tx, child, event.depth)
-                                .map_err(|_| vnfs::Error::client(0, libc::EPIPE as u32))?;
+                                .map_err(|_| vnfs::Error::errno(0, libc::EPIPE as u32))?;
                         } else if event.depth == 0 {
                             total = Some(child);
                         }
@@ -204,7 +204,7 @@ fn traverse<F: Vfsi>(
                 }
                 let metadata = event.entry.attrs();
                 let usage = usage_from_attrs(&rendered, metadata, options)
-                    .map_err(|_| vnfs::Error::client(0, libc::ENOTSUP as u32))?;
+                    .map_err(|_| vnfs::Error::errno(0, libc::ENOTSUP as u32))?;
                 if event.kind == WalkEventKind::Enter {
                     stack.push(Some(usage));
                 } else {
@@ -222,7 +222,7 @@ fn traverse<F: Vfsi>(
                     }
                     if options.all {
                         send(print_tx, usage, event.depth)
-                            .map_err(|_| vnfs::Error::client(0, libc::EPIPE as u32))?;
+                            .map_err(|_| vnfs::Error::errno(0, libc::EPIPE as u32))?;
                     }
                 }
                 Ok(WalkControl::Continue)
