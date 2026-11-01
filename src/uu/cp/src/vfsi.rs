@@ -70,7 +70,7 @@ enum Backend {
 impl Backend {
     fn read_files(&self, paths: &[PathBuf], limit: usize) -> VfResult<Vec<Vec<u8>>> {
         let limit = std::num::NonZeroUsize::new(limit)
-            .ok_or_else(|| VfError::failure(0, libc::EINVAL as u32))?;
+            .ok_or_else(|| VfError::errno(0, libc::EINVAL as u32))?;
         let options = ReadOptions::new().with_max_total_bytes(limit);
         match self {
             Self::Dummy(fs) => fs.read_files_with_options(paths, options),
