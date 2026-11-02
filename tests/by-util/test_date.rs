@@ -1415,6 +1415,39 @@ fn test_date_tz_with_relative_time() {
 
 #[uutests::wasi_ignore(NoTzdb)]
 #[test]
+fn test_date_tz_with_current_relative_time() {
+    // Current zone abbreviations can change with tzdata (Vancouver became
+    // permanent UTC-7 in 2026). Verify the selected zone, not a seasonal name.
+    let output_format = "%s %Y-%m-%d %H:%M:%S %Z %z";
+    for tz in ["America/Vancouver", "Asia/Kolkata"] {
+        let before = Timestamp::now().as_second() - 3600;
+        let result = new_ucmd!()
+            .env("TZ", tz)
+            .arg("-d")
+            .arg("1 hour ago")
+            .arg(format!("+{output_format}"))
+            .succeeds();
+        let after = Timestamp::now().as_second() - 3600;
+        let seconds: i64 = result
+            .stdout_str()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (before..=after).contains(&seconds),
+            "relative result {seconds} outside {before}..={after} for TZ={tz}"
+        );
+        let expected = Timestamp::from_second(seconds)
+            .unwrap()
+            .to_zoned(TimeZone::get(tz).unwrap());
+        result.stdout_only(format!("{}\n", expected.strftime(output_format)));
+    }
+}
+
+#[uutests::wasi_ignore(NoTzdb)]
+#[test]
 fn test_date_utc_time() {
     // Test that -u flag shows correct UTC time
     // We get 2 UTC times just in case we're really unlucky and this runs around
