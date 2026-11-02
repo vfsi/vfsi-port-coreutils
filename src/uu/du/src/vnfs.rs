@@ -6,10 +6,10 @@
 //! Opt-in VFSI-backed traversal for `du` on Linux NFS mounts.
 //!
 //! When `VNFS_IMPL=dummy|nfs` and the operand lies on an NFS mount, traversal
-//! visits one bounded directory at a time through the high-level `vnfs` API.
+//! batches bounded directory pages through the high-level `vnfs` API.
 //! It asks the server for file attributes in the `READDIR` reply instead of issuing one kernel
 //! `lstat` per entry. Enabling it does not change the output: this module
-//! reproduces the parent module's post-order walk, hard-link deduplication,
+//! preserves post-order directory totals, hard-link deduplication,
 //! `--exclude`, `-S`, `-a`, `--time`, `--inodes`, and `--apparent-size`
 //! handling. Unsupported modes and connection setup failures use the standard
 //! traversal. Errors after traversal starts are reported without replaying
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::SystemTime;
 
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use uucore::display::Quotable;
 use uucore::error::UResult;
 use uucore::fsext::MetadataTimeField;
@@ -28,8 +28,8 @@ use uucore::libc;
 use uucore::translate;
 
 use vnfs::directory::{
-    Attributes, Attrs as Metadata, AttrsOptions, FileType as VfType, WalkControl, WalkEventKind,
-    WalkOptions,
+    Attributes, Attrs as Metadata, AttrsOptions, DirectoryListing, FileType as VfType,
+    ListDirControl, TraversalCompletion,
 };
 use vnfs::files::{Vfsi, VfsiExt};
 use vnfs::nfs::Nfs;
@@ -109,6 +109,13 @@ fn max_time(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime> 
     }
 }
 
+fn accumulate(total: &mut Usage, usage: &Usage) {
+    total.size += usage.size;
+    total.blocks += usage.blocks;
+    total.inodes += usage.inodes;
+    total.latest_time = max_time(total.latest_time, usage.latest_time);
+}
+
 fn send(
     print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
     usage: Usage,
@@ -129,14 +136,6 @@ fn traverse<F: Vfsi>(
     options: &TraversalOptions,
     print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
 ) -> io::Result<Usage> {
-    let print_path = |backend_path: &Path| -> PathBuf {
-        match backend_path.strip_prefix(vroot) {
-            Ok(rest) if rest.as_os_str().is_empty() => path.to_path_buf(),
-            Ok(rest) => path.join(rest),
-            Err(_) => path.to_path_buf(),
-        }
-    };
-
     let masks = attr_mask(options);
     let root_attrs = backend
         .attrs_with_options(
@@ -151,85 +150,185 @@ fn traverse<F: Vfsi>(
         return usage_from_attrs(path, &root_attrs, options);
     }
 
-    let mut seen: HashSet<FileInfo> = HashSet::default();
-    let mut stack: Vec<Option<Usage>> = Vec::new();
-    let mut total = None;
-    backend
-        .listdir(
-            vroot,
-            WalkOptions::new(
-                backend
-                    .limits()
-                    .walk_options()
-                    .with_fields(masks)
-                    .with_recursive(true),
-            )
-            .with_enter_leave(true),
-            |event| {
-                let rendered = print_path(event.entry.path());
-                if event.kind == WalkEventKind::Leave {
-                    if let Some(Some(child)) = stack.pop() {
-                        if let Some(Some(parent)) = stack.last_mut() {
-                            if !options.separate_dirs {
-                                parent.size += child.size;
-                                parent.blocks += child.blocks;
-                                parent.inodes += child.inodes;
-                                parent.latest_time =
-                                    max_time(parent.latest_time, child.latest_time);
-                            }
-                            send(print_tx, child, event.depth)
-                                .map_err(|_| vnfs::Error::errno(0, libc::EPIPE as u32))?;
-                        } else if event.depth == 0 {
-                            total = Some(child);
-                        }
-                    }
-                    return Ok(WalkControl::Continue);
-                }
-                let name = rendered.file_name().map(|n| n.to_string_lossy());
-                let excluded = options.excludes.iter().any(|pattern| {
-                    pattern.matches(&rendered.to_string_lossy())
-                        || name.as_deref().is_some_and(|n| pattern.matches(n))
-                });
-                if event.depth > 0 && excluded {
-                    if options.verbose {
-                        println!(
-                            "{}",
-                            translate!("du-verbose-ignored", "path" => rendered.quote())
-                        );
-                    }
-                    if event.kind == WalkEventKind::Enter {
-                        stack.push(None);
-                    }
-                    return Ok(WalkControl::SkipSubtree);
-                }
-                let metadata = event.entry.attrs();
-                let usage = usage_from_attrs(&rendered, metadata, options)
-                    .map_err(|_| vnfs::Error::errno(0, libc::ENOTSUP as u32))?;
-                if event.kind == WalkEventKind::Enter {
-                    stack.push(Some(usage));
-                } else {
-                    if let Some(info) = file_info(metadata)
-                        && !options.count_links
-                        && !seen.insert(info)
-                    {
-                        return Ok(WalkControl::Continue);
-                    }
-                    if let Some(Some(parent)) = stack.last_mut() {
-                        parent.size += usage.size;
-                        parent.blocks += usage.blocks;
-                        parent.inodes += 1;
-                        parent.latest_time = max_time(parent.latest_time, usage.latest_time);
-                    }
-                    if options.all {
-                        send(print_tx, usage, event.depth)
-                            .map_err(|_| vnfs::Error::errno(0, libc::EPIPE as u32))?;
-                    }
-                }
-                Ok(WalkControl::Continue)
-            },
+    traverse_pages(path, vroot, &root_attrs, options, print_tx, |visitor| {
+        backend.vlistdirs(
+            &[vroot],
+            backend
+                .limits()
+                .walk_options()
+                .with_fields(masks)
+                .with_allow_symlink_components(false),
+            visitor,
         )
-        .map_err(io::Error::other)?;
-    total.ok_or_else(|| io::Error::other("vnfs walk did not finish its root"))
+    })
+}
+
+/// Aggregate pages independently of transport, so identity changes between
+/// observations can be tested deterministically without racing the filesystem.
+fn traverse_pages(
+    path: &Path,
+    vroot: &Path,
+    root_attrs: &Metadata,
+    options: &TraversalOptions,
+    print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
+    visit: impl FnOnce(
+        &mut dyn FnMut(usize, DirectoryListing) -> vnfs::Result<ListDirControl>,
+    ) -> vnfs::Result<Vec<TraversalCompletion>>,
+) -> io::Result<Usage> {
+    // Admission and accounting are separate: the native recursive pager may
+    // batch approved siblings, but never lists excluded child directories.
+    // Retain only one accumulator per directory, bounded by the walk's shared
+    // entry/path budgets; file metadata and pages are consumed immediately.
+    struct Directory {
+        usage: Usage,
+        parent: usize,
+        depth: usize,
+        position: usize,
+        entries: usize,
+    }
+    struct LinkedFile {
+        order: Vec<usize>,
+        usage: Usage,
+        parent: usize,
+        depth: usize,
+    }
+    let print_path = |backend_path: &Path| -> PathBuf {
+        match backend_path.strip_prefix(vroot) {
+            Ok(rest) if rest.as_os_str().is_empty() => path.to_path_buf(),
+            Ok(rest) => path.join(rest),
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    let mut directories = vec![Directory {
+        usage: usage_from_attrs(path, root_attrs, options)?,
+        parent: 0,
+        depth: 0,
+        position: 0,
+        entries: 0,
+    }];
+    let mut positions = HashMap::default();
+    positions.insert(vroot.to_path_buf(), 0usize);
+    let mut linked: HashMap<FileInfo, LinkedFile> = HashMap::default();
+    let mut counted: HashSet<FileInfo> = HashSet::default();
+    let completion = visit(&mut |index, listing| {
+        if index != 0 {
+            return Err(vnfs::Error::invalid_reply(None, "du: invalid root index"));
+        }
+        let parent = *positions
+            .get(&listing.path)
+            .ok_or_else(|| vnfs::Error::invalid_reply(None, "du: unadmitted directory page"))?;
+        let depth = directories[parent].depth + 1;
+        let mut pruned = Vec::new();
+        for entry in listing.entries {
+            let position = directories[parent].entries;
+            directories[parent].entries += 1;
+            let rendered = print_path(entry.path());
+            let name = rendered.file_name().map(|n| n.to_string_lossy());
+            let excluded = options.excludes.iter().any(|pattern| {
+                pattern.matches(&rendered.to_string_lossy())
+                    || name.as_deref().is_some_and(|n| pattern.matches(n))
+            });
+            if excluded {
+                if options.verbose {
+                    println!(
+                        "{}",
+                        translate!("du-verbose-ignored", "path" => rendered.quote())
+                    );
+                }
+                if entry.attrs().is_dir() {
+                    pruned.push(entry.path().to_path_buf());
+                }
+                continue;
+            }
+            let usage = usage_from_attrs(&rendered, entry.attrs(), options)
+                .map_err(|_| vnfs::Error::errno(0, libc::ENOTSUP as u32))?;
+            if entry.attrs().is_dir() {
+                let child = directories.len();
+                if positions
+                    .insert(entry.path().to_path_buf(), child)
+                    .is_some()
+                {
+                    return Err(vnfs::Error::invalid_reply(None, "du: duplicate directory"));
+                }
+                directories.push(Directory {
+                    usage,
+                    parent,
+                    depth,
+                    position,
+                    entries: 0,
+                });
+            } else {
+                if !options.count_links
+                    && let Some(info) = file_info(entry.attrs())
+                {
+                    // A move can expose the same single-link inode in
+                    // a later page. Link counts may also change between
+                    // observations: immediate and deferred ownership
+                    // must never count the same identity independently.
+                    if counted.contains(&info) {
+                        continue;
+                    }
+                    if entry.attrs().nlink() != Some(1) || linked.contains_key(&info) {
+                        // Discovery is batched, but hard-link attribution
+                        // follows the original DFS. Retain only linked files;
+                        // ordinary one-link files are consumed immediately.
+                        let mut order = vec![position];
+                        let mut ancestor = parent;
+                        while ancestor != 0 {
+                            order.push(directories[ancestor].position);
+                            ancestor = directories[ancestor].parent;
+                        }
+                        order.reverse();
+                        if linked
+                            .get(&info)
+                            .is_none_or(|previous| order < previous.order)
+                        {
+                            linked.insert(
+                                info,
+                                LinkedFile {
+                                    order,
+                                    usage,
+                                    parent,
+                                    depth,
+                                },
+                            );
+                        }
+                        continue;
+                    }
+                    counted.insert(info);
+                }
+                accumulate(&mut directories[parent].usage, &usage);
+                if options.all {
+                    send(print_tx, usage, depth)
+                        .map_err(|_| vnfs::Error::errno(0, libc::EPIPE as u32))?;
+                }
+            }
+        }
+        Ok(ListDirControl::Prune(pruned))
+    })
+    .map_err(io::Error::other)?;
+    if completion.as_slice() != [TraversalCompletion::Complete] {
+        return Err(io::Error::other("vnfs walk did not finish its root"));
+    }
+    drop(positions);
+    for file in linked.into_values() {
+        accumulate(&mut directories[file.parent].usage, &file.usage);
+        if options.all {
+            send(print_tx, file.usage, file.depth)?;
+        }
+    }
+    // Discovery always precedes descendants. Reverse reduction therefore emits
+    // every directory after its files and subdirectories, independent of page
+    // boundaries and sibling prefetch order. No complete tree of file entries
+    // or output lines is retained.
+    while directories.len() > 1 {
+        let child = directories.pop().unwrap();
+        if !options.separate_dirs {
+            accumulate(&mut directories[child.parent].usage, &child.usage);
+        }
+        send(print_tx, child.usage, child.depth)?;
+    }
+    Ok(directories.pop().unwrap().usage)
 }
 
 /// Compute `du` for `path` through VFSI.
@@ -430,6 +529,144 @@ mod tests {
     }
 
     #[test]
+    fn cross_directory_hardlinks_keep_depth_first_attribution() {
+        use vnfs::directory::{WalkControl, WalkEventKind, WalkOptions};
+        let mut subtree_first = false;
+        // Cover both insertion-ordered and reverse-insertion-ordered filesystems.
+        for directory_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            if directory_first {
+                write(&dir.path().join("a/first"), 5);
+                std::fs::hard_link(dir.path().join("a/first"), dir.path().join("z-link")).unwrap();
+            } else {
+                write(&dir.path().join("z-link"), 5);
+                std::fs::create_dir(dir.path().join("a")).unwrap();
+                std::fs::hard_link(dir.path().join("z-link"), dir.path().join("a/first")).unwrap();
+            }
+            // The existing lazy event walker defines the original DFS order;
+            // filesystem enumeration order itself is deliberately unspecified.
+            let fs = Posix::new(dir.path()).unwrap();
+            let mut first = None;
+            fs.listdir(
+                "/",
+                WalkOptions::new(fs.limits().walk_options()).with_enter_leave(true),
+                |event| {
+                    if event.kind == WalkEventKind::Entry && first.is_none() {
+                        first = Some(event.entry.path().to_path_buf());
+                    }
+                    Ok(WalkControl::Continue)
+                },
+            )
+            .unwrap();
+            let first = first.unwrap();
+            let inside = first == Path::new("/a/first");
+            subtree_first |= inside;
+            let mut opts = options();
+            opts.all = true;
+            let (emitted, total) = run(dir.path(), &opts);
+            assert_eq!(total.size, 5);
+            assert_eq!(
+                emitted.iter().find(|(p, ..)| p.ends_with("a")).unwrap().1,
+                if inside { 5 } else { 0 }
+            );
+            let winner = dir.path().join(first.strip_prefix("/").unwrap());
+            assert!(emitted.iter().any(|(p, ..)| *p == winner));
+            assert_eq!(emitted.len(), 2, "one alias and its directory");
+            opts.count_links = true;
+            let (emitted, total) = run(dir.path(), &opts);
+            assert_eq!(total.size, 10);
+            assert_eq!(emitted.len(), 3);
+        }
+        assert!(
+            subtree_first,
+            "exercise a descendant winning over a root alias"
+        );
+    }
+
+    #[test]
+    fn changing_names_and_link_counts_count_each_file_identity_once() {
+        use vnfs::directory::DirEntry;
+        for (first_links, second_links) in [(1, 1), (2, 1), (1, 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            write(&dir.path().join("source"), 5);
+            if first_links == 2 {
+                std::fs::hard_link(dir.path().join("source"), dir.path().join("extra")).unwrap();
+            }
+            let fs = Posix::new(dir.path()).unwrap();
+            let root = fs.attrs("/").unwrap();
+            let first = fs.attrs("/source").unwrap();
+            if second_links > first_links {
+                std::fs::hard_link(dir.path().join("source"), dir.path().join("extra")).unwrap();
+            } else if second_links < first_links {
+                std::fs::remove_file(dir.path().join("extra")).unwrap();
+            }
+            std::fs::rename(dir.path().join("source"), dir.path().join("destination")).unwrap();
+            let second = fs.attrs("/destination").unwrap();
+            assert_eq!(first.file_id(), second.file_id());
+            assert_eq!(first.nlink(), Some(first_links));
+            assert_eq!(second.nlink(), Some(second_links));
+            for count_links in [false, true] {
+                let mut opts = options();
+                opts.all = true;
+                opts.count_links = count_links;
+                let (tx, rx) = mpsc::channel();
+                // Supply real before/after metadata in separate virtual pages.
+                // This models a move into a later cohort, without timer races.
+                let pages = vec![
+                    DirectoryListing {
+                        path: "/".into(),
+                        entries: vec![
+                            DirEntry::new("/a".into(), root.clone()),
+                            DirEntry::new("/b".into(), root.clone()),
+                        ],
+                    },
+                    DirectoryListing {
+                        path: "/a".into(),
+                        entries: vec![DirEntry::new("/a/first".into(), first.clone())],
+                    },
+                    DirectoryListing {
+                        path: "/b".into(),
+                        entries: vec![DirEntry::new("/b/second".into(), second.clone())],
+                    },
+                ];
+                let total = traverse_pages(
+                    Path::new("out"),
+                    Path::new("/"),
+                    &root,
+                    &opts,
+                    &tx,
+                    |visitor| {
+                        for page in pages {
+                            assert_eq!(visitor(0, page)?, ListDirControl::Prune(Vec::new()));
+                        }
+                        Ok(vec![TraversalCompletion::Complete])
+                    },
+                )
+                .unwrap();
+                let emitted: Vec<_> = rx.try_iter().map(|item| item.unwrap()).collect();
+                assert_eq!(
+                    total.size,
+                    if count_links { 10 } else { 5 },
+                    "nlink {first_links}->{second_links}, count_links={count_links}"
+                );
+                assert_eq!(total.inodes, if count_links { 5 } else { 4 });
+                assert_eq!(emitted.len(), if count_links { 4 } else { 3 });
+                assert!(
+                    emitted
+                        .iter()
+                        .any(|item| item.usage.path == Path::new("out/a/first"))
+                );
+                assert_eq!(
+                    emitted
+                        .iter()
+                        .any(|item| item.usage.path == Path::new("out/b/second")),
+                    count_links
+                );
+            }
+        }
+    }
+
+    #[test]
     fn separate_dirs_excludes_subdirectory_totals() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("a"), 4);
@@ -461,5 +698,66 @@ mod tests {
         let (emitted, _) = run(dir.path(), &options);
         assert_eq!(emitted.len(), 1);
         assert!(emitted[0].0.ends_with("a"));
+    }
+
+    #[test]
+    fn batched_pages_keep_post_order_totals_across_cohorts_and_large_listings() {
+        let dir = tempfile::tempdir().unwrap();
+        // More siblings than the 32-directory cohort; more files than a page.
+        for i in 0..40 {
+            write(&dir.path().join(format!("d{i:02}/nested/file")), 3);
+        }
+        for i in 0..260 {
+            write(&dir.path().join(format!("top-{i:03}")), 2);
+        }
+        let mut options = options();
+        options.all = true;
+        let (emitted, total) = run(dir.path(), &options);
+        assert_eq!((total.size, total.inodes), (640, 381));
+        assert_eq!(emitted.len(), 380);
+        for (i, (path, size, inodes, depth)) in emitted.iter().enumerate() {
+            if path.is_dir() {
+                assert!(
+                    !emitted[i + 1..]
+                        .iter()
+                        .any(|(later, ..)| later.starts_with(path)),
+                    "directory {path:?} must follow every descendant"
+                );
+                assert_eq!(*size, 3);
+                assert_eq!(*inodes, if *depth == 1 { 3 } else { 2 });
+            }
+        }
+    }
+
+    #[test]
+    fn excluded_directories_are_not_listed_or_charged_to_totals() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("keep/leaf"), 7);
+        write(&dir.path().join("drop/hidden"), 999);
+        write(&dir.path().join("omit.tmp"), 99);
+        std::fs::set_permissions(
+            dir.path().join("drop"),
+            std::fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let mut options = options();
+        options.all = true;
+        options.excludes = vec![
+            glob::Pattern::new("drop").unwrap(),
+            glob::Pattern::new("*.tmp").unwrap(),
+        ];
+        let (emitted, total) = run(dir.path(), &options);
+        // Restore permissions even though TempDir cleanup can usually unlink
+        // the empty parent itself; the hidden child needs directory access.
+        std::fs::set_permissions(
+            dir.path().join("drop"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert_eq!((total.size, total.inodes), (7, 3));
+        assert_eq!(emitted.len(), 2);
+        assert!(emitted[0].0.ends_with("keep/leaf"));
+        assert!(emitted[1].0.ends_with("keep"));
     }
 }
