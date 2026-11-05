@@ -7,11 +7,12 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use vnfs::files::{Capabilities, CopyOptions, ReadOptions, StreamOptions, Vfsi, VfsiExt};
+use uucore::vnfs::Session as Backend;
+use vnfs::Error as VfError;
 use vnfs::helpers::{PathMapper, ResolvePath};
-use vnfs::nfs::{Nfs, NfsBuilder, NfsClient};
+use vnfs::nfs::Nfs;
+#[cfg(test)]
 use vnfs::posix::Posix;
-use vnfs::{Error as VfError, Result as VfResult};
 
 const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
 
@@ -62,44 +63,6 @@ fn nfs_mount(path: &Path) -> Option<Mount> {
     })
 }
 
-enum Backend {
-    Dummy(Posix),
-    Nfs { fs: NfsClient, supports_copy: bool },
-}
-
-impl Backend {
-    fn read_files(&self, paths: &[PathBuf], limit: usize) -> VfResult<Vec<Vec<u8>>> {
-        let limit = std::num::NonZeroUsize::new(limit)
-            .ok_or_else(|| VfError::errno(0, libc::EINVAL as u32))?;
-        let options = ReadOptions::new().with_max_total_bytes(limit);
-        match self {
-            Self::Dummy(fs) => fs.read_files_with_options(paths, options),
-            Self::Nfs { fs, .. } => fs.read_files_with_options(paths, options),
-        }
-    }
-
-    fn copy_to_writer(&self, path: &Path, writer: &mut impl Write) -> VfResult<u64> {
-        match self {
-            Self::Dummy(fs) => {
-                vnfs::helpers::copy_to_writer(fs, path, writer, StreamOptions::default())
-            }
-            Self::Nfs { fs, .. } => {
-                vnfs::helpers::copy_to_writer(fs, path, writer, StreamOptions::default())
-            }
-        }
-    }
-
-    fn copy_files(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<VfResult<()>> {
-        match self {
-            Self::Nfs {
-                fs,
-                supports_copy: true,
-            } => Some(fs.vcopy(pairs, CopyOptions::default())),
-            _ => None,
-        }
-    }
-}
-
 struct PreparedCopy {
     dest: PathBuf,
     temp: PathBuf,
@@ -107,7 +70,6 @@ struct PreparedCopy {
 
 struct Context {
     mount: Mount,
-    paths: PathMapper,
     backend: Backend,
     prefetched: HashMap<PathBuf, Vec<u8>>,
     prepared_copies: HashMap<PathBuf, PreparedCopy>,
@@ -126,24 +88,8 @@ thread_local! {
 }
 
 fn make_context(mount: Mount) -> io::Result<Context> {
-    let backend = match impl_choice() {
-        Some("dummy") => Backend::Dummy(Posix::new(&mount.point).map_err(vf_io_error)?),
-        Some("nfs") => {
-            // Inherit and retain the mount's security/version/port and root.
-            let fs = NfsBuilder::from_mount(&mount.point)
-                .map_err(vf_io_error)?
-                .connect()
-                .map_err(vf_io_error)?;
-            let supports_copy = fs
-                .capabilities()
-                .map_err(vf_io_error)?
-                .contains(Capabilities::SERVER_COPY);
-            Backend::Nfs { fs, supports_copy }
-        }
-        _ => return Err(io::Error::other("VNFS_IMPL disabled")),
-    };
+    let backend = Backend::open(&mount.point)?;
     Ok(Context {
-        paths: PathMapper::new(&mount.point)?,
         mount,
         backend,
         prefetched: HashMap::new(),
@@ -204,7 +150,9 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
     CTX.with(|slot| {
         let mut slot = slot.borrow_mut();
         let source_mount = nfs_mount(&sources[0]).expect("validated NFS source");
-        if slot.as_ref().is_none_or(|ctx| ctx.mount != source_mount) {
+        if slot.as_ref().is_none_or(|ctx| {
+            ctx.mount != source_mount || !ctx.backend.matches(&source_mount.point)
+        }) {
             let Ok(context) = make_context(source_mount) else {
                 return Ok(false);
             };
@@ -234,6 +182,14 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
     const DEFAULT_BATCH_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_BATCH_FILES: usize = 4096;
 
+    CTX.with(|slot| {
+        if let Some(context) = slot.borrow_mut().as_mut() {
+            context.prefetched.clear();
+            for (_, copy) in context.prepared_copies.drain() {
+                let _ = std::fs::remove_file(copy.temp);
+            }
+        }
+    });
     if impl_choice().is_none() || sources.len() < 2 {
         return Ok(());
     }
@@ -250,31 +206,38 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
 
     let mut seen = HashSet::new();
     let mut selected = Vec::new();
-    let mut total = 0u64;
+    let mut parents = HashMap::new();
     let mut selected_mount = None;
     for source in sources {
         if !seen.insert(source.clone()) {
             continue;
         }
-        let Ok(metadata) = source.metadata() else {
+        let Some(parent) = source
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .or(Some(Path::new(".")))
+        else {
             continue;
         };
-        if !metadata.is_file() || metadata.len() > max_bytes.saturating_sub(total) {
-            continue;
-        }
-        let Some(mount) = nfs_mount(source) else {
+        let mount = parents.entry(parent.to_path_buf()).or_insert_with(|| {
+            uucore::vnfs::nfs_mount(parent).map(|mount| Mount {
+                server: mount.server,
+                export: mount.export,
+                point: mount.point,
+            })
+        });
+        let Some(mount) = mount.as_ref() else {
             continue;
         };
         if selected_mount
             .as_ref()
-            .is_some_and(|chosen| chosen != &mount)
+            .is_some_and(|chosen| chosen != mount)
         {
             continue;
         }
         selected_mount.get_or_insert_with(|| mount.clone());
-        total += metadata.len();
         selected.push(source.clone());
-        if selected.len() == MAX_BATCH_FILES || total == max_bytes {
+        if selected.len() == MAX_BATCH_FILES {
             break;
         }
     }
@@ -285,39 +248,25 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
 
     CTX.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot.as_ref().is_none_or(|ctx| ctx.mount != mount) {
+        if slot
+            .as_ref()
+            .is_none_or(|ctx| ctx.mount != mount || !ctx.backend.matches(&mount.point))
+        {
             let Ok(context) = make_context(mount.clone()) else {
                 return Ok(());
             };
             *slot = Some(context);
         }
         let ctx = slot.as_mut().expect("VFSI context initialized");
-        // vNFS partitions compounds from negotiated limits. The application
-        // owns one aggregate byte budget, including files that grew since stat.
-        ctx.prefetched.clear();
-        let prefetched_bytes;
-        {
-            let batch = &selected;
-            let Ok(files): io::Result<Vec<PathBuf>> = batch
-                .iter()
-                .map(|source| {
-                    ctx.paths
-                        .map(source, ResolvePath::Follow)
-                        .map_err(Into::into)
-                })
-                .collect()
-            else {
-                return Ok(());
-            };
-            let Ok(contents) = ctx
-                .backend
-                .read_files(&files, usize::try_from(max_bytes).unwrap_or(usize::MAX))
-            else {
-                return Ok(());
-            };
-            prefetched_bytes = contents.iter().map(Vec::len).sum::<usize>();
-            ctx.prefetched.extend(batch.iter().cloned().zip(contents));
-        }
+        let Ok(prefetched) = prefetch_regular_files(
+            &ctx.backend,
+            &selected,
+            usize::try_from(max_bytes).unwrap_or(usize::MAX),
+        ) else {
+            return Ok(());
+        };
+        let prefetched_bytes = prefetched.values().map(Vec::len).sum::<usize>();
+        ctx.prefetched = prefetched;
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             let selected_files = selected.len();
             eprintln!(
@@ -328,6 +277,47 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
     })
 }
 
+fn prefetch_regular_files(
+    backend: &Backend,
+    sources: &[PathBuf],
+    budget: usize,
+) -> vnfs::Result<HashMap<PathBuf, Vec<u8>>> {
+    use vnfs::directory::Attributes;
+    // No-follow metadata admits only real regular files. Symlinks retain cp's
+    // ordinary follow policy and are handled by its existing singular path.
+    let paths = backend.map_many(sources, ResolvePath::NoFollow)?;
+    let attrs = backend.attrs(&paths, Attributes::MODE | Attributes::SIZE)?;
+    if attrs.len() != paths.len() {
+        return Err(VfError::invalid_reply(None, "cp: invalid attribute count"));
+    }
+    let mut remaining = budget;
+    let mut selected = Vec::new();
+    let mut operands = Vec::new();
+    for ((source, path), attrs) in sources.iter().zip(paths).zip(attrs) {
+        attrs.require(Attributes::MODE | Attributes::SIZE)?;
+        if !attrs.is_file() {
+            continue;
+        }
+        let Some(size) = attrs.len().and_then(|size| usize::try_from(size).ok()) else {
+            continue;
+        };
+        if size > remaining {
+            continue;
+        }
+        remaining -= size;
+        selected.push(source.clone());
+        operands.push(path);
+    }
+    if selected.len() < 2 {
+        return Ok(HashMap::new());
+    }
+    let data = backend.read_files(&operands, budget)?;
+    if data.len() != selected.len() {
+        return Err(VfError::invalid_reply(None, "cp: invalid read count"));
+    }
+    Ok(selected.into_iter().zip(data).collect())
+}
+
 /// Read a regular file through VFSI and write it through the kernel. Keeping
 /// the destination on one client avoids incoherent kernel/direct-NFS caches.
 /// Returns `None` when the normal kernel path should be used, otherwise the
@@ -336,13 +326,30 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
     if impl_choice().is_none() {
         return Ok(None);
     }
+    let prefetched = CTX.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|ctx| ctx.prefetched.remove(source))
+    });
+    if let Some(contents) = prefetched {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dest)?;
+        output.write_all(&contents)?;
+        return Ok(Some("vfsi-client-read"));
+    }
     let Some(source_mount) = nfs_mount(source) else {
         return Ok(None);
     };
     let dest_mount = nfs_mount(dest);
     CTX.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot.as_ref().is_none_or(|ctx| ctx.mount != source_mount) {
+        if slot.as_ref().is_none_or(|ctx| {
+            ctx.mount != source_mount || !ctx.backend.matches(&source_mount.point)
+        }) {
             *slot = Some(make_context(source_mount.clone())?);
         }
         let ctx = slot.as_mut().expect("VFSI context initialized");
@@ -370,8 +377,8 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
                 .mode(0o600)
                 .open(dest)?;
             let pair = (
-                ctx.paths.map(source, ResolvePath::Follow)?,
-                ctx.paths.map(dest, ResolvePath::Follow)?,
+                ctx.backend.map(source, ResolvePath::Follow)?,
+                ctx.backend.map(dest, ResolvePath::Follow)?,
             );
             if let Some(result) = ctx.backend.copy_files(std::slice::from_ref(&pair)) {
                 match result {
@@ -392,17 +399,7 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
                 }
             }
         }
-        if let Some(contents) = ctx.prefetched.remove(source) {
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(dest)?;
-            output.write_all(&contents)?;
-            return Ok(Some("vfsi-client-read"));
-        }
-        let source_path = ctx.paths.map(source, ResolvePath::Follow)?;
+        let source_path = ctx.backend.map(source, ResolvePath::Follow)?;
         let mut output = OpenOptions::new()
             .write(true)
             .create(true)
@@ -424,6 +421,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prefetch_batches_regular_files_with_one_budget_and_leaves_symlinks_to_cp() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, data) in [
+            ("one", b"abc".as_slice()),
+            ("two", b"defg"),
+            ("large", b"0123456789"),
+        ] {
+            std::fs::write(root.path().join(name), data).unwrap();
+        }
+        std::os::unix::fs::symlink("one", root.path().join("link")).unwrap();
+        let backend = Backend::Dummy {
+            fs: Posix::new(root.path()).unwrap(),
+            paths: PathMapper::new(root.path()).unwrap(),
+        };
+        let sources: Vec<_> = ["one", "link", "two", "large"]
+            .map(|name| root.path().join(name))
+            .into();
+        let cached = prefetch_regular_files(&backend, &sources, 7).unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[&sources[0]], b"abc");
+        assert_eq!(cached[&sources[2]], b"defg");
+        assert!(!cached.contains_key(&sources[1]));
+        assert!(
+            prefetch_regular_files(&backend, &sources, 3)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            prefetch_regular_files(&backend, &sources, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn mounted_backend_maps_paths_and_streams_without_raw_descriptors() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("file");
@@ -433,7 +465,10 @@ mod tests {
             export: PathBuf::from("/different-server-export"),
             point: root.path().to_path_buf(),
         };
-        let backend = Backend::Dummy(Posix::new(root.path()).unwrap());
+        let backend = Backend::Dummy {
+            fs: Posix::new(root.path()).unwrap(),
+            paths: PathMapper::new(root.path()).unwrap(),
+        };
         let mapped = PathMapper::new(&mount.point)
             .unwrap()
             .map(&file, ResolvePath::Follow)

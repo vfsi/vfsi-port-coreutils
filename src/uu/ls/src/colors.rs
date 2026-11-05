@@ -256,6 +256,36 @@ impl<'a> StyleManager<'a> {
         name: OsString,
         wrap: bool,
     ) -> OsString {
+        #[cfg(all(feature = "vnfs", target_os = "linux"))]
+        if matches!(path.metadata(), Some(crate::meta::LsMeta::Vf(_))) {
+            // std::fs::Metadata is opaque. Classify the already-fetched fields
+            // with the same indicator precedence instead of re-statting entries.
+            let indicator = match path.file_type() {
+                Some(kind) if kind.is_file() => self
+                    .indicator_for_file(path)
+                    .unwrap_or(Indicator::RegularFile),
+                Some(kind) if kind.is_dir() => self
+                    .indicator_for_directory(path)
+                    .unwrap_or(Indicator::Directory),
+                Some(kind) if kind.is_symlink() => self
+                    .indicator_for_symlink(&mut || path.path().exists())
+                    .unwrap_or(Indicator::SymbolicLink),
+                Some(kind) => self
+                    .indicator_for_special_file(*kind)
+                    .unwrap_or(Indicator::MissingFile),
+                None => Indicator::RegularFile,
+            };
+            let style = if indicator == Indicator::RegularFile {
+                path.display_name().to_str().and_then(|file| {
+                    self.colors
+                        .style_for_str(file)
+                        .or_else(|| self.colors.style_for_indicator(indicator))
+                })
+            } else {
+                self.colors.style_for_indicator(indicator)
+            };
+            return self.apply_style(style, Some(path), name, wrap);
+        }
         let style = self.colors.style_for(path);
         self.apply_style(style, Some(path), name, wrap)
     }
@@ -837,5 +867,64 @@ mod tests {
         indicator_codes.insert(Indicator::Directory, "01;34".to_string());
         let manager = style_manager(&colors, indicator_codes);
         assert!(manager.has_indicator_style(Indicator::Directory));
+    }
+}
+
+#[cfg(all(test, feature = "vnfs", target_os = "linux"))]
+mod vfsi_colors {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use vnfs::files::VfsiExt;
+    #[test]
+    fn sparse_vector_metadata_matches_native_color_classification() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        for name in ["plain", "suffix.rs", "exec", "hard"] {
+            fs::write(root.path().join(name), b"x").unwrap();
+        }
+        fs::set_permissions(root.path().join("exec"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.path().join("dir"), fs::Permissions::from_mode(0o1777)).unwrap();
+        fs::hard_link(root.path().join("hard"), root.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink("plain", root.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("missing", root.path().join("broken")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(root.path().join("socket")).unwrap();
+        let fs = vnfs::posix::Posix::new(root.path()).unwrap();
+        let entries = fs
+            .read_dir_with_options(
+                "/",
+                vnfs::directory::ListDirOptions::new().with_fields(
+                    vnfs::directory::Attributes::MODE | vnfs::directory::Attributes::NLINK,
+                ),
+            )
+            .unwrap();
+        let matches = crate::uu_app().get_matches_from(["ls", "--color=always"]);
+        let mut config = crate::config::Config::from(&matches, None).unwrap();
+        config.dereference = crate::config::Dereference::None;
+        let colors = LsColors::from_string("di=34:ln=36:or=31:ex=32:mh=35:*.rs=31");
+        for entry in entries {
+            let name = entry.file_name().unwrap().to_os_string();
+            let path = root.path().join(&name);
+            let native = PathData::new(
+                path.clone().into(),
+                None,
+                Some(name.clone().into()),
+                &config,
+                false,
+                false,
+            );
+            let vector = PathData::from_vf(path, name.clone(), entry, &config);
+            let mut first = StyleManager::new(&colors);
+            let mut second = StyleManager::new(&colors);
+            // Keep the test independent of the host's LS_COLORS overrides.
+            first.indicator_codes.clear();
+            second.indicator_codes.clear();
+            first.ln_color_from_target = false;
+            second.ln_color_from_target = false;
+            assert_eq!(
+                first.apply_style_for_path(&native, name.clone(), false),
+                second.apply_style_for_path(&vector, name.clone(), false),
+                "color differs for {name:?}",
+            );
+        }
     }
 }

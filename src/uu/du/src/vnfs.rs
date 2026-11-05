@@ -27,15 +27,17 @@ use uucore::fsext::MetadataTimeField;
 use uucore::libc;
 use uucore::translate;
 
+use uucore::vnfs::Session;
+use vnfs::directory::FsObjId;
 use vnfs::directory::{
     Attributes, Attrs as Metadata, AttrsOptions, DirectoryListing, FileType as VfType,
     ListDirControl, TraversalCompletion,
 };
 use vnfs::files::{Vfsi, VfsiExt};
-use vnfs::nfs::Nfs;
+#[cfg(test)]
 use vnfs::posix::Posix;
 
-use crate::{Deref, FileInfo, StatPrintInfo, TraversalOptions, Usage};
+use crate::{Deref, StatPrintInfo, TraversalOptions, Usage};
 
 /// Whether `VNFS_IMPL` selects a vectorized backend.
 pub fn is_enabled() -> bool {
@@ -54,11 +56,14 @@ fn attr_mask(options: &TraversalOptions) -> Attributes {
     let mut masks = Attributes::MODE
         | Attributes::SIZE
         | Attributes::NLINK
-        | Attributes::FILEID
+        | Attributes::identity()
         | Attributes::BLOCKS;
-    if options.time.is_some() {
-        masks |= Attributes::MTIME | Attributes::ATIME | Attributes::CTIME;
-    }
+    masks |= match options.time {
+        Some(MetadataTimeField::Modification) => Attributes::MTIME,
+        Some(MetadataTimeField::Access) => Attributes::ATIME,
+        Some(MetadataTimeField::Change) => Attributes::CTIME,
+        _ => Attributes::empty(),
+    };
     masks
 }
 
@@ -77,6 +82,7 @@ fn usage_from_attrs(
     attrs: &Metadata,
     options: &TraversalOptions,
 ) -> io::Result<Usage> {
+    attrs.require(attr_mask(options)).map_err(io::Error::from)?;
     Ok(Usage {
         path: path.to_path_buf(),
         // Directories report zero apparent size, like `Stat::new`.
@@ -93,12 +99,15 @@ fn usage_from_attrs(
     })
 }
 
-fn file_info(attrs: &Metadata) -> Option<FileInfo> {
-    attrs.file_id().filter(|id| *id != 0).map(|id| FileInfo {
-        file_id: u128::from(id),
-        // A single NFS export is one device; `-x` cannot cross it here.
-        dev_id: 0,
-    })
+/// Identities are comparable only within one backend/server namespace.
+#[derive(Default)]
+pub struct Context {
+    seen: HashMap<String, HashSet<FsObjId>>,
+    sessions: HashMap<(String, PathBuf, PathBuf), Session>,
+}
+
+fn file_info(attrs: &Metadata) -> Option<FsObjId> {
+    attrs.fs_obj_id()
 }
 
 fn max_time(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime> {
@@ -135,6 +144,7 @@ fn traverse<F: Vfsi>(
     vroot: &Path,
     options: &TraversalOptions,
     print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
+    counted: &mut HashSet<FsObjId>,
 ) -> io::Result<Usage> {
     let masks = attr_mask(options);
     let root_attrs = backend
@@ -146,21 +156,52 @@ fn traverse<F: Vfsi>(
         )
         .map_err(io::Error::other)?;
 
+    let root_id = root_attrs.fs_obj_id().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scoped identity was not supplied",
+        )
+    })?;
+    if !options.count_links && counted.contains(&root_id) {
+        return Ok(Usage {
+            path: path.to_path_buf(),
+            size: 0,
+            blocks: 0,
+            inodes: 0,
+            latest_time: None,
+        });
+    }
     if root_attrs.file_type() != VfType::Directory {
-        return usage_from_attrs(path, &root_attrs, options);
+        let usage = usage_from_attrs(path, &root_attrs, options)?;
+        if !options.count_links {
+            counted.insert(root_id);
+        }
+        return Ok(usage);
     }
 
-    traverse_pages(path, vroot, &root_attrs, options, print_tx, |visitor| {
-        backend.vlistdirs(
-            &[vroot],
-            backend
-                .limits()
-                .walk_options()
-                .with_fields(masks)
-                .with_allow_symlink_components(false),
-            visitor,
-        )
-    })
+    let usage = traverse_pages(
+        path,
+        vroot,
+        &root_attrs,
+        options,
+        print_tx,
+        counted,
+        |visitor| {
+            backend.vlistdirs(
+                &[vroot],
+                backend
+                    .limits()
+                    .walk_options()
+                    .with_fields(masks)
+                    .with_allow_symlink_components(false),
+                visitor,
+            )
+        },
+    )?;
+    if !options.count_links {
+        counted.insert(root_id);
+    }
+    Ok(usage)
 }
 
 /// Aggregate pages independently of transport, so identity changes between
@@ -171,6 +212,7 @@ fn traverse_pages(
     root_attrs: &Metadata,
     options: &TraversalOptions,
     print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
+    counted: &mut HashSet<FsObjId>,
     visit: impl FnOnce(
         &mut dyn FnMut(usize, DirectoryListing) -> vnfs::Result<ListDirControl>,
     ) -> vnfs::Result<Vec<TraversalCompletion>>,
@@ -206,10 +248,10 @@ fn traverse_pages(
         position: 0,
         entries: 0,
     }];
+    let mut directory_ids = Vec::new();
     let mut positions = HashMap::default();
     positions.insert(vroot.to_path_buf(), 0usize);
-    let mut linked: HashMap<FileInfo, LinkedFile> = HashMap::default();
-    let mut counted: HashSet<FileInfo> = HashSet::default();
+    let mut linked: HashMap<FsObjId, LinkedFile> = HashMap::default();
     let completion = visit(&mut |index, listing| {
         if index != 0 {
             return Err(vnfs::Error::invalid_reply(None, "du: invalid root index"));
@@ -243,6 +285,15 @@ fn traverse_pages(
             let usage = usage_from_attrs(&rendered, entry.attrs(), options)
                 .map_err(|_| vnfs::Error::errno(0, libc::ENOTSUP as u32))?;
             if entry.attrs().is_dir() {
+                if !options.count_links
+                    && let Some(id) = file_info(entry.attrs())
+                {
+                    if !options.count_links && counted.contains(&id) {
+                        pruned.push(entry.path().to_path_buf());
+                        continue;
+                    }
+                    directory_ids.push(id);
+                }
                 let child = directories.len();
                 if positions
                     .insert(entry.path().to_path_buf(), child)
@@ -311,7 +362,9 @@ fn traverse_pages(
         return Err(io::Error::other("vnfs walk did not finish its root"));
     }
     drop(positions);
-    for file in linked.into_values() {
+    counted.extend(directory_ids);
+    for (id, file) in linked {
+        counted.insert(id);
         accumulate(&mut directories[file.parent].usage, &file.usage);
         if options.all {
             send(print_tx, file.usage, file.depth)?;
@@ -336,6 +389,7 @@ fn traverse_pages(
 /// Returns `Ok(None)` when the path is not on an NFS mount or the backend is
 /// disabled. Traversal errors are returned without restarting the walk.
 pub fn try_du(
+    context: &mut Context,
     path: &Path,
     options: &TraversalOptions,
     print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
@@ -355,19 +409,30 @@ pub fn try_du(
     // Path inside the export namespace the backend resolves against.
     let vroot = Path::new("/").join(relative);
 
-    let result = match std::env::var("VNFS_IMPL").as_deref() {
-        Ok("dummy") => traverse(
-            &Posix::new(&mount.point).map_err(io::Error::other)?,
-            path,
-            &vroot,
-            options,
-            print_tx,
-        ),
-        Ok("nfs") => match Nfs::from_mount(&mount.point) {
-            Ok(fs) => traverse(&fs, path, &vroot, options, print_tx),
-            Err(_) => return Ok(None),
-        },
-        _ => return Ok(None),
+    // Kernel st_dev IDs and direct NFS FSIDs are different identity domains.
+    // Keep them apart; direct sessions on the same server share FSID/FILEID.
+    let namespace = if std::env::var("VNFS_IMPL").as_deref() == Ok("dummy") {
+        "kernel".to_owned()
+    } else {
+        format!("nfs:{}", mount.server)
+    };
+    let counted = context.seen.entry(namespace.clone()).or_default();
+    let key = (namespace, mount.export.clone(), mount.point.clone());
+    if context
+        .sessions
+        .get(&key)
+        .is_none_or(|session| !session.matches(&mount.point))
+    {
+        let Ok(session) = Session::open(&mount.point) else {
+            return Ok(None);
+        };
+        context.sessions.insert(key.clone(), session);
+    }
+    let result = match &context.sessions[&key] {
+        Session::Dummy { fs, .. } => traverse(fs, path, &vroot, options, print_tx, counted),
+        Session::Nfs { session, .. } => {
+            traverse(session.fs(), path, &vroot, options, print_tx, counted)
+        }
     };
 
     print_stats();
@@ -384,32 +449,7 @@ fn print_stats() {
     if std::env::var("VNFS_STATS").as_deref() != Ok("1") {
         return;
     }
-    let stats = vnfs::diagnostics::take_and_reset();
-    let (compounds, ops, bytes, max_ops) = (
-        stats.compounds,
-        stats.operations,
-        stats.compound_bytes,
-        stats.max_operations,
-    );
-    if compounds > 0 {
-        let avg_bytes = bytes.map_or_else(
-            || "unknown".into(),
-            |b| format!("{:.0}", b as f64 / compounds as f64),
-        );
-        let bytes = bytes.map_or_else(|| "unknown".into(), |b| b.to_string());
-        eprintln!(
-            "[vnfs] compounds={compounds} avg_ops={:.2} max_ops={max_ops} avg_bytes={avg_bytes} total_bytes={bytes}",
-            ops as f64 / compounds as f64
-        );
-    }
-    let (calls, micros) = (stats.rpc_calls, stats.rpc_micros);
-    if calls > 0 {
-        eprintln!(
-            "[vnfs] rpc_calls={calls} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
-            micros as f64 / calls as f64 / 1000.0,
-            micros as f64 / 1000.0
-        );
-    }
+    eprint!("{}", vnfs::diagnostics::take_and_reset());
 }
 
 #[cfg(test)]
@@ -473,7 +513,15 @@ mod tests {
     fn run(root: &Path, options: &TraversalOptions) -> (Vec<(PathBuf, u64, u64, usize)>, Usage) {
         let backend = Posix::new(root).expect("dummy root");
         let (tx, rx) = mpsc::channel();
-        let total = traverse(&backend, root, Path::new("/"), options, &tx).expect("traverse");
+        let total = traverse(
+            &backend,
+            root,
+            Path::new("/"),
+            options,
+            &tx,
+            &mut HashSet::default(),
+        )
+        .expect("traverse");
         drop(tx);
         let mut emitted = Vec::new();
         for info in &rx {
@@ -593,15 +641,27 @@ mod tests {
                 std::fs::hard_link(dir.path().join("source"), dir.path().join("extra")).unwrap();
             }
             let fs = Posix::new(dir.path()).unwrap();
-            let root = fs.attrs("/").unwrap();
-            let first = fs.attrs("/source").unwrap();
+            let root = fs
+                .attrs_with_options("/", AttrsOptions::new().with_fields(attr_mask(&options())))
+                .unwrap();
+            let first = fs
+                .attrs_with_options(
+                    "/source",
+                    AttrsOptions::new().with_fields(attr_mask(&options())),
+                )
+                .unwrap();
             if second_links > first_links {
                 std::fs::hard_link(dir.path().join("source"), dir.path().join("extra")).unwrap();
             } else if second_links < first_links {
                 std::fs::remove_file(dir.path().join("extra")).unwrap();
             }
             std::fs::rename(dir.path().join("source"), dir.path().join("destination")).unwrap();
-            let second = fs.attrs("/destination").unwrap();
+            let second = fs
+                .attrs_with_options(
+                    "/destination",
+                    AttrsOptions::new().with_fields(attr_mask(&options())),
+                )
+                .unwrap();
             assert_eq!(first.file_id(), second.file_id());
             assert_eq!(first.nlink(), Some(first_links));
             assert_eq!(second.nlink(), Some(second_links));
@@ -635,6 +695,7 @@ mod tests {
                     &root,
                     &opts,
                     &tx,
+                    &mut HashSet::default(),
                     |visitor| {
                         for page in pages {
                             assert_eq!(visitor(0, page)?, ListDirControl::Prune(Vec::new()));
@@ -664,6 +725,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn command_operands_share_scoped_hardlink_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/file"), 5);
+        std::fs::create_dir(dir.path().join("b")).unwrap();
+        std::fs::hard_link(dir.path().join("a/file"), dir.path().join("b/alias")).unwrap();
+        let fs = Posix::new(dir.path()).unwrap();
+        let attrs = fs
+            .attrs_with_options(
+                "/a/file",
+                AttrsOptions::new().with_fields(attr_mask(&options())),
+            )
+            .unwrap();
+        let identity = file_info(&attrs).unwrap();
+        assert_eq!(Some(identity.fs_id()), attrs.fs_id());
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            identity.fs_id(),
+            u128::from(std::fs::metadata(dir.path().join("a/file")).unwrap().dev())
+        );
+        let (tx, _rx) = mpsc::channel();
+        let mut seen = HashSet::default();
+        let first = traverse(
+            &fs,
+            Path::new("a"),
+            Path::new("/a"),
+            &options(),
+            &tx,
+            &mut seen,
+        )
+        .unwrap();
+        let second = traverse(
+            &fs,
+            Path::new("b"),
+            Path::new("/b"),
+            &options(),
+            &tx,
+            &mut seen,
+        )
+        .unwrap();
+        assert_eq!((first.size, second.size), (5, 0));
+        assert_eq!((first.inodes, second.inodes), (2, 1));
+        // A root previously visited under another operand is skipped.
+        let repeated = traverse(
+            &fs,
+            Path::new("a/file"),
+            Path::new("/a/file"),
+            &options(),
+            &tx,
+            &mut seen,
+        )
+        .unwrap();
+        assert_eq!(repeated.inodes, 0);
+
+        let mut opts = options();
+        opts.count_links = true;
+        let repeated =
+            traverse(&fs, Path::new("b"), Path::new("/b"), &opts, &tx, &mut seen).unwrap();
+        assert_eq!(repeated.size, 5);
     }
 
     #[test]

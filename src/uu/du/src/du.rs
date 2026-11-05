@@ -1267,6 +1267,8 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
     // Check existence of path provided in argument
     let mut seen_inodes: FxHashSet<FileInfo> = FxHashSet::default();
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+    let mut vfsi_context = vnfs::Context::default();
 
     'loop_file: for path in files {
         // Skip if we don't want to ignore anything
@@ -1304,7 +1306,8 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
         #[cfg(all(feature = "vnfs", target_os = "linux"))]
         if vnfs::is_enabled() && vnfs::supports(&traversal_options) {
-            match vnfs::try_du(&path, &traversal_options, &print_tx) {
+            match vnfs::try_du(&mut vfsi_context, &path, &traversal_options, &print_tx) {
+                Ok(Some(usage)) if usage.inodes == 0 => continue 'loop_file,
                 Ok(Some(usage)) => {
                     print_tx
                         .send(Ok(StatPrintInfo { usage, depth: 0 }))
