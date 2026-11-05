@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
+use uucore::vnfs::Session as Backend;
 use vnfs::Error as VfError;
-use vnfs::directory::{Attributes, DirEntry, DirectoryListing, ListDirOptions};
+use vnfs::directory::{Attributes, DirEntry};
 use vnfs::files::VfsiExt;
 use vnfs::helpers::{PathMapper, ResolvePath};
-use vnfs::nfs::{Nfs, NfsClient};
+#[cfg(test)]
 use vnfs::posix::Posix;
 
 pub(crate) struct WalkEntry {
@@ -44,84 +45,63 @@ fn vf_io_error(e: VfError) -> io::Error {
     e.into()
 }
 
-/// Attributes requested for every entry (all supported fields). The
-/// `FATTR4_NAMED_ATTR` boolean is only needed by the long format (for the `+`
-/// access-indicator), and costs the server a per-entry xattr enumeration, so
-/// it is only requested then.
-fn full_mask(config: &crate::config::Config) -> Attributes {
-    use Attributes as AttrMask;
-    let mut mask = AttrMask::MODE
-        | AttrMask::SIZE
-        | AttrMask::NLINK
-        | AttrMask::FILEID
-        | AttrMask::BLOCKS
-        | AttrMask::UID
-        | AttrMask::GID
-        | AttrMask::RDEV
-        | AttrMask::ATIME
-        | AttrMask::MTIME
-        | AttrMask::CTIME;
-    if config.format == crate::display::Format::Long {
-        mask |= AttrMask::NAMED_ATTR;
+/// Keep the metadata facade's concrete fields valid; size/time/xattrs remain
+/// sparse and are requested only for the selected rendering/sorting modes.
+fn attr_mask(config: &crate::config::Config) -> Attributes {
+    use crate::{config::Sort, display::Format};
+    use uucore::fsext::MetadataTimeField;
+    let mut mask = Attributes::MODE
+        | Attributes::NLINK
+        | Attributes::UID
+        | Attributes::GID
+        | Attributes::FILEID
+        | Attributes::BLOCKS
+        | Attributes::RDEV;
+    if config.format == Format::Long {
+        mask |= Attributes::SIZE
+            | Attributes::NLINK
+            | Attributes::BLOCKS
+            | Attributes::RDEV
+            | Attributes::NAMED_ATTR;
+        if config.long.owner || config.long.author {
+            mask |= Attributes::UID;
+        }
+        if config.long.group {
+            mask |= Attributes::GID;
+        }
+    }
+    if config.inode {
+        mask |= Attributes::FILEID;
+    }
+    if config.alloc_size {
+        mask |= Attributes::BLOCKS;
+    }
+    if config.color.is_some() {
+        mask |= Attributes::NLINK;
+    }
+    if config.sort == Sort::Size {
+        mask |= Attributes::SIZE;
+    }
+    if config.format == Format::Long || config.sort == Sort::Time {
+        mask |= match config.time {
+            MetadataTimeField::Modification => Attributes::MTIME,
+            MetadataTimeField::Access => Attributes::ATIME,
+            MetadataTimeField::Change => Attributes::CTIME,
+            MetadataTimeField::Birth => Attributes::empty(),
+        };
     }
     mask
-}
-
-/// The application-facing clients selected for this mount.
-enum Backend {
-    Dummy(Posix),
-    Nfs(NfsClient),
-}
-
-impl Backend {
-    fn read_dirs(&self, dirs: &[&Path], fields: Attributes) -> vnfs::Result<Vec<DirectoryListing>> {
-        match self {
-            Self::Dummy(fs) => {
-                fs.read_dirs_with_options(dirs, ListDirOptions::new().with_fields(fields))
-            }
-            Self::Nfs(fs) => {
-                fs.read_dirs_with_options(dirs, ListDirOptions::new().with_fields(fields))
-            }
-        }
-        .map(|trees| trees.into_iter().flatten().collect())
-    }
 }
 
 struct VfContext {
     backend: Backend,
     mount: NfsMount,
-    paths: PathMapper,
 }
 
 impl Drop for VfContext {
     fn drop(&mut self) {
         if std::env::var("VNFS_STATS").as_deref() == Ok("1") {
-            let stats = vnfs::diagnostics::take_and_reset();
-            let (n, ops, bytes, max) = (
-                stats.compounds,
-                stats.operations,
-                stats.compound_bytes,
-                stats.max_operations,
-            );
-            if n > 0 {
-                let avg_bytes = bytes.map_or_else(
-                    || "unknown".into(),
-                    |b| format!("{:.0}", b as f64 / n as f64),
-                );
-                let bytes = bytes.map_or_else(|| "unknown".into(), |b| b.to_string());
-                eprintln!(
-                    "[vnfs] compounds={n} avg_ops={:.2} max_ops={max} avg_bytes={avg_bytes} total_bytes={bytes}",
-                    ops as f64 / n as f64
-                );
-            }
-            let (calls, us) = (stats.rpc_calls, stats.rpc_micros);
-            if calls > 0 {
-                eprintln!(
-                    "[vnfs] rpc_calls={calls} avg_rpc_ms={:.2} total_rpc_ms={:.1}",
-                    us as f64 / calls as f64 / 1000.0,
-                    us as f64 / 1000.0
-                );
-            }
+            eprint!("{}", vnfs::diagnostics::take_and_reset());
         }
     }
 }
@@ -136,17 +116,8 @@ fn nfs_mountpoint(path: &Path) -> Option<NfsMount> {
 }
 
 fn make_ctx(mount: NfsMount) -> io::Result<VfContext> {
-    let backend = match impl_choice() {
-        Some("dummy") => Backend::Dummy(Posix::new(&mount.point).map_err(vf_io_error)?),
-        Some("nfs") => Backend::Nfs(Nfs::from_mount(&mount.point).map_err(vf_io_error)?),
-        _ => return Err(io::Error::other("VNFS_IMPL disabled")),
-    };
-    let paths = PathMapper::new(&mount.point)?;
-    Ok(VfContext {
-        backend,
-        mount,
-        paths,
-    })
+    let backend = Backend::open(&mount.point)?;
+    Ok(VfContext { backend, mount })
 }
 
 /// Open `path` for listing through the vectorized backend when applicable.
@@ -160,7 +131,10 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
     };
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
-        if ctx.as_ref().is_none_or(|ctx| ctx.mount != mount) {
+        if ctx
+            .as_ref()
+            .is_none_or(|ctx| ctx.mount != mount || !ctx.backend.matches(&mount.point))
+        {
             let t0 = std::time::Instant::now();
             *ctx = Some(make_ctx(mount)?);
             if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
@@ -172,8 +146,8 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         }
         let ctx = ctx.as_mut().unwrap();
 
-        let vpath = ctx.paths.map(path, ResolvePath::Follow)?;
-        let listing = match ctx.backend.read_dirs(&[&vpath], full_mask(config)) {
+        let vpath = ctx.backend.map(path, ResolvePath::Follow)?;
+        let listing = match ctx.backend.read_dirs(&[&vpath], attr_mask(config)) {
             Ok(mut listings) => match listings.pop() {
                 Some(listing) => listing,
                 None => return Err(io::Error::other("vnfs returned no directory listing")),
@@ -209,7 +183,7 @@ fn ctx_open_many(
 ) -> Vec<Option<LsReadDir>> {
     let vpaths: vnfs::Result<Vec<PathBuf>> = kernel_dirs
         .iter()
-        .map(|d| ctx.paths.map(d, ResolvePath::Follow))
+        .map(|d| ctx.backend.map(d, ResolvePath::Follow))
         .collect();
     let Ok(vpaths) = vpaths else {
         return std::iter::repeat_with(|| None)
@@ -262,11 +236,14 @@ pub fn try_open_many_vf(
         let mut out: Vec<Option<LsReadDir>> =
             std::iter::repeat_with(|| None).take(dirs.len()).collect();
         for (mount, indices) in groups {
-            if ctx.as_ref().is_none_or(|ctx| ctx.mount != mount) {
+            if ctx
+                .as_ref()
+                .is_none_or(|ctx| ctx.mount != mount || !ctx.backend.matches(&mount.point))
+            {
                 *ctx = Some(make_ctx(mount)?);
             }
             let grouped: Vec<&Path> = indices.iter().map(|&i| dirs[i]).collect();
-            let listings = ctx_open_many(ctx.as_mut().unwrap(), &grouped, full_mask(config));
+            let listings = ctx_open_many(ctx.as_mut().unwrap(), &grouped, attr_mask(config));
             for (index, listing) in indices.into_iter().zip(listings) {
                 out[index] = listing;
             }
@@ -309,7 +286,10 @@ pub fn try_visit_walk_vf(
     };
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
-        if ctx.as_ref().is_none_or(|ctx| ctx.mount != mount) {
+        if ctx
+            .as_ref()
+            .is_none_or(|ctx| ctx.mount != mount || !ctx.backend.matches(&mount.point))
+        {
             let t0 = std::time::Instant::now();
             *ctx = Some(make_ctx(mount)?);
             if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
@@ -323,8 +303,12 @@ pub fn try_visit_walk_vf(
 
         let t0 = std::time::Instant::now();
         match &ctx.backend {
-            Backend::Dummy(fs) => visit_ordered(fs, &ctx.mount.point, path, config, &mut callback)?,
-            Backend::Nfs(fs) => visit_ordered(fs, &ctx.mount.point, path, config, &mut callback)?,
+            Backend::Dummy { fs, .. } => {
+                visit_ordered(fs, &ctx.mount.point, path, config, &mut callback)?
+            }
+            Backend::Nfs { session, .. } => {
+                visit_ordered(session.fs(), &ctx.mount.point, path, config, &mut callback)?
+            }
         }
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             eprintln!(
@@ -352,7 +336,7 @@ fn visit_ordered<F: vnfs::Vfsi>(
     let mut output_error = None;
     let result = fs.visit_dirs_ordered(
         root,
-        fs.limits().walk_options().with_fields(full_mask(config)),
+        fs.limits().walk_options().with_fields(attr_mask(config)),
         crate::vf_entry_order(config),
         |entry| {
             entry
@@ -390,8 +374,10 @@ mod tests {
 
     fn dummy_ctx(root: &Path) -> VfContext {
         VfContext {
-            paths: PathMapper::new(root).unwrap(),
-            backend: Backend::Dummy(Posix::new(root).unwrap()),
+            backend: Backend::Dummy {
+                fs: Posix::new(root).unwrap(),
+                paths: PathMapper::new(root).unwrap(),
+            },
             mount: NfsMount {
                 server: "dummy".to_string(),
                 export: PathBuf::from("/"),
@@ -411,6 +397,47 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn masks_follow_rendering_and_sorting_requirements() {
+        for (args, required, absent) in [
+            (
+                vec!["ls", "-1", "--color=never"],
+                Attributes::MODE,
+                Attributes::SIZE | Attributes::ATIME | Attributes::MTIME,
+            ),
+            (
+                vec!["ls", "-i", "-s"],
+                Attributes::FILEID | Attributes::BLOCKS,
+                Attributes::SIZE | Attributes::MTIME,
+            ),
+            (
+                vec!["ls", "-S"],
+                Attributes::SIZE,
+                Attributes::MTIME | Attributes::CTIME,
+            ),
+            (
+                vec!["ls", "-tu"],
+                Attributes::ATIME,
+                Attributes::MTIME | Attributes::CTIME,
+            ),
+            (
+                vec!["ls", "-l"],
+                Attributes::MODE
+                    | Attributes::SIZE
+                    | Attributes::MTIME
+                    | Attributes::UID
+                    | Attributes::GID,
+                Attributes::ATIME | Attributes::CTIME,
+            ),
+        ] {
+            let matches = crate::uu_app().get_matches_from(args);
+            let config = crate::config::Config::from(&matches, None).unwrap();
+            let mask = attr_mask(&config);
+            assert!(mask.contains(required), "missing {required:?} in {mask:?}");
+            assert!(!mask.intersects(absent), "unneeded attributes in {mask:?}");
+        }
     }
 
     #[test]
