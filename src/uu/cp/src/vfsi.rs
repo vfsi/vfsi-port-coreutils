@@ -139,7 +139,7 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
             *slot = Some(context);
         }
         let ctx = slot.as_mut().expect("VFSI context initialized");
-        if let Some(Ok(())) = ctx.backend.copy_files(&pairs) {
+        if let Some(Ok(())) = ctx.backend.try_server_copy(&pairs) {
             ctx.prepared_copies.extend(plans);
             if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
                 let copied = pairs.len();
@@ -262,7 +262,7 @@ fn prefetch_regular_files(
     // No-follow metadata admits only real regular files. Symlinks retain cp's
     // ordinary follow policy and are handled by its existing singular path.
     let paths = backend.map_many(sources, ResolvePath::NoFollow)?;
-    let attrs = backend.attrs(&paths, Attributes::MODE | Attributes::SIZE)?;
+    let attrs = backend.attrs_nofollow(&paths, Attributes::MODE | Attributes::SIZE)?;
     if attrs.len() != paths.len() {
         return Err(VfError::invalid_reply(None, "cp: invalid attribute count"));
     }
@@ -360,7 +360,7 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
                 ctx.backend.map(source, ResolvePath::Follow)?,
                 ctx.backend.map(dest, ResolvePath::Follow)?,
             );
-            if let Some(result) = ctx.backend.copy_files(std::slice::from_ref(&pair)) {
+            if let Some(result) = ctx.backend.try_server_copy(std::slice::from_ref(&pair)) {
                 match result {
                     Ok(()) => {
                         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
