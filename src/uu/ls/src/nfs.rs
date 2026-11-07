@@ -45,18 +45,12 @@ fn vf_io_error(e: VfError) -> io::Error {
     e.into()
 }
 
-/// Keep the metadata facade's concrete fields valid; size/time/xattrs remain
-/// sparse and are requested only for the selected rendering/sorting modes.
+/// Request metadata consumed by the selected rendering and sorting modes.
+/// Session::read_dirs validates required fields before exposing any listing.
 fn attr_mask(config: &crate::config::Config) -> Attributes {
     use crate::{config::Sort, display::Format};
     use uucore::fsext::MetadataTimeField;
-    let mut mask = Attributes::MODE
-        | Attributes::NLINK
-        | Attributes::UID
-        | Attributes::GID
-        | Attributes::FILEID
-        | Attributes::BLOCKS
-        | Attributes::RDEV;
+    let mut mask = Attributes::MODE;
     if config.format == Format::Long {
         mask |= Attributes::SIZE
             | Attributes::NLINK
@@ -405,7 +399,15 @@ mod tests {
             (
                 vec!["ls", "-1", "--color=never"],
                 Attributes::MODE,
-                Attributes::SIZE | Attributes::ATIME | Attributes::MTIME,
+                Attributes::SIZE
+                    | Attributes::ATIME
+                    | Attributes::MTIME
+                    | Attributes::UID
+                    | Attributes::GID
+                    | Attributes::FILEID
+                    | Attributes::BLOCKS
+                    | Attributes::NLINK
+                    | Attributes::RDEV,
             ),
             (
                 vec!["ls", "-i", "-s"],
@@ -421,6 +423,21 @@ mod tests {
                 vec!["ls", "-tu"],
                 Attributes::ATIME,
                 Attributes::MTIME | Attributes::CTIME,
+            ),
+            (
+                vec!["ls", "-g"],
+                Attributes::NLINK | Attributes::SIZE | Attributes::GID,
+                Attributes::UID | Attributes::FILEID,
+            ),
+            (
+                vec!["ls", "-o"],
+                Attributes::NLINK | Attributes::SIZE | Attributes::UID,
+                Attributes::GID | Attributes::FILEID,
+            ),
+            (
+                vec!["ls", "-go"],
+                Attributes::NLINK | Attributes::SIZE,
+                Attributes::UID | Attributes::GID,
             ),
             (
                 vec!["ls", "-l"],

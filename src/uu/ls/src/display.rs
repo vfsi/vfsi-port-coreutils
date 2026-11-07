@@ -283,8 +283,16 @@ fn display_dir_entry_size(
         let nlink_len = display_symlink_count(md).len();
         (
             nlink_len,
-            display_uname(md, config, &mut state.uid_cache).len(),
-            display_group(md, config, &mut state.gid_cache).len(),
+            if config.long.owner || config.long.author {
+                display_uname(md, config, &mut state.uid_cache).len()
+            } else {
+                0
+            },
+            if config.long.group {
+                display_group(md, config, &mut state.gid_cache).len()
+            } else {
+                0
+            },
             size_len,
             major_len,
             minor_len,
@@ -1480,6 +1488,35 @@ mod vfsi_size_tests {
     use vnfs::directory::{Attributes, AttrsOptions};
     use vnfs::files::VfsiExt;
     use vnfs::posix::Posix;
+
+    #[test]
+    fn hidden_identity_columns_do_not_populate_name_caches() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"").unwrap();
+        let fs = Posix::new(root.path()).unwrap();
+        let config =
+            Config::from(&crate::uu_app().get_matches_from(["ls", "-go", "-n"]), None).unwrap();
+        assert!(!config.long.owner && !config.long.author && !config.long.group);
+        let attrs = fs
+            .attrs_with_options(
+                "/file",
+                AttrsOptions::new()
+                    .with_fields(Attributes::MODE | Attributes::SIZE | Attributes::NLINK),
+            )
+            .unwrap();
+        assert!(attrs.uid().is_none() && attrs.gid().is_none());
+        let entry = crate::PathData::from_vf(
+            root.path().join("file"),
+            "file".into(),
+            vnfs::directory::DirEntry::new("/file".into(), attrs),
+            &config,
+        );
+        let mut output = crate::TextOutput::new(&config);
+        let (_, owner, group, _, _, _) = display_dir_entry_size(&entry, &config, &mut output.state);
+        assert_eq!((owner, group), (0, 0));
+        assert!(output.state.uid_cache.is_empty());
+        assert!(output.state.gid_cache.is_empty());
+    }
 
     #[test]
     fn missing_size_is_displayed_as_unknown_not_zero() {
