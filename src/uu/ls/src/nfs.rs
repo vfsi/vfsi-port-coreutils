@@ -171,24 +171,30 @@ fn ctx_open_many(
     kernel_dirs: &[&Path],
     masks: Attributes,
 ) -> Vec<Option<LsReadDir>> {
-    let vpaths: vnfs::Result<Vec<PathBuf>> = kernel_dirs
+    let mapped: Vec<_> = kernel_dirs
         .iter()
-        .map(|d| ctx.backend.map(d, ResolvePath::Follow))
+        .map(|path| ctx.backend.map(path, ResolvePath::Follow).ok())
         .collect();
-    let Ok(vpaths) = vpaths else {
-        return std::iter::repeat_with(|| None)
-            .take(kernel_dirs.len())
-            .collect();
-    };
-    let refs: Vec<&Path> = vpaths.iter().map(PathBuf::as_path).collect();
+    let mut out: Vec<Option<LsReadDir>> = std::iter::repeat_with(|| None)
+        .take(kernel_dirs.len())
+        .collect();
+    let refs: Vec<&Path> = mapped.iter().filter_map(Option::as_deref).collect();
+    if refs.is_empty() {
+        return out;
+    }
     let Ok(listings) = ctx.backend.read_dirs(&refs, masks) else {
-        // Callback entries can interleave across directories by READDIR page.
-        // An error index identifies the failed operand, not which earlier
-        // callback streams are complete.
-        return std::iter::repeat_with(|| None).take(refs.len()).collect();
+        // A backend error does not prove which interleaved streams completed.
+        // Only mapping failures can be isolated without replaying reads.
+        return out;
     };
-    let mut out = Vec::with_capacity(refs.len());
-    for (i, listing) in listings.into_iter().enumerate() {
+    if listings.len() != refs.len() {
+        return out;
+    }
+    let indices = mapped
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| path.is_some().then_some(index));
+    for (index, listing) in indices.zip(listings) {
         let mut list = Vec::with_capacity(listing.entries.len());
         for entry in listing.entries {
             let name = entry
@@ -196,12 +202,12 @@ fn ctx_open_many(
                 .map(std::ffi::OsStr::to_os_string)
                 .unwrap_or_default();
             list.push(LsDirEntry::Vf {
-                path: kernel_dirs[i].join(&name),
+                path: kernel_dirs[index].join(&name),
                 name,
                 entry,
             });
         }
-        out.push(Some(LsReadDir::from_vf(list)));
+        out[index] = Some(LsReadDir::from_vf(list));
     }
     out
 }
@@ -466,17 +472,30 @@ mod tests {
         let other = ("a", "/export", "/mnt/b");
         assert_eq!(
             group_mounts(
-                [
-                    None,
-                    Some(mount),
-                    Some(other),
-                    Some(mount),
-                    None
-                ],
+                [None, Some(mount), Some(other), Some(mount), None],
                 |a, b| a == b
             ),
             [(mount, vec![1, 3]), (other, vec![2])]
         );
+    }
+
+    #[test]
+    fn open_many_mapping_failure_preserves_other_operands_and_duplicates() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("good")).unwrap();
+        std::fs::write(root.path().join("good/file"), b"data").unwrap();
+        let mut ctx = dummy_ctx(root.path());
+        let dirs = [
+            root.path().join("good"),
+            root.path().join("vanished"),
+            root.path().join("good"),
+        ];
+        let paths: Vec<_> = dirs.iter().map(PathBuf::as_path).collect();
+        let mut result = ctx_open_many(&mut ctx, &paths, Attributes::MODE);
+        assert_eq!(result.len(), 3);
+        assert_eq!(names(result[0].as_mut()), ["file"]);
+        assert!(result[1].is_none());
+        assert_eq!(names(result[2].as_mut()), ["file"]);
     }
 
     #[test]
@@ -529,7 +548,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("d0")).unwrap();
         std::fs::write(root.path().join("d0/a.txt"), b"a").unwrap();
-        // d1 does not exist.
+        // Mapping succeeds, but listing a regular file must fail.
+        std::fs::write(root.path().join("d1"), b"not a directory").unwrap();
         std::fs::create_dir_all(root.path().join("d2")).unwrap();
         std::fs::write(root.path().join("d2/b.txt"), b"b").unwrap();
         let mut ctx = dummy_ctx(root.path());
