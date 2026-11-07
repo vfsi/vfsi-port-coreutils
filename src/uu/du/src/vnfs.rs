@@ -399,11 +399,11 @@ pub fn try_du(
     if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Ok(None);
     }
-    let Some(mount) = uucore::vnfs::nfs_mount(path) else {
+    let Some(mount) = uucore::vnfs::nfs_mount(path).and_then(uucore::vnfs::mount_root) else {
         return Ok(None);
     };
     let resolved = path.canonicalize().map_err(io::Error::other)?;
-    let Ok(relative) = resolved.strip_prefix(&mount.point) else {
+    let Ok(relative) = resolved.strip_prefix(mount.mount_point()) else {
         return Ok(None);
     };
     // Path inside the export namespace the backend resolves against.
@@ -414,16 +414,20 @@ pub fn try_du(
     let namespace = if std::env::var("VNFS_IMPL").as_deref() == Ok("dummy") {
         "kernel".to_owned()
     } else {
-        format!("nfs:{}", mount.server)
+        format!("nfs:{}", mount.host())
     };
     let counted = context.seen.entry(namespace.clone()).or_default();
-    let key = (namespace, mount.export.clone(), mount.point.clone());
+    let key = (
+        namespace,
+        mount.export_root().to_path_buf(),
+        mount.mount_point().to_path_buf(),
+    );
     if context
         .sessions
         .get(&key)
-        .is_none_or(|session| !session.matches(&mount.point))
+        .is_none_or(|session| !session.matches(&mount))
     {
-        let Ok(session) = Session::open(&mount.point) else {
+        let Ok(session) = Session::open(&mount) else {
             return Ok(None);
         };
         context.sessions.insert(key.clone(), session);

@@ -16,19 +16,7 @@ use vnfs::nfs::Nfs;
 use vnfs::nfs::mount::NfsMountSession;
 use vnfs::posix::Posix;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Mount {
-    config: vnfs::nfs::mount::NfsMount,
-}
-
-/// An NFS mount that contains a path: the server, the exported path, and the
-/// local mountpoint.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NfsMount {
-    pub server: String,
-    pub export: PathBuf,
-    pub point: PathBuf,
-}
+pub use vnfs::nfs::mount::NfsMount;
 
 /// Find the longest NFS mount (if any) that contains `path`.
 ///
@@ -41,12 +29,22 @@ pub fn nfs_mount(path: &Path) -> Option<NfsMount> {
     } else {
         resolved.parent()?
     };
-    let mount = Nfs::discover_mount(directory).ok()?;
-    Some(NfsMount {
-        server: mount.host().to_owned(),
-        export: mount.export_root().to_path_buf(),
-        point: mount.mount_point().to_path_buf(),
-    })
+    Nfs::discover_mount(directory).ok()
+}
+
+/// Compare namespace grouping keys, not session reuse or authorization state.
+pub fn same_mount(a: &NfsMount, b: &NfsMount) -> bool {
+    a.host() == b.host() && a.export_root() == b.export_root() && a.mount_point() == b.mount_point()
+}
+
+/// Resolve one selected group's root once, retaining the complete discovery
+/// snapshot for connection validation and later session reuse.
+pub fn mount_root(mount: NfsMount) -> Option<NfsMount> {
+    if mount.local_path() == mount.mount_point() {
+        return Some(mount);
+    }
+    let root = Nfs::discover_mount(mount.mount_point()).ok()?;
+    same_mount(&mount, &root).then_some(root)
 }
 
 /// One command's mounted namespace and backend. Output paths remain kernel
@@ -63,14 +61,14 @@ pub enum Session {
 }
 
 impl Session {
-    pub fn open(root: &Path) -> std::io::Result<Self> {
+    pub fn open(root: &NfsMount) -> std::io::Result<Self> {
         match std::env::var("VNFS_IMPL").as_deref() {
             Ok("dummy") => Ok(Self::Dummy {
-                fs: Posix::new(root)?,
-                paths: PathMapper::new(root)?,
+                fs: Posix::new(root.local_path())?,
+                paths: PathMapper::new(root.local_path())?,
             }),
             Ok("nfs") => {
-                let session = NfsMountSession::from_mount(root)?;
+                let session = NfsMountSession::from_discovered(root.clone())?;
                 let supports_copy = session
                     .fs()
                     .capabilities()?
@@ -89,12 +87,17 @@ impl Session {
     /// Reuse only an unchanged mount/root/policy/credential discovery snapshot.
     /// A command may retain a matching session while keeping data caches scoped
     /// to that command. No filesystem effects are submitted by this check.
-    pub fn matches(&self, root: &Path) -> bool {
+    pub fn matches(&self, root: &NfsMount) -> bool {
         match self {
-            Self::Dummy { paths, .. } => paths.local_root() == root,
-            Self::Nfs { session, .. } => {
-                Nfs::discover_mount(root).is_ok_and(|config| &config == session.mount())
-            }
+            Self::Dummy { paths, .. } => paths.local_root() == root.local_path(),
+            Self::Nfs { session, .. } => session.mount() == root,
+        }
+    }
+
+    pub fn local_root(&self) -> &Path {
+        match self {
+            Self::Dummy { paths, .. } => paths.local_root(),
+            Self::Nfs { session, .. } => session.local_root(),
         }
     }
 
@@ -182,7 +185,7 @@ impl Session {
     }
 }
 
-fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
+fn remove_paths(path: &Path) -> Option<(NfsMount, PathBuf)> {
     let Component::Normal(name) = path.components().next_back()? else {
         return None;
     };
@@ -191,7 +194,7 @@ fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
     let parent = parent.canonicalize().ok()?;
     let info = Nfs::discover_mount(&parent).ok()?;
     let point = info.mount_point().to_path_buf();
-    let mount = Mount { config: info };
+    let mount = info;
     let absolute = parent.join(name);
 
     // Removing an export's mount point through its server-side path would
@@ -200,13 +203,13 @@ fn remove_paths(path: &Path) -> Option<(Mount, PathBuf)> {
         return None;
     }
 
-    let session = PathMapper::new(mount.config.local_path()).ok()?;
+    let session = PathMapper::new(mount.local_path()).ok()?;
     let dummy_path = session.map(path, ResolvePath::NoFollow).ok()?;
     Some((mount, dummy_path))
 }
 
 thread_local! {
-    static REMOVE_SESSION: std::cell::RefCell<Option<(String, vnfs::nfs::mount::NfsMount, Session)>> =
+    static REMOVE_SESSION: std::cell::RefCell<Option<(String, NfsMount, Session)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -226,22 +229,21 @@ pub fn try_remove(path: &Path, recursive: bool) -> Option<std::io::Result<()>> {
         let mut slot = slot.borrow_mut();
         if slot
             .as_ref()
-            .is_none_or(|(mode, config, _)| mode != &implementation || config != &mount.config)
+            .is_none_or(|(mode, config, _)| mode != &implementation || config != &mount)
         {
-            let backend = match implementation.as_str() {
-                "dummy" => Session::Dummy {
-                    fs: Posix::new(mount.config.local_path()).ok()?,
-                    paths: PathMapper::new(mount.config.local_path()).ok()?,
-                },
-                _ => {
-                    let session = NfsMountSession::from_discovered(mount.config.clone()).ok()?;
-                    Session::Nfs {
-                        session: Box::new(session),
-                        supports_copy: false,
-                    }
+            let backend = if implementation == "dummy" {
+                Session::Dummy {
+                    fs: Posix::new(mount.local_path()).ok()?,
+                    paths: PathMapper::new(mount.local_path()).ok()?,
+                }
+            } else {
+                let session = NfsMountSession::from_discovered(mount.clone()).ok()?;
+                Session::Nfs {
+                    session: Box::new(session),
+                    supports_copy: false,
                 }
             };
-            *slot = Some((implementation, mount.config, backend));
+            *slot = Some((implementation, mount, backend));
         }
         Some(
             slot.as_ref()?

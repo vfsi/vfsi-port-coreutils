@@ -7,10 +7,9 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use uucore::vnfs::Session as Backend;
+use uucore::vnfs::{NfsMount as Mount, Session as Backend, mount_root, same_mount};
 use vnfs::Error as VfError;
 use vnfs::helpers::{PathMapper, ResolvePath};
-use vnfs::nfs::Nfs;
 #[cfg(test)]
 use vnfs::posix::Posix;
 
@@ -28,13 +27,6 @@ fn vf_io_error(e: VfError) -> io::Error {
     e.into()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Mount {
-    server: String,
-    export: PathBuf,
-    point: PathBuf,
-}
-
 fn existing_ancestor(path: &Path) -> &Path {
     let mut candidate = path;
     while !candidate.exists() {
@@ -47,20 +39,7 @@ fn existing_ancestor(path: &Path) -> &Path {
 }
 
 fn nfs_mount(path: &Path) -> Option<Mount> {
-    let path = existing_ancestor(path)
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
-    let directory = if path.is_dir() {
-        path.as_path()
-    } else {
-        path.parent()?
-    };
-    let mount = Nfs::discover_mount(directory).ok()?;
-    Some(Mount {
-        server: mount.host().to_owned(),
-        export: mount.export_root().to_path_buf(),
-        point: mount.mount_point().to_path_buf(),
-    })
+    uucore::vnfs::nfs_mount(existing_ancestor(path))
 }
 
 struct PreparedCopy {
@@ -69,7 +48,6 @@ struct PreparedCopy {
 }
 
 struct Context {
-    mount: Mount,
     backend: Backend,
     prefetched: HashMap<PathBuf, Vec<u8>>,
     prepared_copies: HashMap<PathBuf, PreparedCopy>,
@@ -88,9 +66,8 @@ thread_local! {
 }
 
 fn make_context(mount: Mount) -> io::Result<Context> {
-    let backend = Backend::open(&mount.point)?;
+    let backend = Backend::open(&mount)?;
     Ok(Context {
-        mount,
         backend,
         prefetched: HashMap::new(),
         prepared_copies: HashMap::new(),
@@ -121,7 +98,7 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
     let mut seen_destinations = HashSet::new();
     let mut plans = Vec::with_capacity(sources.len());
     let mut pairs = Vec::with_capacity(sources.len());
-    let paths = PathMapper::new(&target_mount.point)?;
+    let paths = PathMapper::new(target_mount.mount_point())?;
     for (i, source) in sources.iter().enumerate() {
         if !source.metadata().is_ok_and(|metadata| metadata.is_file()) {
             return Ok(false);
@@ -129,7 +106,7 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
         let Some(source_mount) = nfs_mount(source) else {
             return Ok(false);
         };
-        if source_mount != target_mount {
+        if !same_mount(&source_mount, &target_mount) {
             return Ok(false);
         }
         let Some(name) = source.file_name() else {
@@ -149,10 +126,13 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
 
     CTX.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let source_mount = nfs_mount(&sources[0]).expect("validated NFS source");
-        if slot.as_ref().is_none_or(|ctx| {
-            ctx.mount != source_mount || !ctx.backend.matches(&source_mount.point)
-        }) {
+        let Some(source_mount) = mount_root(target_mount) else {
+            return Ok(false);
+        };
+        if slot
+            .as_ref()
+            .is_none_or(|ctx| !ctx.backend.matches(&source_mount))
+        {
             let Ok(context) = make_context(source_mount) else {
                 return Ok(false);
             };
@@ -219,19 +199,15 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
         else {
             continue;
         };
-        let mount = parents.entry(parent.to_path_buf()).or_insert_with(|| {
-            uucore::vnfs::nfs_mount(parent).map(|mount| Mount {
-                server: mount.server,
-                export: mount.export,
-                point: mount.point,
-            })
-        });
+        let mount = parents
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| uucore::vnfs::nfs_mount(parent));
         let Some(mount) = mount.as_ref() else {
             continue;
         };
         if selected_mount
             .as_ref()
-            .is_some_and(|chosen| chosen != mount)
+            .is_some_and(|chosen| !same_mount(chosen, mount))
         {
             continue;
         }
@@ -244,14 +220,14 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
     if selected.len() < 2 {
         return Ok(());
     }
-    let mount = selected_mount.expect("selected VFSI sources have a mount");
+    let Some(mount) = mount_root(selected_mount.expect("selected VFSI sources have a mount"))
+    else {
+        return Ok(());
+    };
 
     CTX.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot
-            .as_ref()
-            .is_none_or(|ctx| ctx.mount != mount || !ctx.backend.matches(&mount.point))
-        {
+        if slot.as_ref().is_none_or(|ctx| !ctx.backend.matches(&mount)) {
             let Ok(context) = make_context(mount.clone()) else {
                 return Ok(());
             };
@@ -345,11 +321,15 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
         return Ok(None);
     };
     let dest_mount = nfs_mount(dest);
+    let Some(source_mount) = mount_root(source_mount) else {
+        return Ok(None);
+    };
     CTX.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot.as_ref().is_none_or(|ctx| {
-            ctx.mount != source_mount || !ctx.backend.matches(&source_mount.point)
-        }) {
+        if slot
+            .as_ref()
+            .is_none_or(|ctx| !ctx.backend.matches(&source_mount))
+        {
             *slot = Some(make_context(source_mount.clone())?);
         }
         let ctx = slot.as_mut().expect("VFSI context initialized");
@@ -366,7 +346,7 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
         if server_copy_enabled()
             && dest_mount
                 .as_ref()
-                .is_some_and(|mount| *mount == source_mount)
+                .is_some_and(|mount| same_mount(mount, &source_mount))
         {
             // Create/truncate through the kernel first so cp retains its normal
             // destination-creation semantics and the mount has no stale tail.
@@ -460,16 +440,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("file");
         std::fs::write(&file, b"hello world").unwrap();
-        let mount = Mount {
-            server: "unused".to_string(),
-            export: PathBuf::from("/different-server-export"),
-            point: root.path().to_path_buf(),
-        };
         let backend = Backend::Dummy {
             fs: Posix::new(root.path()).unwrap(),
             paths: PathMapper::new(root.path()).unwrap(),
         };
-        let mapped = PathMapper::new(&mount.point)
+        let mapped = PathMapper::new(root.path())
             .unwrap()
             .map(&file, ResolvePath::Follow)
             .unwrap();

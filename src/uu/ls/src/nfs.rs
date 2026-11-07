@@ -89,7 +89,6 @@ fn attr_mask(config: &crate::config::Config) -> Attributes {
 
 struct VfContext {
     backend: Backend,
-    mount: NfsMount,
 }
 
 impl Drop for VfContext {
@@ -110,8 +109,8 @@ fn nfs_mountpoint(path: &Path) -> Option<NfsMount> {
 }
 
 fn make_ctx(mount: NfsMount) -> io::Result<VfContext> {
-    let backend = Backend::open(&mount.point)?;
-    Ok(VfContext { backend, mount })
+    let backend = Backend::open(&mount)?;
+    Ok(VfContext { backend })
 }
 
 /// Open `path` for listing through the vectorized backend when applicable.
@@ -120,15 +119,12 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
     if impl_choice().is_none() {
         return Ok(None);
     }
-    let Some(mount) = nfs_mountpoint(path) else {
+    let Some(mount) = nfs_mountpoint(path).and_then(uucore::vnfs::mount_root) else {
         return Ok(None);
     };
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
-        if ctx
-            .as_ref()
-            .is_none_or(|ctx| ctx.mount != mount || !ctx.backend.matches(&mount.point))
-        {
+        if ctx.as_ref().is_none_or(|ctx| !ctx.backend.matches(&mount)) {
             let t0 = std::time::Instant::now();
             *ctx = Some(make_ctx(mount)?);
             if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
@@ -221,7 +217,10 @@ pub fn try_open_many_vf(
     if impl_choice().is_none() || dirs.len() < 2 {
         return Ok(None);
     }
-    let groups = group_mounts(dirs.iter().map(|path| nfs_mountpoint(path)));
+    let groups = group_mounts(
+        dirs.iter().map(|path| nfs_mountpoint(path)),
+        uucore::vnfs::same_mount,
+    );
     if groups.is_empty() {
         return Ok(None);
     }
@@ -230,10 +229,10 @@ pub fn try_open_many_vf(
         let mut out: Vec<Option<LsReadDir>> =
             std::iter::repeat_with(|| None).take(dirs.len()).collect();
         for (mount, indices) in groups {
-            if ctx
-                .as_ref()
-                .is_none_or(|ctx| ctx.mount != mount || !ctx.backend.matches(&mount.point))
-            {
+            let Some(mount) = uucore::vnfs::mount_root(mount) else {
+                continue;
+            };
+            if ctx.as_ref().is_none_or(|ctx| !ctx.backend.matches(&mount)) {
                 *ctx = Some(make_ctx(mount)?);
             }
             let grouped: Vec<&Path> = indices.iter().map(|&i| dirs[i]).collect();
@@ -246,13 +245,19 @@ pub fn try_open_many_vf(
     })
 }
 
-fn group_mounts(mounts: impl IntoIterator<Item = Option<NfsMount>>) -> Vec<(NfsMount, Vec<usize>)> {
-    let mut groups: Vec<(NfsMount, Vec<usize>)> = Vec::new();
+fn group_mounts<M>(
+    mounts: impl IntoIterator<Item = Option<M>>,
+    same: impl Fn(&M, &M) -> bool,
+) -> Vec<(M, Vec<usize>)> {
+    let mut groups: Vec<(M, Vec<usize>)> = Vec::new();
     for (index, mount) in mounts.into_iter().enumerate() {
         let Some(mount) = mount else {
             continue;
         };
-        if let Some((_, indices)) = groups.iter_mut().find(|(candidate, _)| *candidate == mount) {
+        if let Some((_, indices)) = groups
+            .iter_mut()
+            .find(|(candidate, _)| same(candidate, &mount))
+        {
             indices.push(index);
         } else {
             groups.push((mount, vec![index]));
@@ -275,15 +280,12 @@ pub fn try_visit_walk_vf(
     if impl_choice().is_none() || (config.sort == crate::config::Sort::None && config.reverse) {
         return Ok(false);
     }
-    let Some(mount) = nfs_mountpoint(path) else {
+    let Some(mount) = nfs_mountpoint(path).and_then(uucore::vnfs::mount_root) else {
         return Ok(false);
     };
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
-        if ctx
-            .as_ref()
-            .is_none_or(|ctx| ctx.mount != mount || !ctx.backend.matches(&mount.point))
-        {
+        if ctx.as_ref().is_none_or(|ctx| !ctx.backend.matches(&mount)) {
             let t0 = std::time::Instant::now();
             *ctx = Some(make_ctx(mount)?);
             if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
@@ -298,10 +300,16 @@ pub fn try_visit_walk_vf(
         let t0 = std::time::Instant::now();
         match &ctx.backend {
             Backend::Dummy { fs, .. } => {
-                visit_ordered(fs, &ctx.mount.point, path, config, &mut callback)?;
+                visit_ordered(fs, ctx.backend.local_root(), path, config, &mut callback)?;
             }
             Backend::Nfs { session, .. } => {
-                visit_ordered(session.fs(), &ctx.mount.point, path, config, &mut callback)?;
+                visit_ordered(
+                    session.fs(),
+                    ctx.backend.local_root(),
+                    path,
+                    config,
+                    &mut callback,
+                )?;
             }
         }
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
@@ -371,11 +379,6 @@ mod tests {
             backend: Backend::Dummy {
                 fs: Posix::new(root).unwrap(),
                 paths: PathMapper::new(root).unwrap(),
-            },
-            mount: NfsMount {
-                server: "dummy".to_string(),
-                export: PathBuf::from("/"),
-                point: root.to_path_buf(),
             },
         }
     }
@@ -459,23 +462,19 @@ mod tests {
 
     #[test]
     fn groups_mixed_mounts_and_duplicates_without_losing_original_indices() {
-        let mount = NfsMount {
-            server: "a".into(),
-            export: "/export".into(),
-            point: "/mnt/a".into(),
-        };
-        let other = NfsMount {
-            point: "/mnt/b".into(),
-            ..mount.clone()
-        };
+        let mount = ("a", "/export", "/mnt/a");
+        let other = ("a", "/export", "/mnt/b");
         assert_eq!(
-            group_mounts([
-                None,
-                Some(mount.clone()),
-                Some(other.clone()),
-                Some(mount.clone()),
-                None
-            ]),
+            group_mounts(
+                [
+                    None,
+                    Some(mount),
+                    Some(other),
+                    Some(mount),
+                    None
+                ],
+                |a, b| a == b
+            ),
             [(mount, vec![1, 3]), (other, vec![2])]
         );
     }
