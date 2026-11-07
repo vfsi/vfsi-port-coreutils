@@ -56,7 +56,7 @@ pub enum Session {
     },
     Nfs {
         session: Box<NfsMountSession>,
-        supports_copy: bool,
+        copy_capabilities: std::cell::OnceCell<Capabilities>,
     },
 }
 
@@ -69,13 +69,9 @@ impl Session {
             }),
             Ok("nfs") => {
                 let session = NfsMountSession::from_discovered(root.clone())?;
-                let supports_copy = session
-                    .fs()
-                    .capabilities()?
-                    .contains(Capabilities::SERVER_COPY);
                 Ok(Self::Nfs {
                     session: Box::new(session),
-                    supports_copy,
+                    copy_capabilities: std::cell::OnceCell::new(),
                 })
             }
             _ => Err(std::io::Error::new(
@@ -160,13 +156,26 @@ impl Session {
         }
     }
     pub fn copy_files(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<VfResult<()>> {
-        match self {
-            Self::Nfs {
-                session,
-                supports_copy: true,
-            } => Some(session.fs().vcopy(pairs, CopyOptions::default())),
-            _ => None,
-        }
+        let Self::Nfs {
+            session,
+            copy_capabilities,
+        } = self
+        else {
+            return None;
+        };
+        let capabilities = if let Some(capabilities) = copy_capabilities.get() {
+            *capabilities
+        } else {
+            let capabilities = match session.fs().capabilities() {
+                Ok(capabilities) => capabilities,
+                Err(error) => return Some(Err(error)),
+            };
+            let _ = copy_capabilities.set(capabilities);
+            capabilities
+        };
+        capabilities
+            .contains(Capabilities::SERVER_COPY)
+            .then(|| session.fs().vcopy(pairs, CopyOptions::default()))
     }
     fn remove(&self, path: &Path, recursive: bool) -> VfResult<()> {
         let mode = if recursive {
@@ -240,7 +249,7 @@ pub fn try_remove(path: &Path, recursive: bool) -> Option<std::io::Result<()>> {
                 let session = NfsMountSession::from_discovered(mount.clone()).ok()?;
                 Session::Nfs {
                     session: Box::new(session),
-                    supports_copy: false,
+                    copy_capabilities: std::cell::OnceCell::new(),
                 }
             };
             *slot = Some((implementation, mount, backend));
@@ -298,5 +307,36 @@ mod tests {
                 .is_err()
         );
         assert!(dir.exists());
+    }
+    #[test]
+    #[ignore = "requires VFSI_TEST_MOUNT pointing at a writable NFS fixture"]
+    fn copy_capabilities_are_lazy_and_cached_after_a_successful_query() {
+        let root = std::env::var("VFSI_TEST_MOUNT").expect("required NFS fixture");
+        let mount = Nfs::discover_mount(&root).unwrap();
+        let backend = Session::Nfs {
+            session: Box::new(NfsMountSession::from_discovered(mount).unwrap()),
+            copy_capabilities: std::cell::OnceCell::new(),
+        };
+        let Session::Nfs {
+            copy_capabilities, ..
+        } = &backend
+        else {
+            unreachable!()
+        };
+        assert!(copy_capabilities.get().is_none());
+        backend
+            .read_dirs(&[Path::new("/")], Attributes::MODE)
+            .unwrap();
+        assert!(
+            copy_capabilities.get().is_none(),
+            "listing must not query COPY capabilities"
+        );
+        if let Some(result) = backend.copy_files(&[]) {
+            result.unwrap();
+        }
+        assert!(copy_capabilities.get().is_some());
+        if let Some(result) = backend.copy_files(&[]) {
+            result.unwrap();
+        }
     }
 }
