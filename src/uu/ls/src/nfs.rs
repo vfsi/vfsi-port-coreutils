@@ -46,7 +46,7 @@ fn vf_io_error(e: VfError) -> io::Error {
 }
 
 /// Request metadata consumed by the selected rendering and sorting modes.
-/// Session::read_dirs validates required fields before exposing any listing.
+/// `Session::read_dirs` validates required fields before exposing any listing.
 fn attr_mask(config: &crate::config::Config) -> Attributes {
     use crate::{config::Sort, display::Format};
     use uucore::fsext::MetadataTimeField;
@@ -298,10 +298,10 @@ pub fn try_visit_walk_vf(
         let t0 = std::time::Instant::now();
         match &ctx.backend {
             Backend::Dummy { fs, .. } => {
-                visit_ordered(fs, &ctx.mount.point, path, config, &mut callback)?
+                visit_ordered(fs, &ctx.mount.point, path, config, &mut callback)?;
             }
             Backend::Nfs { session, .. } => {
-                visit_ordered(session.fs(), &ctx.mount.point, path, config, &mut callback)?
+                visit_ordered(session.fs(), &ctx.mount.point, path, config, &mut callback)?;
             }
         }
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
@@ -331,7 +331,7 @@ fn visit_ordered<F: vnfs::Vfsi>(
     let result = fs.visit_dirs_ordered(
         root,
         fs.limits().walk_options().with_fields(attr_mask(config)),
-        crate::vf_entry_order(config),
+        crate::vf_entry_order(config, &session),
         |entry| {
             entry
                 .file_name()
@@ -580,14 +580,58 @@ mod tests {
     }
 
     #[test]
+    fn grouping_target_cache_is_scoped_to_one_directory() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["first", "second", "target-dir"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        std::fs::write(root.path().join("target-file"), b"").unwrap();
+        std::fs::write(root.path().join("first/a-file"), b"").unwrap();
+        std::fs::write(root.path().join("second/a-file"), b"").unwrap();
+        std::fs::write(root.path().join("second/b-file"), b"").unwrap();
+        let link = root.path().join("first/z-link");
+        std::os::unix::fs::symlink("../target-file", &link).unwrap();
+        let fs = Posix::new(root.path()).unwrap();
+        let first = fs.read_dir("/first").unwrap();
+        let second = fs.read_dir("/second").unwrap();
+        let find = |name| {
+            first
+                .iter()
+                .find(|entry| entry.file_name().unwrap() == name)
+                .unwrap()
+        };
+        let config = crate::config::Config::from(
+            &crate::uu_app().get_matches_from(["ls", "--group-directories-first"]),
+            None,
+        )
+        .unwrap();
+        let mapper = PathMapper::new(root.path()).unwrap();
+        let mut compare = crate::vf_entry_order(&config, &mapper);
+        assert_eq!(
+            compare(find("z-link"), find("a-file")),
+            std::cmp::Ordering::Greater
+        );
+        let _ = compare(&second[0], &second[1]);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("../target-dir", &link).unwrap();
+        assert_eq!(
+            compare(find("z-link"), find("a-file")),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
     fn vector_order_matches_normal_sort_modes() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("dir")).unwrap();
         for (name, contents) in [("a10.txt", "x"), ("a2.rs", "longer"), ("bb.txt", "zz")] {
             std::fs::write(root.path().join(name), contents).unwrap();
         }
+        std::os::unix::fs::symlink("dir", root.path().join("a-dir-link")).unwrap();
+        std::os::unix::fs::symlink("missing", root.path().join("broken-link")).unwrap();
         let fs = Posix::new(root.path()).unwrap();
         let entries = fs.read_dir("/").unwrap();
+        let mapper = PathMapper::new(root.path()).unwrap();
         let matches = crate::uu_app().get_matches_from(["ls"]);
         let mut config = crate::config::Config::from(&matches, None).unwrap();
         for sort in [
@@ -616,7 +660,7 @@ mod tests {
                     config.reverse = reverse;
                     config.group_directories_first = group;
                     let mut vector = entries.clone();
-                    vector.sort_by(crate::vf_entry_order(&config));
+                    vector.sort_by(crate::vf_entry_order(&config, &mapper));
                     let mut normal: Vec<_> = entries
                         .iter()
                         .map(|entry| {
