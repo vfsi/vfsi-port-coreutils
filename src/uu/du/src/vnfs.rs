@@ -733,6 +733,8 @@ mod tests {
 
     #[test]
     fn command_operands_share_scoped_hardlink_identity() {
+        use std::os::unix::fs::MetadataExt;
+
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("a/file"), 5);
         std::fs::create_dir(dir.path().join("b")).unwrap();
@@ -746,7 +748,6 @@ mod tests {
             .unwrap();
         let identity = file_info(&attrs).unwrap();
         assert_eq!(Some(identity.fs_id()), attrs.fs_id());
-        use std::os::unix::fs::MetadataExt;
         assert_eq!(
             identity.fs_id(),
             u128::from(std::fs::metadata(dir.path().join("a/file")).unwrap().dev())
