@@ -2008,6 +2008,8 @@ dependencies = [
 [[package]]
 name = "nfsv41-sys"
 version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063f4d75e94b8dafab0313553c816e7ba9d24a9596c1c116d1b5ab67cb068df9"
 dependencies = [
  "bindgen 0.73.2",
  "cc",
@@ -4696,7 +4698,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vfsi-core"
-version = "0.1.17"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41f9ca2369f1428e4b973267deb4ca628505a9f02672df13dc2f739946d63572"
 dependencies = [
  "bitfields",
  "bitflags 2.13.2",
@@ -4705,7 +4709,9 @@ dependencies = [
 
 [[package]]
 name = "vfsi-local"
-version = "0.1.15"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea0cc09779d74274ae4f61eade8084312d8128ab983b4648fae65ad2610296dc"
 dependencies = [
  "libc",
  "vfsi-core",
@@ -4714,7 +4720,9 @@ dependencies = [
 
 [[package]]
 name = "vfsi-nfs"
-version = "0.1.16"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0f9db84ef20b03dac5432e56dacf10b29d3b17c683631e375c62123e55ac8c6"
 dependencies = [
  "bitfields",
  "libc",
@@ -4727,6 +4735,8 @@ dependencies = [
 [[package]]
 name = "vfsi-posix"
 version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51c52f916a1a6e7523c6e1e54cfe953e9169a49549dcbe6414e3cfa2ffa0705e"
 dependencies = [
  "vfsi-core",
  "vfsi-local",
@@ -4735,7 +4745,9 @@ dependencies = [
 
 [[package]]
 name = "vfsi-sync"
-version = "0.1.18"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "582bfd31e6df4f8276de9ae71babb26236d557ce13a2c3cae38233c66b54b9fe"
 dependencies = [
  "libc",
  "vfsi-core",
@@ -4743,7 +4755,9 @@ dependencies = [
 
 [[package]]
 name = "vnfs"
-version = "0.0.28"
+version = "0.0.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a953719b910e8973357c3e512e8803d436802d5e2b86a7b8ff483f902372147"
 dependencies = [
  "bitfields",
  "libc",

@@ -40,6 +40,8 @@ Minimal compatible glibc version is same with ubuntu-latest runner. Use `coreuti
 
 ## VFSI port
 
+The optional dependency uses the published `vnfs` 0.0.29 crate from crates.io.
+
 This branch adds opt-in mounted-NFS acceleration with the `vnfs` feature and
 `VNFS_IMPL=nfs`. The Rust ports use the high-level vNFS API and retain mount
 connection settings through shared discovery. `du` and recursive `ls` process
