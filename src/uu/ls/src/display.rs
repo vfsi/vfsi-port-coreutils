@@ -1505,7 +1505,7 @@ mod vfsi_size_tests {
             )
             .unwrap();
         assert!(attrs.uid().is_none() && attrs.gid().is_none());
-        let entry = crate::PathData::from_vf(
+        let entry = PathData::from_vf(
             root.path().join("file"),
             "file".into(),
             vnfs::directory::DirEntry::new("/file".into(), attrs),

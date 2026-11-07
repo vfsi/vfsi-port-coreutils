@@ -16,7 +16,6 @@ use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::cell::RefCell;
-#[cfg(all(feature = "vnfs", target_os = "linux"))]
 use std::cmp::Ordering;
 use std::{
     cell::OnceCell,
@@ -1705,168 +1704,178 @@ pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
     list_with_output(locs, config, &mut output)
 }
 
-fn sort_entries(entries: &mut [PathData], config: &Config) {
-    // The order the name sort uses. Sorting by time falls back on it so that
-    // entries sharing a timestamp come out in a fixed order rather than in
-    // whatever order the directory was read in, which is what GNU ls does and
-    // what every other arm of this match already does.
-    let use_locale = uucore::i18n::collator::should_use_locale_collation();
-    let name_cmp = |a: &PathData, b: &PathData| {
-        if use_locale {
-            uucore::i18n::collator::locale_cmp(
-                os_str_as_bytes_lossy(a.display_name()).as_ref(),
-                os_str_as_bytes_lossy(b.display_name()).as_ref(),
-            )
-        } else {
-            a.display_name().cmp(b.display_name())
-        }
-    };
-
-    match config.sort {
-        Sort::Time => entries.sort_unstable_by(|a, b| {
-            let time = |p: &PathData| {
-                p.metadata()
-                    .and_then(|md| ls_time(md, config.time))
-                    .unwrap_or(UNIX_EPOCH)
-            };
-            time(b).cmp(&time(a)).then_with(|| name_cmp(a, b))
-        }),
-        Sort::Size => {
-            entries.sort_unstable_by(|a, b| {
-                b.metadata()
-                    .and_then(LsMeta::len)
-                    .cmp(&a.metadata().and_then(LsMeta::len))
-                    .then(a.file_name().cmp(b.file_name()))
-            });
-        }
-        // The default sort in GNU ls is case insensitive
-        Sort::Name => entries.sort_unstable_by(name_cmp),
-        Sort::Version => entries.sort_unstable_by(|a, b| {
-            version_cmp(
-                os_str_as_bytes_lossy(a.display_name()).as_ref(),
-                os_str_as_bytes_lossy(b.display_name()).as_ref(),
-            )
-            .then(a.path().cmp(b.path()))
-        }),
-        Sort::Extension => entries.sort_unstable_by(|a, b| {
-            a.path()
-                .extension()
-                .cmp(&b.path().extension())
-                .then(a.path().file_stem().cmp(&b.path().file_stem()))
-        }),
-        Sort::Width => entries.sort_unstable_by(|a, b| {
-            a.display_name()
-                .len()
-                .cmp(&b.display_name().len())
-                .then(a.display_name().cmp(b.display_name()))
-        }),
-        Sort::None => {}
+/// Borrowed sort inputs keep metadata lazy for name/version/extension sorts.
+trait SortEntry {
+    fn sort_name(&self) -> &OsStr;
+    fn sort_path(&self) -> &Path;
+    fn sort_file_name(&self) -> &OsStr {
+        self.sort_name()
     }
+    fn sort_size(&self) -> Option<u64>;
+    fn sort_time(&self, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime>;
+}
 
+impl SortEntry for PathData<'_> {
+    fn sort_name(&self) -> &OsStr {
+        self.display_name()
+    }
+    fn sort_path(&self) -> &Path {
+        self.path()
+    }
+    fn sort_file_name(&self) -> &OsStr {
+        self.file_name()
+    }
+    fn sort_size(&self) -> Option<u64> {
+        self.metadata().and_then(LsMeta::len)
+    }
+    fn sort_time(&self, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
+        self.metadata()
+            .and_then(|metadata| ls_time(metadata, field))
+    }
+}
+
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+impl SortEntry for VnfsDirEntry {
+    fn sort_name(&self) -> &OsStr {
+        self.file_name().unwrap_or_default()
+    }
+    fn sort_path(&self) -> &Path {
+        self.path()
+    }
+    fn sort_size(&self) -> Option<u64> {
+        self.attrs().len()
+    }
+    fn sort_time(&self, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
+        use uucore::fsext::MetadataTimeField;
+        match field {
+            MetadataTimeField::Modification => self.attrs().modified(),
+            MetadataTimeField::Access => self.attrs().accessed(),
+            MetadataTimeField::Change => self.attrs().changed(),
+            MetadataTimeField::Birth => None,
+        }
+    }
+}
+
+fn entry_order<E: SortEntry>(config: &Config) -> impl Fn(&E, &E) -> Ordering + '_ {
+    let use_locale = uucore::i18n::collator::should_use_locale_collation();
+    move |a, b| {
+        let name_cmp = || {
+            if use_locale {
+                uucore::i18n::collator::locale_cmp(
+                    os_str_as_bytes_lossy(a.sort_name()).as_ref(),
+                    os_str_as_bytes_lossy(b.sort_name()).as_ref(),
+                )
+            } else {
+                a.sort_name().cmp(b.sort_name())
+            }
+        };
+        match config.sort {
+            Sort::Time => b
+                .sort_time(config.time)
+                .unwrap_or(UNIX_EPOCH)
+                .cmp(&a.sort_time(config.time).unwrap_or(UNIX_EPOCH))
+                .then_with(name_cmp),
+            Sort::Size => b
+                .sort_size()
+                .cmp(&a.sort_size())
+                .then(a.sort_file_name().cmp(b.sort_file_name())),
+            Sort::Name => name_cmp(),
+            Sort::Version => version_cmp(
+                os_str_as_bytes_lossy(a.sort_name()).as_ref(),
+                os_str_as_bytes_lossy(b.sort_name()).as_ref(),
+            )
+            .then(a.sort_path().cmp(b.sort_path())),
+            Sort::Extension => a
+                .sort_path()
+                .extension()
+                .cmp(&b.sort_path().extension())
+                .then(a.sort_path().file_stem().cmp(&b.sort_path().file_stem())),
+            Sort::Width => a
+                .sort_name()
+                .len()
+                .cmp(&b.sort_name().len())
+                .then(a.sort_name().cmp(b.sort_name())),
+            Sort::None => Ordering::Equal,
+        }
+    }
+}
+
+fn cached_directory(
+    cache: &mut std::collections::HashMap<PathBuf, bool>,
+    key: &Path,
+    lookup: impl FnOnce() -> bool,
+) -> bool {
+    if let Some(&directory) = cache.get(key) {
+        return directory;
+    }
+    let directory = lookup();
+    cache.insert(key.to_path_buf(), directory);
+    directory
+}
+
+fn sort_entries(entries: &mut [PathData], config: &Config) {
+    if config.sort != Sort::None {
+        entries.sort_unstable_by(entry_order(config));
+    }
     if config.reverse {
         entries.reverse();
     }
-
     if config.group_directories_first && config.sort != Sort::None {
-        entries.sort_by_key(|p| {
-            let ft = {
-                // We will always try to deref symlinks to group directories, so PathData.md
-                // is not always useful.
-                if p.must_dereference {
-                    p.file_type()
-                } else {
-                    None
-                }
+        let mut followed = std::collections::HashMap::new();
+        entries.sort_by_key(|entry| {
+            let kind = if entry.must_dereference {
+                entry.file_type()
+            } else {
+                entry.ft.get().and_then(Option::as_ref)
             };
-
-            !match ft {
-                None => {
-                    // If it metadata cannot be determined, treat as a file.
-                    get_metadata_with_deref_opt(&p.p_buf, true)
-                        .map_or_else(|_| false, |m| m.is_dir())
-                }
-                Some(ft) => ft.is_dir(),
+            !match kind {
+                Some(kind) if entry.must_dereference || !kind.is_symlink() => kind.is_dir(),
+                _ => cached_directory(&mut followed, entry.path(), || {
+                    get_metadata_with_deref_opt(entry.path(), true).is_ok_and(|m| m.is_dir())
+                }),
             }
         });
     }
 }
 
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
-/// Sort `vnfs` entry attributes exactly as [`sort_entries`] would sort the
-/// corresponding [`PathData`], so the vectorized recursive walk can order its
-/// output (and thus the sub-directory visit order) identically to the normal
-/// path under any locale and sort mode.
-pub(crate) fn vf_entry_order(
-    config: &Config,
-) -> impl FnMut(&VnfsDirEntry, &VnfsDirEntry) -> Ordering + '_ {
-    use crate::config::Sort;
-    fn name_of(a: &VnfsDirEntry) -> &OsStr {
-        a.file_name().unwrap_or_default()
-    }
-    fn ext_of(e: &VnfsDirEntry) -> Option<&OsStr> {
-        e.path().extension()
-    }
-    fn stem_of(e: &VnfsDirEntry) -> Option<&OsStr> {
-        e.path().file_stem()
-    }
-    let use_locale = uucore::i18n::collator::should_use_locale_collation();
+/// Apply the same ordering to already fetched entries; resolve only symlink
+/// directory grouping through the kernel, once per name in this sort scope.
+pub(crate) fn vf_entry_order<'a>(
+    config: &'a Config,
+    mapper: &'a vnfs::helpers::PathMapper,
+) -> impl FnMut(&VnfsDirEntry, &VnfsDirEntry) -> Ordering + 'a {
+    let compare = entry_order(config);
+    let mut followed = std::collections::HashMap::new();
+    let mut parent = None;
     move |a, b| {
-        let name_cmp = || {
-            if use_locale {
-                uucore::i18n::collator::locale_cmp(
-                    os_str_as_bytes_lossy(name_of(a)).as_ref(),
-                    os_str_as_bytes_lossy(name_of(b)).as_ref(),
-                )
-            } else {
-                name_of(a).cmp(name_of(b))
-            }
-        };
-        let order = match config.sort {
-            Sort::Time => vf_time(b, config.time)
-                .unwrap_or(UNIX_EPOCH)
-                .cmp(&vf_time(a, config.time).unwrap_or(UNIX_EPOCH))
-                .then_with(name_cmp),
-            Sort::Size => b
-                .attrs()
-                .len()
-                .cmp(&a.attrs().len())
-                .then_with(|| name_of(a).cmp(name_of(b))),
-            Sort::Name => name_cmp(),
-            Sort::Version => version_cmp(
-                os_str_as_bytes_lossy(name_of(a)).as_ref(),
-                os_str_as_bytes_lossy(name_of(b)).as_ref(),
-            )
-            .then(a.path().cmp(b.path())),
-            Sort::Extension => ext_of(a).cmp(&ext_of(b)).then(stem_of(a).cmp(&stem_of(b))),
-            Sort::Width => name_of(a)
-                .len()
-                .cmp(&name_of(b).len())
-                .then(name_of(a).cmp(name_of(b))),
-            Sort::None => Ordering::Equal,
-        };
+        let order = compare(a, b);
         let order = if config.reverse {
             order.reverse()
         } else {
             order
         };
         if config.group_directories_first && config.sort != Sort::None {
-            (a.file_type() != vnfs::directory::FileType::Directory)
-                .cmp(&(b.file_type() != vnfs::directory::FileType::Directory))
-                .then(order)
+            if parent.as_deref() != a.path().parent() {
+                followed.clear();
+                parent = a.path().parent().map(Path::to_path_buf);
+            }
+            let mut directory = |entry: &VnfsDirEntry| {
+                if !entry.attrs().is_symlink() {
+                    return entry.attrs().is_dir();
+                }
+                cached_directory(&mut followed, entry.path(), || {
+                    mapper
+                        .local_path(entry.path())
+                        .ok()
+                        .and_then(|path| get_metadata_with_deref_opt(&path, true).ok())
+                        .is_some_and(|metadata| metadata.is_dir())
+                })
+            };
+            (!directory(a)).cmp(&!directory(b)).then(order)
         } else {
             order
         }
-    }
-}
-
-#[cfg(all(feature = "vnfs", target_os = "linux"))]
-fn vf_time(a: &VnfsDirEntry, field: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
-    use uucore::fsext::MetadataTimeField;
-    match field {
-        MetadataTimeField::Modification => a.attrs().modified(),
-        MetadataTimeField::Access => a.attrs().accessed(),
-        MetadataTimeField::Change => a.attrs().changed(),
-        MetadataTimeField::Birth => None,
     }
 }
 
@@ -2037,4 +2046,44 @@ fn get_security_context<'a>(
     }
 
     Cow::Borrowed(SUBSTITUTE_STRING)
+}
+
+#[cfg(test)]
+mod shared_order_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct NameOnly(&'static str);
+    impl SortEntry for NameOnly {
+        fn sort_name(&self) -> &OsStr {
+            OsStr::new(self.0)
+        }
+        fn sort_path(&self) -> &Path {
+            Path::new(self.0)
+        }
+        fn sort_size(&self) -> Option<u64> {
+            panic!("filename sort fetched size")
+        }
+        fn sort_time(&self, _: uucore::fsext::MetadataTimeField) -> Option<SystemTime> {
+            panic!("filename sort fetched a timestamp")
+        }
+    }
+
+    #[test]
+    fn filename_sort_modes_keep_metadata_lazy() {
+        let matches = uu_app().get_matches_from(["ls", "-1"]);
+        let mut config = Config::from(&matches, None).unwrap();
+        for (sort, expected) in [
+            (Sort::Name, ["a10.txt", "a2.rs", "b"]),
+            (Sort::Version, ["a2.rs", "a10.txt", "b"]),
+            (Sort::Extension, ["b", "a2.rs", "a10.txt"]),
+            (Sort::Width, ["b", "a2.rs", "a10.txt"]),
+            (Sort::None, ["a10.txt", "a2.rs", "b"]),
+        ] {
+            config.sort = sort;
+            let mut entries = ["a10.txt", "a2.rs", "b"].map(NameOnly);
+            entries.sort_by(entry_order(&config));
+            assert_eq!(entries.map(|entry| entry.0), expected);
+        }
+    }
 }
