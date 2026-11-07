@@ -109,7 +109,7 @@ impl Session {
             Self::Nfs { session, .. } => session.map_many(paths, policy),
         }
     }
-    pub fn attrs(
+    pub fn attrs_nofollow(
         &self,
         paths: &[PathBuf],
         fields: Attributes,
@@ -124,18 +124,49 @@ impl Session {
     }
     pub fn read_dirs(&self, dirs: &[&Path], fields: Attributes) -> VfResult<Vec<DirectoryListing>> {
         let options = ListDirOptions::new().with_fields(fields);
-        let trees = match self {
-            Self::Dummy { fs, .. } => fs.read_dirs_with_options(dirs, options),
-            Self::Nfs { session, .. } => session.fs().read_dirs_with_options(dirs, options),
-        }?;
-        let trees: Vec<DirectoryListing> = trees.into_iter().flatten().collect();
-        for listing in &trees {
-            for entry in &listing.entries {
-                entry.attrs().require(fields - Attributes::NAMED_ATTR)?;
+        let mut listings: Vec<_> = dirs
+            .iter()
+            .map(|path| DirectoryListing {
+                path: path.to_path_buf(),
+                entries: Vec::new(),
+            })
+            .collect();
+        let mut collect = |index: usize, page: DirectoryListing| {
+            let listing = listings
+                .get_mut(index)
+                .ok_or_else(|| vnfs::Error::invalid_reply(None, "invalid directory root index"))?;
+            if page.path != listing.path {
+                return Err(vnfs::Error::invalid_reply(
+                    Some(index),
+                    "invalid shallow directory path",
+                ));
             }
+            for entry in &page.entries {
+                entry
+                    .attrs()
+                    .require(fields - Attributes::NAMED_ATTR)
+                    .map_err(|error| error.with_index(index))?;
+            }
+            listing.entries.extend(page.entries);
+            Ok(std::ops::ControlFlow::Continue(()))
+        };
+        let completion = match self {
+            Self::Dummy { fs, .. } => fs.vlistdirs(dirs, options, &mut collect),
+            Self::Nfs { session, .. } => session.fs().vlistdirs(dirs, options, &mut collect),
+        }?;
+        if completion.len() != dirs.len()
+            || completion
+                .iter()
+                .any(|state| *state != vnfs::directory::TraversalCompletion::Complete)
+        {
+            return Err(vnfs::Error::invalid_reply(
+                None,
+                "incomplete shallow directory collection",
+            ));
         }
-        Ok(trees)
+        Ok(listings)
     }
+
     pub fn read_files(&self, paths: &[PathBuf], limit: usize) -> VfResult<Vec<Vec<u8>>> {
         let limit = std::num::NonZeroUsize::new(limit)
             .ok_or_else(|| vnfs::Error::errno(0, libc::EINVAL as u32))?;
@@ -155,7 +186,9 @@ impl Session {
             }
         }
     }
-    pub fn copy_files(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<VfResult<()>> {
+    /// None means server COPY was not submitted and another method may be used.
+    /// An error in Some does not authorize blind replay; callers own partial effects.
+    pub fn try_server_copy(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<VfResult<()>> {
         let Self::Nfs {
             session,
             copy_capabilities,
@@ -268,6 +301,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shallow_collection_preserves_empty_and_duplicate_roots() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("empty")).unwrap();
+        std::fs::create_dir(root.path().join("full")).unwrap();
+        std::fs::write(root.path().join("full/file"), b"data").unwrap();
+        let backend = Session::Dummy {
+            fs: Posix::new(root.path()).unwrap(),
+            paths: PathMapper::new(root.path()).unwrap(),
+        };
+        let dirs = [Path::new("/full"), Path::new("/empty"), Path::new("/full")];
+        let listings = backend.read_dirs(&dirs, Attributes::MODE).unwrap();
+        assert_eq!(listings.len(), dirs.len());
+        for (listing, path) in listings.iter().zip(dirs) {
+            assert_eq!(listing.path, path);
+        }
+        assert!(listings[1].entries.is_empty());
+        assert_eq!(listings[0].entries.len(), 1);
+        assert_eq!(listings[2].entries.len(), 1);
+        assert_eq!(listings[0].entries[0].path(), listings[2].entries[0].path());
+        assert!(backend.read_dirs(&[], Attributes::MODE).unwrap().is_empty());
+    }
+
+    #[test]
     fn removes_empty_directory() {
         let root = tempfile::tempdir().unwrap();
         let empty = root.path().join("empty");
@@ -331,11 +387,11 @@ mod tests {
             copy_capabilities.get().is_none(),
             "listing must not query COPY capabilities"
         );
-        if let Some(result) = backend.copy_files(&[]) {
+        if let Some(result) = backend.try_server_copy(&[]) {
             result.unwrap();
         }
         assert!(copy_capabilities.get().is_some());
-        if let Some(result) = backend.copy_files(&[]) {
+        if let Some(result) = backend.try_server_copy(&[]) {
             result.unwrap();
         }
     }
