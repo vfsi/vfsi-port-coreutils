@@ -26,3 +26,6 @@ jobs:
       - name: Build the VFSI multicall binary
         run: |
           cargo build --locked --no-default-features --features "cp du ls rm rmdir feat_vnfs"
+      - name: Verify copy fallback with round-robin enabled
+        run: |
+          cargo test --locked --no-default-features --features "cp du ls rm rmdir feat_vnfs" --test tests test_round_robin_opt_in
