@@ -1889,9 +1889,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libntirpc-sys"
-version = "0.3.3"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53598d8ac548008245e75c0c70370f8553aa882bd0dd9e6f75135fd6976fc5ff"
+checksum = "483b27e21c5d1fe5c133583183bb31df3fb2f2044d5f79aea1226913b7573388"
 dependencies = [
  "bindgen 0.73.2",
  "cc",
@@ -4698,9 +4698,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vfsi-core"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e31b459362c556472102cab7fb407425ecbbd704753f08649cb93714b65a7d17"
+checksum = "b913717ec4ad7d94cca50b9fb9c13d195f4a3106f9e77bf386e452471fa01de4"
 dependencies = [
  "bitfields",
  "bitflags 2.13.2",
@@ -4755,9 +4755,9 @@ dependencies = [
 
 [[package]]
 name = "vnfs"
-version = "0.0.30"
+version = "0.0.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80b22602e6bd732fb8b3b93cedfbbc09b2b6b8c60bd75714afa54ac59ec04701"
+checksum = "0ef11ae29b749759375bcaec6440b4068422ce070ed383dabcaca70c2ec8a933"
 dependencies = [
  "bitfields",
  "libc",
