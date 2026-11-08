@@ -186,6 +186,20 @@ impl Session {
             }
         }
     }
+    /// Copy into caller-admitted writers; destination policy stays with the utility.
+    pub fn copy_to_writers<W: std::io::Write>(
+        &self,
+        paths: &[PathBuf],
+        writers: &mut [W],
+        options: vnfs::helpers::WriterCopyOptions,
+    ) -> VfResult<Vec<u64>> {
+        match self {
+            Self::Dummy { fs, .. } => vnfs::helpers::copy_to_writers(fs, paths, writers, options),
+            Self::Nfs { session, .. } => {
+                vnfs::helpers::copy_to_writers(session.fs(), paths, writers, options)
+            }
+        }
+    }
     /// None means server COPY was not submitted and another method may be used.
     /// An error in Some does not authorize blind replay; callers own partial effects.
     pub fn try_server_copy(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<VfResult<()>> {

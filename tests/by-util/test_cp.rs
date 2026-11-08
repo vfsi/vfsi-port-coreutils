@@ -9546,3 +9546,50 @@ fn test_progressbar_inexistent_source() {
         .fails_with_code(1)
         .stderr_contains("cp: cannot stat 'inexistent1': No such file or directory");
 }
+
+// Enabling the streaming experiment must not consume small files or bypass
+// ordinary overwrite/symlink policy when the batch is ineligible.
+#[test]
+#[cfg(all(target_os = "linux", feature = "feat_vnfs"))]
+fn test_round_robin_opt_in_retains_small_file_and_no_clobber_fallback() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.write("one", "first");
+    at.write("two", "second");
+    at.mkdir("out");
+    at.write("out/one", "keep");
+    scene
+        .ucmd()
+        .env("VNFS_IMPL", "dummy")
+        .env("VNFS_CP_STREAM_BYTES", "2097152")
+        .args(&["--reflink=never", "-n", "one", "two", "out"])
+        .succeeds();
+    assert_eq!(at.read("out/one"), "keep");
+    assert_eq!(at.read("out/two"), "second");
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "feat_vnfs"))]
+fn test_round_robin_opt_in_retains_destination_symlink_policy() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.write("one", "first");
+    at.write("two", "second");
+    at.write("referent", "old");
+    at.mkdir("out");
+    at.symlink_file(at.plus("referent"), "out/one");
+    scene
+        .ucmd()
+        .env("VNFS_IMPL", "dummy")
+        .env("VNFS_CP_STREAM_BYTES", "2097152")
+        .args(&["--reflink=never", "one", "two", "out"])
+        .succeeds();
+    assert_eq!(at.read("referent"), "first");
+    assert_eq!(at.read("out/two"), "second");
+    assert!(
+        std_fs::symlink_metadata(at.plus("out/one"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}

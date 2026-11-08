@@ -55,6 +55,22 @@ server-side COPY is experimental and disabled by default: enabling
 caller to account for cache coherence. This port does not provide filesystem
 identity or a new coherence guarantee.
 
+For large, independent sources, experimental round-robin client reads can be
+selected with `VNFS_CP_STREAM_BYTES=2097152` and `cp --reflink=never`.
+This uses the new vnfs multi-writer helper with a 2 MiB read budget and bounded
+open destinations; it writes directly into caller-owned files without staging.
+Only plain copies of files larger than 64 MiB from one directory into new
+destinations qualify. Existing destinations, symlinks, small/mixed inputs and
+metadata-sensitive options keep the established path. The default is disabled
+(or set the budget to zero). A failed batch returns failure and may leave
+multiple partial outputs; it is never replayed. `VNFS_PROFILE=1` reports
+`cp_vfsi_method=round_robin` when this path succeeds.
+
+This experiment currently needs the uncommitted vnfs helper in `~/vnfs02`.
+For local verification, pass
+`--config 'patch.crates-io.vnfs.path="/home/ubuntu/vnfs02/crates/vnfs"'`
+to Cargo. No machine-specific dependency path is stored in the manifest.
+
 ## Goals
 
 uutils coreutils aims to be a drop-in replacement for the GNU utils. Differences with GNU
