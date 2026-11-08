@@ -1460,6 +1460,11 @@ pub fn copy(sources: &[PathBuf], target: &Path, options: &Options) -> CopyResult
     let target_type = TargetType::determine(sources, target);
     verify_target_type(target, target_type)?;
 
+    #[cfg(all(feature = "vnfs", target_os = "linux"))]
+    if let Some(result) = vfsi::try_round_robin(sources, target, options) {
+        return result.map_err(|e| CpError::IoErrContext(e, "VFSI round-robin copy".into()));
+    }
+
     let mut non_fatal_errors = false;
     let mut seen_sources = HashSet::with_capacity(sources.len());
     let mut symlinked_files = HashSet::new();

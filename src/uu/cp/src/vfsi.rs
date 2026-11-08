@@ -396,9 +396,319 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
     })
 }
 
+/// Experimental direct-to-destination batching. Explicit opt-in keeps ordinary
+/// cp failure ordering unchanged. No fallback is permitted after output starts.
+pub fn try_round_robin(
+    sources: &[PathBuf],
+    target: &Path,
+    options: &super::Options,
+) -> Option<io::Result<()>> {
+    let budget = std::env::var("VNFS_CP_STREAM_BYTES")
+        .ok()?
+        .parse::<usize>()
+        .ok()
+        .and_then(std::num::NonZeroUsize::new)?;
+    if impl_choice().is_none() || !plain_stream_options(options) || sources.len() < 2 {
+        return None;
+    }
+    let entries = stream_entries(sources, target, options)?;
+    // Admission requires one identical parent and rejects source symlinks.
+    // Resolve that directory once instead of rediscovering it for every file.
+    let mount = mount_root(nfs_mount(stream_parent(&sources[0]))?)?;
+    let backend = match Backend::open(&mount) {
+        Ok(backend) => backend,
+        Err(error) => return Some(Err(error)),
+    };
+    let paths = match backend.map_many(sources, ResolvePath::Follow) {
+        Ok(paths) => paths,
+        Err(error) => return Some(Err(error.into())),
+    };
+    Some(copy_stream_entries(&backend, &paths, &entries, budget))
+}
+
+fn plain_stream_options(options: &super::Options) -> bool {
+    use super::{BackupMode, ClobberMode, CopyMode, OverwriteMode, ReflinkMode, SparseMode};
+    options.copy_mode == CopyMode::Copy
+        && options.update == super::UpdateMode::All
+        && options.overwrite == OverwriteMode::Clobber(ClobberMode::Standard)
+        && options.backup == BackupMode::None
+        && options.attributes == super::Attributes::NONE
+        && options.reflink_mode == ReflinkMode::Never
+        && options.sparse_mode != SparseMode::Always
+        && options.dereference(true)
+        && !options.attributes_only
+        && !options.parents
+        && !options.recursive
+        && !options.no_target_dir
+        && !options.one_file_system
+        && !options.copy_contents
+        && !options.strip_trailing_slashes
+        && !options.verbose
+        && !options.debug
+        && !options.progress_bar
+        && !options.set_selinux_context
+        && options.context.is_none()
+}
+
+fn stream_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn stream_entries(
+    sources: &[PathBuf],
+    target: &Path,
+    options: &super::Options,
+) -> Option<Vec<(PathBuf, std::fs::Permissions)>> {
+    // All operands must be independent regular files and fresh destinations.
+    // Anything requiring prompts, backups, symlink policy or metadata
+    // preservation stays on cp's established admission and finalization path.
+    if !target.is_dir() {
+        return None;
+    }
+    let mut names = HashSet::new();
+    let parent = stream_parent(sources.first()?);
+    sources
+        .iter()
+        .map(|source| {
+            let metadata = source.symlink_metadata().ok()?;
+            if stream_parent(source) != parent
+                || !metadata.is_file()
+                || metadata.len() <= 64 * 1024 * 1024
+            {
+                return None;
+            }
+            let name = source.file_name()?;
+            if !names.insert(name.to_owned())
+                || source.as_os_str().as_encoded_bytes().ends_with(b"/")
+            {
+                return None;
+            }
+            let dest = target.join(name);
+            if dest.symlink_metadata().err()?.kind() != io::ErrorKind::NotFound {
+                return None;
+            }
+            let permissions =
+                super::calculate_dest_permissions(None, &dest, &metadata, options, "");
+            Some((dest, permissions))
+        })
+        .collect()
+}
+
+fn copy_stream_entries(
+    backend: &Backend,
+    paths: &[PathBuf],
+    entries: &[(PathBuf, std::fs::Permissions)],
+    budget: std::num::NonZeroUsize,
+) -> io::Result<()> {
+    // Bound open destinations as well as read storage.
+    let capacity = (budget.get() / (1024 * 1024)).clamp(1, 32);
+    let options = vnfs::helpers::WriterCopyOptions::new().with_round_robin(budget);
+    for (paths, entries) in paths.chunks(capacity).zip(entries.chunks(capacity)) {
+        let mut outputs = Vec::with_capacity(entries.len());
+        for (dest, _) in entries {
+            // Atomic refusal of a destination created after preflight. Never
+            // truncate a competing file or follow a competing symlink.
+            outputs.push(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(dest)?,
+            );
+        }
+        backend
+            .copy_to_writers(paths, &mut outputs, options)
+            .map_err(vf_io_error)?;
+        for (output, (_, permissions)) in outputs.iter().zip(entries) {
+            // Match cp's best-effort chmod, through the owned descriptor.
+            output.set_permissions(permissions.clone()).ok();
+        }
+        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+            eprintln!(
+                "[profile] cp_vfsi_method=round_robin cp_stream_files={} cp_stream_bytes={budget}",
+                paths.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stream_options() -> super::super::Options {
+        super::super::Options {
+            reflink_mode: super::super::ReflinkMode::Never,
+            cli_dereference: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn streaming_resolves_bare_relative_operands_against_the_current_directory() {
+        assert_eq!(stream_parent(Path::new("one")), Path::new("."));
+        assert_eq!(stream_parent(Path::new("./two")), Path::new("."));
+        assert_eq!(stream_parent(Path::new("/dir/one")), Path::new("/dir"));
+    }
+
+    #[test]
+    fn streaming_keeps_complex_copy_policies_on_the_existing_path() {
+        let base = stream_options();
+        assert!(plain_stream_options(&base));
+        let mut options = stream_options();
+        options.verbose = true;
+        assert!(!plain_stream_options(&options));
+        options = stream_options();
+        options.parents = true;
+        assert!(!plain_stream_options(&options));
+        options = stream_options();
+        options.overwrite = super::super::OverwriteMode::NoClobber;
+        assert!(!plain_stream_options(&options));
+        options = stream_options();
+        options.attributes_only = true;
+        assert!(!plain_stream_options(&options));
+        options = stream_options();
+        options.recursive = true;
+        assert!(!plain_stream_options(&options));
+        assert!(!plain_stream_options(&super::super::Options::default()));
+    }
+
+    #[test]
+    fn streaming_admission_rejects_small_duplicate_existing_and_symlink_operands() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let one = root.path().join("one");
+        let two = root.path().join("two");
+        std::fs::File::create(&one)
+            .unwrap()
+            .set_len(65 * 1024 * 1024)
+            .unwrap();
+        std::fs::File::create(&two)
+            .unwrap()
+            .set_len(65 * 1024 * 1024)
+            .unwrap();
+        let sources = [one.clone(), two.clone()];
+        assert!(stream_entries(&sources, dest.path(), &stream_options()).is_some());
+        assert!(
+            stream_entries(&[one.clone(), one.clone()], dest.path(), &stream_options()).is_none()
+        );
+        std::os::unix::fs::symlink("missing", dest.path().join("two")).unwrap();
+        assert!(stream_entries(&sources, dest.path(), &stream_options()).is_none());
+        std::fs::remove_file(dest.path().join("two")).unwrap();
+        std::fs::write(dest.path().join("two"), b"existing").unwrap();
+        assert!(stream_entries(&sources, dest.path(), &stream_options()).is_none());
+        std::fs::remove_file(dest.path().join("two")).unwrap();
+        std::fs::remove_file(&two).unwrap();
+        std::os::unix::fs::symlink(&one, &two).unwrap();
+        assert!(stream_entries(&sources, dest.path(), &stream_options()).is_none());
+        std::fs::remove_file(&two).unwrap();
+        std::fs::write(&two, b"small").unwrap();
+        assert!(stream_entries(&sources, dest.path(), &stream_options()).is_none());
+        let other = dest.path().join("another");
+        std::fs::File::create(&other)
+            .unwrap()
+            .set_len(65 * 1024 * 1024)
+            .unwrap();
+        assert!(stream_entries(&[one, other], dest.path(), &stream_options()).is_none());
+    }
+
+    #[test]
+    fn streaming_writes_owned_destinations_and_applies_modes_without_staging() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("one"), b"first").unwrap();
+        std::fs::write(root.path().join("two"), b"second").unwrap();
+        let backend = Backend::Dummy {
+            fs: Posix::new(root.path()).unwrap(),
+            paths: PathMapper::new(root.path()).unwrap(),
+        };
+        let paths = vec![PathBuf::from("/one"), PathBuf::from("/two")];
+        let entries = vec![
+            (
+                dest.path().join("one"),
+                std::fs::Permissions::from_mode(0o640),
+            ),
+            (
+                dest.path().join("two"),
+                std::fs::Permissions::from_mode(0o400),
+            ),
+        ];
+        copy_stream_entries(
+            &backend,
+            &paths,
+            &entries,
+            std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&entries[0].0).unwrap(), b"first");
+        assert_eq!(std::fs::read(&entries[1].0).unwrap(), b"second");
+        for (path, mode) in &entries {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                mode.mode()
+            );
+        }
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 2);
+        // A racing destination must never be truncated, including symlinks.
+        assert!(
+            copy_stream_entries(
+                &backend,
+                &paths,
+                &entries,
+                std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&entries[0].0).unwrap(), b"first");
+        std::fs::remove_file(&entries[0].0).unwrap();
+        std::os::unix::fs::symlink(&entries[1].0, &entries[0].0).unwrap();
+        assert!(
+            copy_stream_entries(
+                &backend,
+                &paths,
+                &entries,
+                std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&entries[1].0).unwrap(), b"second");
+    }
+
+    #[test]
+    fn streaming_source_failure_is_returned_without_scalar_replay() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let backend = Backend::Dummy {
+            fs: Posix::new(root.path()).unwrap(),
+            paths: PathMapper::new(root.path()).unwrap(),
+        };
+        let entries = vec![(
+            dest.path().join("missing"),
+            std::fs::Permissions::from_mode(0o644),
+        )];
+        let error = copy_stream_entries(
+            &backend,
+            &[PathBuf::from("/missing")],
+            &entries,
+            std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(&entries[0].0).unwrap(), b"");
+        assert_eq!(
+            std::fs::metadata(&entries[0].0)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn prefetch_batches_regular_files_with_one_budget_and_leaves_symlinks_to_cp() {

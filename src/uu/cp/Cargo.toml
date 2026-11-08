@@ -67,7 +67,7 @@ name = "cp_bench"
 harness = false
 
 [features]
-vnfs = ["dep:vnfs"]
+vnfs = ["dep:vnfs", "uucore/vnfs"]
 selinux = ["dep:selinux", "uucore/selinux"]
 
 [lints]
