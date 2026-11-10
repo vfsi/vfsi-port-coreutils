@@ -80,6 +80,65 @@ fn server_copy_enabled() -> bool {
     std::env::var("VNFS_CP_SERVER_COPY").as_deref() == Ok("1")
 }
 
+// Only a proven unsubmitted input permits another copy method. A definite
+// failure can include partial effects; an uncertain failure can still be live.
+fn server_copy_completed(outcome: vnfs::OpResult<()>) -> Result<bool, VfError> {
+    match outcome {
+        Ok(()) => Ok(true),
+        Err(error) if error.state() == vnfs::error::FailureState::NotAttempted => Ok(false),
+        Err(error) => Err(error.into_cause()),
+    }
+}
+
+fn retain_server_copies(
+    prepared: &mut HashMap<PathBuf, PreparedCopy>,
+    plans: Vec<(PathBuf, PreparedCopy)>,
+    outcomes: vnfs::VecResult<()>,
+) -> io::Result<bool> {
+    // An outer rejection guarantees that no input COPY was dispatched.
+    let Ok(outcomes) = outcomes else {
+        return Ok(false);
+    };
+    if outcomes.len() != plans.len() {
+        for (_, copy) in plans {
+            let _ = std::fs::remove_file(copy.temp);
+        }
+        return Err(vf_io_error(VfError::invalid_reply(
+            None,
+            "invalid server-copy outcome count",
+        )));
+    }
+    let mut first_error = None;
+    let mut copied = false;
+    for (index, ((source, copy), outcome)) in plans.into_iter().zip(outcomes).enumerate() {
+        match server_copy_completed(outcome) {
+            Ok(true) => {
+                copied = true;
+                prepared.insert(source, copy);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // These are private, uniquely named staging paths. Cleanup is
+                // best effort and does not claim unknown effects were undone.
+                let _ = std::fs::remove_file(&copy.temp);
+                first_error
+                    .get_or_insert_with(|| error.with_index(index).with_context("copy", source));
+            }
+        }
+    }
+    match first_error {
+        Some(error) => {
+            // The command will not publish this failed batch. Release known
+            // completed staging files now; process exit may skip TLS Drop.
+            for (_, copy) in prepared.drain() {
+                let _ = std::fs::remove_file(copy.temp);
+            }
+            Err(vf_io_error(error))
+        }
+        None => Ok(copied),
+    }
+}
+
 fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<bool> {
     if !server_copy_enabled()
         || sources.len() < 2
@@ -139,19 +198,17 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
             *slot = Some(context);
         }
         let ctx = slot.as_mut().expect("VFSI context initialized");
-        if let Some(Ok(())) = ctx.backend.try_server_copy(&pairs) {
-            ctx.prepared_copies.extend(plans);
-            if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-                let copied = pairs.len();
-                eprintln!("[profile] cp_vfsi_batched_server_copies={copied}");
-            }
-            Ok(true)
-        } else {
-            for (_, prepared) in plans {
-                let _ = std::fs::remove_file(prepared.temp);
-            }
-            Ok(false)
+        let Some(outcomes) = ctx.backend.try_server_copy(&pairs) else {
+            return Ok(false);
+        };
+        let copied = retain_server_copies(&mut ctx.prepared_copies, plans, outcomes)?;
+        if copied && std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+            eprintln!(
+                "[profile] cp_vfsi_batched_server_copies={}",
+                ctx.prepared_copies.len()
+            );
         }
+        Ok(copied)
     })
 }
 
@@ -360,22 +417,19 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
                 ctx.backend.map(source, ResolvePath::Follow)?,
                 ctx.backend.map(dest, ResolvePath::Follow)?,
             );
-            if let Some(result) = ctx.backend.try_server_copy(std::slice::from_ref(&pair)) {
-                match result {
-                    Ok(()) => {
-                        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-                            eprintln!("[profile] cp_vfsi_method=server_copy");
-                        }
-                        return Ok(Some("vfsi-server-copy"));
+            if let Some(Ok(mut outcomes)) = ctx.backend.try_server_copy(std::slice::from_ref(&pair))
+            {
+                if outcomes.len() != 1 {
+                    return Err(vf_io_error(VfError::invalid_reply(
+                        None,
+                        "invalid server-copy outcome count",
+                    )));
+                }
+                if server_copy_completed(outcomes.pop().unwrap()).map_err(vf_io_error)? {
+                    if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+                        eprintln!("[profile] cp_vfsi_method=server_copy");
                     }
-                    Err(error) => {
-                        // COPY is an optional v4.2 facility. Re-truncate and
-                        // use the established client-side VFSI path when an
-                        // export or server declines it.
-                        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-                            eprintln!("[profile] cp_vfsi_server_copy_fallback={error}");
-                        }
-                    }
+                    return Ok(Some("vfsi-server-copy"));
                 }
             }
         }
@@ -537,6 +591,133 @@ fn copy_stream_entries(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn malformed_server_copy_reply_cleans_staging_without_publishing_or_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let temp = root.path().join("staging");
+        let dest = root.path().join("destination");
+        std::fs::write(&temp, b"copied once").unwrap();
+        std::fs::write(&dest, b"racing destination").unwrap();
+        let mut prepared = HashMap::new();
+        assert!(
+            retain_server_copies(
+                &mut prepared,
+                vec![(
+                    PathBuf::from("source"),
+                    PreparedCopy {
+                        dest: dest.clone(),
+                        temp: temp.clone()
+                    }
+                )],
+                Ok(vec![])
+            )
+            .is_err()
+        );
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(dest).unwrap(), b"racing destination");
+        assert!(prepared.is_empty());
+    }
+
+    #[test]
+    fn server_copy_only_unsubmitted_errors_allow_fallback() {
+        use vnfs::error::OpError;
+        assert!(server_copy_completed(Ok(())).unwrap());
+        assert!(
+            !server_copy_completed(Err(OpError::not_attempted(VfError::unsupported(None))))
+                .unwrap()
+        );
+        for unknown in [false, true] {
+            let cause = VfError::unsupported(None);
+            let error = if unknown {
+                OpError::unknown(cause, None)
+            } else {
+                OpError::failed(cause, None)
+            };
+            assert!(server_copy_completed(Err(error)).is_err());
+        }
+    }
+
+    #[test]
+    fn server_copy_failure_cleans_nonprefix_successes_without_fallback() {
+        use vnfs::error::OpError;
+        for unknown in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let plans: Vec<_> = (0..3)
+                .map(|index| {
+                    let source = PathBuf::from(format!("source-{index}"));
+                    let temp = root.path().join(format!("staged-{index}"));
+                    std::fs::write(&temp, b"completed once").unwrap();
+                    (
+                        source,
+                        PreparedCopy {
+                            dest: root.path().join(format!("target-{index}")),
+                            temp,
+                        },
+                    )
+                })
+                .collect();
+            let mut prepared = HashMap::new();
+            let cause = VfError::unsupported(None);
+            let error = if unknown {
+                OpError::unknown(cause, None)
+            } else {
+                OpError::failed(cause, None)
+            };
+            assert!(
+                retain_server_copies(&mut prepared, plans, Ok(vec![Ok(()), Err(error), Ok(())]))
+                    .is_err()
+            );
+            assert!(prepared.is_empty());
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn server_copy_rejection_and_unsubmitted_siblings_keep_safe_fallback() {
+        use vnfs::error::OpError;
+        let root = tempfile::tempdir().unwrap();
+        let plans = || {
+            (0..2)
+                .map(|index| {
+                    (
+                        PathBuf::from(format!("source-{index}")),
+                        PreparedCopy {
+                            dest: root.path().join(format!("target-{index}")),
+                            temp: root.path().join(format!("staged-{index}")),
+                        },
+                    )
+                })
+                .collect()
+        };
+        let mut prepared = HashMap::new();
+        assert!(
+            !retain_server_copies(
+                &mut prepared,
+                plans(),
+                Err(VfError::transport(None, "rejected before dispatch"))
+            )
+            .unwrap()
+        );
+        assert!(prepared.is_empty());
+        assert!(
+            retain_server_copies(
+                &mut prepared,
+                plans(),
+                Ok(vec![
+                    Err(OpError::not_attempted(VfError::unsupported(None))),
+                    Ok(())
+                ])
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            prepared.keys().collect::<Vec<_>>(),
+            [&PathBuf::from("source-1")]
+        );
+        assert!(retain_server_copies(&mut prepared, plans(), Ok(vec![Ok(())])).is_err());
+    }
+
     use super::*;
 
     fn stream_options() -> super::super::Options {
