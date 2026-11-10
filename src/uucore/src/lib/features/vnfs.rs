@@ -118,8 +118,8 @@ impl Session {
             .with_fields(fields)
             .with_follow_final_symlink(false);
         match self {
-            Self::Dummy { fs, .. } => fs.vgetattrs(paths, options),
-            Self::Nfs { session, .. } => session.fs().vgetattrs(paths, options),
+            Self::Dummy { fs, .. } => fs.getattrs_all(paths, options),
+            Self::Nfs { session, .. } => session.fs().getattrs_all(paths, options),
         }
     }
     pub fn read_dirs(&self, dirs: &[&Path], fields: Attributes) -> VfResult<Vec<DirectoryListing>> {
@@ -151,8 +151,8 @@ impl Session {
             Ok(std::ops::ControlFlow::Continue(()))
         };
         let completion = match self {
-            Self::Dummy { fs, .. } => fs.vlistdirs(dirs, options, &mut collect),
-            Self::Nfs { session, .. } => session.fs().vlistdirs(dirs, options, &mut collect),
+            Self::Dummy { fs, .. } => fs.listdirs_all(dirs, options, &mut collect),
+            Self::Nfs { session, .. } => session.fs().listdirs_all(dirs, options, &mut collect),
         }?;
         if completion.len() != dirs.len()
             || completion
@@ -201,8 +201,9 @@ impl Session {
         }
     }
     /// None means server COPY was not submitted and another method may be used.
-    /// An error in Some does not authorize blind replay; callers own partial effects.
-    pub fn try_server_copy(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<VfResult<()>> {
+    /// An outer rejection means no COPY input was dispatched. Inner failures
+    /// retain each input's certainty; Failed/Unknown do not authorize replay.
+    pub fn try_server_copy(&self, pairs: &[(PathBuf, PathBuf)]) -> Option<vnfs::VecResult<()>> {
         let Self::Nfs {
             session,
             copy_capabilities,
@@ -231,11 +232,11 @@ impl Session {
             RemoveMode::Entry
         };
         match self {
-            Self::Dummy { fs, .. } => fs.vremove(&[path], mode, RemoveOptions::default()),
+            Self::Dummy { fs, .. } => fs.removes_all(&[path], mode, RemoveOptions::default()),
             Self::Nfs { session, .. } => {
                 session
                     .fs()
-                    .vremove(&[path], mode, RemoveOptions::default())
+                    .removes_all(&[path], mode, RemoveOptions::default())
             }
         }
     }
@@ -344,7 +345,7 @@ mod tests {
         std::fs::create_dir(&empty).unwrap();
         let fs = Posix::new(root.path()).unwrap();
 
-        fs.vremove(&["/empty"], RemoveMode::Entry, RemoveOptions::default())
+        fs.removes_all(&["/empty"], RemoveMode::Entry, RemoveOptions::default())
             .unwrap();
 
         assert!(!empty.exists());
@@ -358,7 +359,7 @@ mod tests {
         std::fs::write(tree.join("child/file"), b"data").unwrap();
         let fs = Posix::new(root.path()).unwrap();
 
-        fs.vremove(&["/tree"], RemoveMode::Tree, RemoveOptions::default())
+        fs.removes_all(&["/tree"], RemoveMode::Tree, RemoveOptions::default())
             .unwrap();
 
         assert!(!tree.exists());
@@ -373,7 +374,7 @@ mod tests {
         let fs = Posix::new(root.path()).unwrap();
 
         assert!(
-            fs.vremove(&["/dir"], RemoveMode::Entry, RemoveOptions::default())
+            fs.removes_all(&["/dir"], RemoveMode::Entry, RemoveOptions::default())
                 .is_err()
         );
         assert!(dir.exists());

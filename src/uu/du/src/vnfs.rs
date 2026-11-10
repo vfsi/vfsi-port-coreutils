@@ -187,7 +187,7 @@ fn traverse<F: Vfsi>(
         print_tx,
         counted,
         |visitor| {
-            backend.vlistdirs(
+            backend.listdirs_all(
                 &[vroot],
                 backend
                     .limits()
