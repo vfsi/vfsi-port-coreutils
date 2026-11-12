@@ -5795,8 +5795,8 @@ fn test_invalid_max_unchanged_stats_is_rejected() {
     for value in ["-1", "abc"] {
         new_ucmd!()
             .arg(format!("--max-unchanged-stats={value}"))
-            .pipe_in("a\n")
             .fails_with_code(1)
+            .no_stdout()
             .stderr_contains("invalid maximum number of unchanged stats between opens: '")
             .stderr_contains(value);
     }
