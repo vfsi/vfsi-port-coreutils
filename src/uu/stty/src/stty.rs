@@ -881,10 +881,12 @@ fn apply_saved_state(termios: &mut Termios, state: &(CFlags, CCFlags)) {
 }
 
 fn apply_special_setting(
-    _termios: &mut Termios,
+    termios: &mut Termios,
     setting: &SpecialSetting,
     fd: impl AsFd,
 ) -> io::Result<()> {
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = termios;
     let mut size = tcgetwinsize(&fd)?;
     match setting {
         SpecialSetting::Rows(n) => size.ws_row = *n,
@@ -897,7 +899,7 @@ fn apply_special_setting(
             // nix only defines Termios's `line_discipline` field on these platforms
             #[cfg(any(target_os = "linux", target_os = "android"))]
             {
-                _termios.line_discipline = *n;
+                termios.line_discipline = *n;
             }
         }
     }
