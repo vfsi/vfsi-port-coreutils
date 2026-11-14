@@ -893,14 +893,12 @@ fn apply_saved_state(termios: &mut Termios, state: &(CFlags, CCFlags)) {
 }
 
 fn apply_special_setting(
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android")),
-        expect(unused_variables)
-    )]
     termios: &mut Termios,
     setting: &SpecialSetting,
     fd: impl AsFd,
 ) -> io::Result<()> {
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = termios;
     let mut size = tcgetwinsize(&fd)?;
     match setting {
         SpecialSetting::Rows(n) => size.ws_row = *n,
