@@ -105,8 +105,12 @@ impl Session {
     }
     pub fn map_many(&self, paths: &[PathBuf], policy: ResolvePath) -> VfResult<Vec<PathBuf>> {
         match self {
-            Self::Dummy { paths: mapper, .. } => mapper.map_many(paths, policy),
-            Self::Nfs { session, .. } => session.map_many(paths, policy),
+            Self::Dummy { paths: mapper, .. } => mapper
+                .map_many(paths, policy)
+                .map_err(vnfs::error::IndexedError::into_cause),
+            Self::Nfs { session, .. } => session
+                .map_many(paths, policy)
+                .map_err(vnfs::error::IndexedError::into_cause),
         }
     }
     pub fn attrs_nofollow(
@@ -118,8 +122,13 @@ impl Session {
             .with_fields(fields)
             .with_follow_final_symlink(false);
         match self {
-            Self::Dummy { fs, .. } => fs.getattrs_all(paths, options),
-            Self::Nfs { session, .. } => session.fs().getattrs_all(paths, options),
+            Self::Dummy { fs, .. } => fs
+                .getattrs_all(paths, options)
+                .map_err(vnfs::error::IndexedError::into_cause),
+            Self::Nfs { session, .. } => session
+                .fs()
+                .getattrs_all(paths, options)
+                .map_err(vnfs::error::IndexedError::into_cause),
         }
     }
     pub fn read_dirs(&self, dirs: &[&Path], fields: Attributes) -> VfResult<Vec<DirectoryListing>> {
@@ -132,35 +141,40 @@ impl Session {
             })
             .collect();
         let mut collect = |index: usize, page: DirectoryListing| {
-            let listing = listings
-                .get_mut(index)
-                .ok_or_else(|| vnfs::Error::invalid_reply(None, "invalid directory root index"))?;
+            let listing = listings.get_mut(index).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid directory root index",
+                )
+            })?;
             if page.path != listing.path {
-                return Err(vnfs::Error::invalid_reply(
-                    Some(index),
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
                     "invalid shallow directory path",
                 ));
             }
             for entry in &page.entries {
-                entry
-                    .attrs()
-                    .require(fields - Attributes::NAMED_ATTR)
-                    .map_err(|error| error.with_index(index))?;
+                entry.attrs().require(fields - Attributes::NAMED_ATTR)?;
             }
             listing.entries.extend(page.entries);
             Ok(std::ops::ControlFlow::Continue(()))
         };
         let completion = match self {
-            Self::Dummy { fs, .. } => fs.listdirs_all(dirs, options, &mut collect),
-            Self::Nfs { session, .. } => session.fs().listdirs_all(dirs, options, &mut collect),
+            Self::Dummy { fs, .. } => fs
+                .listdirs_all(dirs, options, &mut collect)
+                .map_err(vnfs::error::IndexedError::into_cause),
+            Self::Nfs { session, .. } => session
+                .fs()
+                .listdirs_all(dirs, options, &mut collect)
+                .map_err(vnfs::error::IndexedError::into_cause),
         }?;
         if completion.len() != dirs.len()
             || completion
                 .iter()
                 .any(|state| *state != vnfs::directory::TraversalCompletion::Complete)
         {
-            return Err(vnfs::Error::invalid_reply(
-                None,
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
                 "incomplete shallow directory collection",
             ));
         }
@@ -169,11 +183,16 @@ impl Session {
 
     pub fn read_files(&self, paths: &[PathBuf], limit: usize) -> VfResult<Vec<Vec<u8>>> {
         let limit = std::num::NonZeroUsize::new(limit)
-            .ok_or_else(|| vnfs::Error::errno(0, libc::EINVAL as u32))?;
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
         let options = ReadOptions::new().with_max_total_bytes(limit);
         match self {
-            Self::Dummy { fs, .. } => fs.read_files_with_options(paths, options),
-            Self::Nfs { session, .. } => session.fs().read_files_with_options(paths, options),
+            Self::Dummy { fs, .. } => fs
+                .read_files_with_options(paths, options)
+                .map_err(vnfs::error::IndexedError::into_cause),
+            Self::Nfs { session, .. } => session
+                .fs()
+                .read_files_with_options(paths, options)
+                .map_err(vnfs::error::IndexedError::into_cause),
         }
     }
     pub fn copy_to_writer(&self, path: &Path, writer: &mut impl std::io::Write) -> VfResult<u64> {
@@ -194,9 +213,11 @@ impl Session {
         options: vnfs::helpers::WriterCopyOptions,
     ) -> VfResult<Vec<u64>> {
         match self {
-            Self::Dummy { fs, .. } => vnfs::helpers::copy_to_writers(fs, paths, writers, options),
+            Self::Dummy { fs, .. } => vnfs::helpers::copy_to_writers(fs, paths, writers, options)
+                .map_err(vnfs::error::IndexedError::into_cause),
             Self::Nfs { session, .. } => {
                 vnfs::helpers::copy_to_writers(session.fs(), paths, writers, options)
+                    .map_err(vnfs::error::IndexedError::into_cause)
             }
         }
     }
@@ -232,12 +253,13 @@ impl Session {
             RemoveMode::Entry
         };
         match self {
-            Self::Dummy { fs, .. } => fs.removes_all(&[path], mode, RemoveOptions::default()),
-            Self::Nfs { session, .. } => {
-                session
-                    .fs()
-                    .removes_all(&[path], mode, RemoveOptions::default())
-            }
+            Self::Dummy { fs, .. } => fs
+                .removes_all(&[path], mode, RemoveOptions::default())
+                .map_err(vnfs::error::IndexedError::into_cause),
+            Self::Nfs { session, .. } => session
+                .fs()
+                .removes_all(&[path], mode, RemoveOptions::default())
+                .map_err(vnfs::error::IndexedError::into_cause),
         }
     }
 }
@@ -302,12 +324,7 @@ pub fn try_remove(path: &Path, recursive: bool) -> Option<std::io::Result<()>> {
             };
             *slot = Some((implementation, mount, backend));
         }
-        Some(
-            slot.as_ref()?
-                .2
-                .remove(&relative_path, recursive)
-                .map_err(Into::into),
-        )
+        Some(slot.as_ref()?.2.remove(&relative_path, recursive))
     })
 }
 
@@ -346,6 +363,7 @@ mod tests {
         let fs = Posix::new(root.path()).unwrap();
 
         fs.removes_all(&["/empty"], RemoveMode::Entry, RemoveOptions::default())
+            .map_err(vnfs::error::IndexedError::into_cause)
             .unwrap();
 
         assert!(!empty.exists());
@@ -360,6 +378,7 @@ mod tests {
         let fs = Posix::new(root.path()).unwrap();
 
         fs.removes_all(&["/tree"], RemoveMode::Tree, RemoveOptions::default())
+            .map_err(vnfs::error::IndexedError::into_cause)
             .unwrap();
 
         assert!(!tree.exists());

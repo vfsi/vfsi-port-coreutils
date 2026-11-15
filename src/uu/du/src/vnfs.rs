@@ -82,7 +82,7 @@ fn usage_from_attrs(
     attrs: &Metadata,
     options: &TraversalOptions,
 ) -> io::Result<Usage> {
-    attrs.require(attr_mask(options)).map_err(io::Error::from)?;
+    attrs.require(attr_mask(options))?;
     Ok(Usage {
         path: path.to_path_buf(),
         // Directories report zero apparent size, like `Stat::new`.
@@ -187,15 +187,17 @@ fn traverse<F: Vfsi>(
         print_tx,
         counted,
         |visitor| {
-            backend.listdirs_all(
-                &[vroot],
-                backend
-                    .limits()
-                    .walk_options()
-                    .with_fields(masks)
-                    .with_allow_symlink_components(false),
-                visitor,
-            )
+            backend
+                .listdirs_all(
+                    &[vroot],
+                    backend
+                        .limits()
+                        .walk_options()
+                        .with_fields(masks)
+                        .with_allow_symlink_components(false),
+                    visitor,
+                )
+                .map_err(vnfs::error::IndexedError::into_cause)
         },
     )?;
     if !options.count_links {
@@ -254,11 +256,14 @@ fn traverse_pages(
     let mut linked: HashMap<FsObjId, LinkedFile> = HashMap::default();
     let completion = visit(&mut |index, listing| {
         if index != 0 {
-            return Err(vnfs::Error::invalid_reply(None, "du: invalid root index"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "du: invalid root index",
+            ));
         }
-        let parent = *positions
-            .get(&listing.path)
-            .ok_or_else(|| vnfs::Error::invalid_reply(None, "du: unadmitted directory page"))?;
+        let parent = *positions.get(&listing.path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "du: unadmitted directory page")
+        })?;
         let depth = directories[parent].depth + 1;
         let mut pruned = Vec::new();
         for entry in listing.entries {
@@ -283,7 +288,7 @@ fn traverse_pages(
                 continue;
             }
             let usage = usage_from_attrs(&rendered, entry.attrs(), options)
-                .map_err(|_| vnfs::Error::errno(0, libc::ENOTSUP as u32))?;
+                .map_err(|_| io::Error::from_raw_os_error(libc::ENOTSUP))?;
             if entry.attrs().is_dir() {
                 if !options.count_links
                     && let Some(id) = file_info(entry.attrs())
@@ -299,7 +304,10 @@ fn traverse_pages(
                     .insert(entry.path().to_path_buf(), child)
                     .is_some()
                 {
-                    return Err(vnfs::Error::invalid_reply(None, "du: duplicate directory"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "du: duplicate directory",
+                    ));
                 }
                 directories.push(Directory {
                     usage,
@@ -351,7 +359,7 @@ fn traverse_pages(
                 accumulate(&mut directories[parent].usage, &usage);
                 if options.all {
                     send(print_tx, usage, depth)
-                        .map_err(|_| vnfs::Error::errno(0, libc::EPIPE as u32))?;
+                        .map_err(|_| io::Error::from_raw_os_error(libc::EPIPE))?;
                 }
             }
         }

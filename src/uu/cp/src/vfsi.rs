@@ -8,7 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use uucore::vnfs::{NfsMount as Mount, Session as Backend, mount_root, same_mount};
-use vnfs::Error as VfError;
+
 use vnfs::helpers::{PathMapper, ResolvePath};
 #[cfg(test)]
 use vnfs::posix::Posix;
@@ -21,10 +21,6 @@ fn impl_choice() -> Option<&'static str> {
         Ok("nfs") => Some("nfs"),
         _ => None,
     }
-}
-
-fn vf_io_error(e: VfError) -> io::Error {
-    e.into()
 }
 
 fn existing_ancestor(path: &Path) -> &Path {
@@ -82,7 +78,7 @@ fn server_copy_enabled() -> bool {
 
 // Only a proven unsubmitted input permits another copy method. A definite
 // failure can include partial effects; an uncertain failure can still be live.
-fn server_copy_completed(outcome: vnfs::OpResult<()>) -> Result<bool, VfError> {
+fn server_copy_completed(outcome: vnfs::OpResult<()>) -> Result<bool, io::Error> {
     match outcome {
         Ok(()) => Ok(true),
         Err(error) if error.state() == vnfs::error::FailureState::NotAttempted => Ok(false),
@@ -103,10 +99,10 @@ fn retain_server_copies(
         for (_, copy) in plans {
             let _ = std::fs::remove_file(copy.temp);
         }
-        return Err(vf_io_error(VfError::invalid_reply(
-            None,
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "invalid server-copy outcome count",
-        )));
+        ));
     }
     let mut first_error = None;
     let mut copied = false;
@@ -121,8 +117,9 @@ fn retain_server_copies(
                 // These are private, uniquely named staging paths. Cleanup is
                 // best effort and does not claim unknown effects were undone.
                 let _ = std::fs::remove_file(&copy.temp);
-                first_error
-                    .get_or_insert_with(|| error.with_index(index).with_context("copy", source));
+                first_error.get_or_insert_with(|| {
+                    vnfs::error::IndexedError::at(index, error).with_context("copy", source)
+                });
             }
         }
     }
@@ -133,7 +130,7 @@ fn retain_server_copies(
             for (_, copy) in prepared.drain() {
                 let _ = std::fs::remove_file(copy.temp);
             }
-            Err(vf_io_error(error))
+            Err(error.into_cause())
         }
         None => Ok(copied),
     }
@@ -321,7 +318,10 @@ fn prefetch_regular_files(
     let paths = backend.map_many(sources, ResolvePath::NoFollow)?;
     let attrs = backend.attrs_nofollow(&paths, Attributes::MODE | Attributes::SIZE)?;
     if attrs.len() != paths.len() {
-        return Err(VfError::invalid_reply(None, "cp: invalid attribute count"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cp: invalid attribute count",
+        ));
     }
     let mut remaining = budget;
     let mut selected = Vec::new();
@@ -346,7 +346,10 @@ fn prefetch_regular_files(
     }
     let data = backend.read_files(&operands, budget)?;
     if data.len() != selected.len() {
-        return Err(VfError::invalid_reply(None, "cp: invalid read count"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cp: invalid read count",
+        ));
     }
     Ok(selected.into_iter().zip(data).collect())
 }
@@ -420,12 +423,12 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
             if let Some(Ok(mut outcomes)) = ctx.backend.try_server_copy(std::slice::from_ref(&pair))
             {
                 if outcomes.len() != 1 {
-                    return Err(vf_io_error(VfError::invalid_reply(
-                        None,
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
                         "invalid server-copy outcome count",
-                    )));
+                    ));
                 }
-                if server_copy_completed(outcomes.pop().unwrap()).map_err(vf_io_error)? {
+                if server_copy_completed(outcomes.pop().unwrap())? {
                     if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
                         eprintln!("[profile] cp_vfsi_method=server_copy");
                     }
@@ -443,9 +446,7 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             eprintln!("[profile] cp_vfsi_method=client_read");
         }
-        ctx.backend
-            .copy_to_writer(&source_path, &mut output)
-            .map_err(vf_io_error)?;
+        ctx.backend.copy_to_writer(&source_path, &mut output)?;
         Ok(Some("vfsi-client-read"))
     })
 }
@@ -475,7 +476,7 @@ pub fn try_round_robin(
     };
     let paths = match backend.map_many(sources, ResolvePath::Follow) {
         Ok(paths) => paths,
-        Err(error) => return Some(Err(error.into())),
+        Err(error) => return Some(Err(error)),
     };
     Some(copy_stream_entries(&backend, &paths, &entries, budget))
 }
@@ -572,9 +573,7 @@ fn copy_stream_entries(
                     .open(dest)?,
             );
         }
-        backend
-            .copy_to_writers(paths, &mut outputs, options)
-            .map_err(vf_io_error)?;
+        backend.copy_to_writers(paths, &mut outputs, options)?;
         for (output, (_, permissions)) in outputs.iter().zip(entries) {
             // Match cp's best-effort chmod, through the owned descriptor.
             output.set_permissions(permissions.clone()).ok();
@@ -624,11 +623,13 @@ mod tests {
         use vnfs::error::OpError;
         assert!(server_copy_completed(Ok(())).unwrap());
         assert!(
-            !server_copy_completed(Err(OpError::not_attempted(VfError::unsupported(None))))
-                .unwrap()
+            !server_copy_completed(Err(OpError::not_attempted(io::Error::from(
+                io::ErrorKind::Unsupported
+            ))))
+            .unwrap()
         );
         for unknown in [false, true] {
-            let cause = VfError::unsupported(None);
+            let cause = io::Error::from(io::ErrorKind::Unsupported);
             let error = if unknown {
                 OpError::unknown(cause, None)
             } else {
@@ -658,7 +659,7 @@ mod tests {
                 })
                 .collect();
             let mut prepared = HashMap::new();
-            let cause = VfError::unsupported(None);
+            let cause = io::Error::from(io::ErrorKind::Unsupported);
             let error = if unknown {
                 OpError::unknown(cause, None)
             } else {
@@ -695,7 +696,7 @@ mod tests {
             !retain_server_copies(
                 &mut prepared,
                 plans(),
-                Err(VfError::transport(None, "rejected before dispatch"))
+                Err(io::Error::other("rejected before dispatch"))
             )
             .unwrap()
         );
@@ -705,7 +706,9 @@ mod tests {
                 &mut prepared,
                 plans(),
                 Ok(vec![
-                    Err(OpError::not_attempted(VfError::unsupported(None))),
+                    Err(OpError::not_attempted(io::Error::from(
+                        io::ErrorKind::Unsupported
+                    ))),
                     Ok(())
                 ])
             )
@@ -950,7 +953,7 @@ mod tests {
         let error = backend
             .read_files(std::slice::from_ref(&mapped), 0)
             .unwrap_err();
-        assert_eq!(io::Error::from(error).kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
             backend
                 .read_files(std::slice::from_ref(&mapped), 4)
