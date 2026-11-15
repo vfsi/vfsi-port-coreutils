@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
 use uucore::vnfs::Session as Backend;
-use vnfs::Error as VfError;
+
 use vnfs::directory::{Attributes, DirEntry};
 use vnfs::files::VfsiExt;
 use vnfs::helpers::{PathMapper, ResolvePath};
@@ -36,13 +36,6 @@ fn impl_choice() -> Option<&'static str> {
         Ok("nfs") => Some("nfs"),
         _ => None,
     }
-}
-
-/// Map a vectorized error to an `io::Error`, choosing an `ErrorKind` from the
-/// typed [`vnfs::Error`] (transport vs. filesystem status) and keeping the
-/// operation index in the message.
-fn vf_io_error(e: VfError) -> io::Error {
-    e.into()
 }
 
 /// Request metadata consumed by the selected rendering and sorting modes.
@@ -142,8 +135,8 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
                 Some(listing) => listing,
                 None => return Err(io::Error::other("vnfs returned no directory listing")),
             },
-            Err(error) if error.raw_code() == uucore::libc::EFBIG as u32 => return Ok(None),
-            Err(error) => return Err(vf_io_error(error)),
+            Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Ok(None),
+            Err(error) => return Err(error),
         };
 
         let mut out = Vec::with_capacity(listing.entries.len());
@@ -337,10 +330,8 @@ fn visit_ordered<F: vnfs::Vfsi>(
     callback: &mut impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
 ) -> uucore::error::UResult<()> {
     use vnfs::directory::WalkControl;
-    let session = PathMapper::new(mount).map_err(vf_io_error)?;
-    let root = session
-        .map(path, ResolvePath::Follow)
-        .map_err(vf_io_error)?;
+    let session = PathMapper::new(mount)?;
+    let root = session.map(path, ResolvePath::Follow)?;
     let mut output_error = None;
     let result = fs.visit_dirs_ordered(
         root,
@@ -370,7 +361,7 @@ fn visit_ordered<F: vnfs::Vfsi>(
     if let Some(error) = output_error {
         return Err(error);
     }
-    result.map_err(vf_io_error)?;
+    result?;
     Ok(())
 }
 

@@ -4698,9 +4698,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vfsi-core"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba0f55468355a8e15adede76367bc6dbbe16abc2a3ca1229a28bc84171c8fd32"
+checksum = "8dc7b2d255f3174bbd941a73f56de9e0899d14a03bf97a0fb470918f71d41304"
 dependencies = [
  "bitfields",
  "bitflags 2.13.2",
@@ -4709,9 +4709,9 @@ dependencies = [
 
 [[package]]
 name = "vfsi-local"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "672d9d0dcee6b7ad392fd0a45d2937ea05c36db8e49f14c5f9b1dc77611d5057"
+checksum = "206575d14b541293b6bb6d99c4018e2b455397d21b265a1162c6a7288393e9d4"
 dependencies = [
  "libc",
  "vfsi-core",
@@ -4720,9 +4720,9 @@ dependencies = [
 
 [[package]]
 name = "vfsi-nfs"
-version = "0.2.4"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31cb0de01128d5dff0a871a54e3b7454911afb3289d88ee57ba1ae7e991cc8a8"
+checksum = "6969c94ce04e18a14ca5a18755527893d09b0de64860eba0e62ec80cb58467ea"
 dependencies = [
  "bitfields",
  "libc",
@@ -4734,9 +4734,9 @@ dependencies = [
 
 [[package]]
 name = "vfsi-posix"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8507a31909dace9d100c36e2d5f34243b4086a8cecb512f1a73f21eb8a2b0da"
+checksum = "55c4600a1f7d6ec134c2c470ed2fdfd94180406a2f184ecbe8ef8d15924fe66a"
 dependencies = [
  "vfsi-core",
  "vfsi-local",
@@ -4745,9 +4745,9 @@ dependencies = [
 
 [[package]]
 name = "vfsi-sync"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8341281b037a46d4d2e8fa38dd7b61354cfd232e3b472933e4f592ad80144a64"
+checksum = "77ed15d71c70d53e3040bafe358b588aff64a31ba1fb9e48d75203961e3c7e30"
 dependencies = [
  "libc",
  "vfsi-core",
@@ -4755,9 +4755,9 @@ dependencies = [
 
 [[package]]
 name = "vnfs"
-version = "0.0.35"
+version = "0.0.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74516580dc0eac3cbc0f9920e1889445a4b9a5f96ddf472cd8e137c8571d3edc"
+checksum = "e79f16b7673f2d499cdf69502a4d6b93fb680a532104ca6b67008d8f5514770c"
 dependencies = [
  "bitfields",
  "libc",
