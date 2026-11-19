@@ -1478,31 +1478,9 @@ fn list_recursive_vf<O: LsOutput>(
         return Ok(false);
     }
     let t0 = std::time::Instant::now();
-    let root_kernel = root.path();
-    // A directory (and its whole subtree) is skipped when it or any ancestor
-    // below the root is not displayed (e.g. hidden without `-a`). The walk is
-    // pre-ordered, so once one is skipped its descendants follow contiguously.
-    let mut skip_until: Option<usize> = None;
     let mut entries = Vec::new();
     let mut i = 0usize;
     let used = nfs::try_visit_walk_vf(root.path(), config, |w| {
-        let rel = Path::new(&w.path)
-            .strip_prefix(root_kernel)
-            .unwrap_or(Path::new(&w.path));
-        let depth = rel.components().count();
-        if let Some(skip) = skip_until {
-            if depth > skip {
-                return Ok(());
-            }
-            skip_until = None;
-        }
-        if rel
-            .components()
-            .any(|c| !display::should_display(c.as_os_str(), config))
-        {
-            skip_until = Some(depth);
-            return Ok(());
-        }
         let path = PathBuf::from(&w.path);
         let path_data = PathData::new(path.clone().into(), None, None, config, false, false);
         output.write_dir_header(&path_data, config, i == 0 && pos == 0 && files_is_empty)?;

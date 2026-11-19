@@ -336,7 +336,7 @@ fn visit_ordered<F: vnfs::Vfsi>(
     let root = session.map(path, ResolvePath::Follow)?;
     let mut output_error = None;
     let result = fs.visit_dirs_ordered(
-        root,
+        &root,
         fs.limits().walk_options().with_fields(attr_mask(config)),
         crate::vf_entry_order(config, &session),
         |entry| {
@@ -344,11 +344,21 @@ fn visit_ordered<F: vnfs::Vfsi>(
                 .file_name()
                 .is_some_and(|name| crate::display::should_display(name, config))
         },
-        |listing, depth| {
-            let rendered = if depth == 0 {
+        |listing, _| {
+            let relative = listing
+                .path
+                .strip_prefix(&root)
+                .map_err(|_| io::Error::other("VFSI directory outside walk root"))?;
+            if relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(io::Error::other("invalid VFSI directory path"));
+            }
+            let rendered = if relative.as_os_str().is_empty() {
                 path.to_path_buf()
             } else {
-                session.local_path(&listing.path)?
+                path.join(relative)
             };
             if let Err(error) = callback(WalkEntry {
                 path: rendered,
@@ -591,6 +601,26 @@ mod tests {
         assert_eq!(paths, [Path::new("/"), Path::new("/b"), Path::new("/a")]);
         assert_eq!(tree[1].entries[0].attrs().len(), Some(4));
         assert!(tree[1].entries[0].attrs().blocks().is_some());
+    }
+
+    #[test]
+    fn ordered_walk_renders_the_operand_spelling_and_prunes_hidden_children() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".hidden/tree/child")).unwrap();
+        std::fs::create_dir(root.path().join(".hidden/tree/.skip")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(".hidden/tree", &alias).unwrap();
+        let backend = Posix::new(root.path()).unwrap();
+        let config =
+            crate::config::Config::from(&crate::uu_app().get_matches_from(["ls", "-R"]), None)
+                .unwrap();
+        let mut paths = Vec::new();
+        visit_ordered(&backend, root.path(), &alias, &config, &mut |entry| {
+            paths.push(entry.path);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(paths, [alias.clone(), alias.join("child")]);
     }
 
     #[test]
