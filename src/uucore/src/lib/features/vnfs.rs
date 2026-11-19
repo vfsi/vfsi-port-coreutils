@@ -131,7 +131,11 @@ impl Session {
                 .map_err(vnfs::error::IndexedError::into_cause),
         }
     }
-    pub fn read_dirs(&self, dirs: &[&Path], fields: Attributes) -> VfResult<Vec<DirectoryListing>> {
+    pub fn read_dirs(
+        &self,
+        dirs: &[&Path],
+        fields: Attributes,
+    ) -> vnfs::VecResult<DirectoryListing> {
         let options = ListDirOptions::new().with_fields(fields);
         let mut listings: Vec<_> = dirs
             .iter()
@@ -160,25 +164,24 @@ impl Session {
             Ok(std::ops::ControlFlow::Continue(()))
         };
         let completion = match self {
-            Self::Dummy { fs, .. } => fs
-                .listdirs_all(dirs, options, &mut collect)
-                .map_err(vnfs::error::IndexedError::into_cause),
-            Self::Nfs { session, .. } => session
-                .fs()
-                .listdirs_all(dirs, options, &mut collect)
-                .map_err(vnfs::error::IndexedError::into_cause),
+            Self::Dummy { fs, .. } => fs.vlistdirs(dirs, options, &mut collect),
+            Self::Nfs { session, .. } => session.fs().vlistdirs(dirs, options, &mut collect),
         }?;
-        if completion.len() != dirs.len()
-            || completion
-                .iter()
-                .any(|state| *state != vnfs::directory::TraversalCompletion::Complete)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "incomplete shallow directory collection",
-            ));
+        if completion.len() != dirs.len() {
+            return Err(std::io::Error::other("invalid directory outcome count"));
         }
-        Ok(listings)
+        Ok(completion
+            .into_iter()
+            .zip(listings)
+            .map(|(outcome, listing)| match outcome {
+                Ok(vnfs::directory::TraversalCompletion::Complete) => Ok(listing),
+                Ok(_) => Err(vnfs::error::OpError::failed(
+                    std::io::Error::other("incomplete shallow directory collection"),
+                    None,
+                )),
+                Err(error) => Err(error),
+            })
+            .collect())
     }
 
     pub fn read_files(&self, paths: &[PathBuf], limit: usize) -> VfResult<Vec<Vec<u8>>> {
@@ -342,16 +345,27 @@ mod tests {
             fs: Posix::new(root.path()).unwrap(),
             paths: PathMapper::new(root.path()).unwrap(),
         };
-        let dirs = [Path::new("/full"), Path::new("/empty"), Path::new("/full")];
+        let dirs = [
+            Path::new("/full"),
+            Path::new("/missing"),
+            Path::new("/empty"),
+            Path::new("/full"),
+        ];
         let listings = backend.read_dirs(&dirs, Attributes::MODE).unwrap();
         assert_eq!(listings.len(), dirs.len());
-        for (listing, path) in listings.iter().zip(dirs) {
-            assert_eq!(listing.path, path);
+        for index in [0, 2, 3] {
+            assert_eq!(listings[index].as_ref().unwrap().path, dirs[index]);
         }
-        assert!(listings[1].entries.is_empty());
-        assert_eq!(listings[0].entries.len(), 1);
-        assert_eq!(listings[2].entries.len(), 1);
-        assert_eq!(listings[0].entries[0].path(), listings[2].entries[0].path());
+        assert_eq!(
+            listings[1].as_ref().unwrap_err().cause().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(listings[2].as_ref().unwrap().entries.is_empty());
+        let first = &listings[0].as_ref().unwrap().entries;
+        let duplicate = &listings[3].as_ref().unwrap().entries;
+        assert_eq!(first.len(), 1);
+        assert_eq!(duplicate.len(), 1);
+        assert_eq!(first[0].path(), duplicate[0].path());
         assert!(backend.read_dirs(&[], Attributes::MODE).unwrap().is_empty());
     }
 
@@ -416,6 +430,9 @@ mod tests {
         assert!(copy_capabilities.get().is_none());
         backend
             .read_dirs(&[Path::new("/")], Attributes::MODE)
+            .unwrap()
+            .pop()
+            .unwrap()
             .unwrap();
         assert!(
             copy_capabilities.get().is_none(),

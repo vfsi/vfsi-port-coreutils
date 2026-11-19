@@ -130,11 +130,16 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
         let ctx = ctx.as_mut().unwrap();
 
         let vpath = ctx.backend.map(path, ResolvePath::Follow)?;
-        let listing = match ctx.backend.read_dirs(&[&vpath], attr_mask(config)) {
-            Ok(mut listings) => match listings.pop() {
-                Some(listing) => listing,
-                None => return Err(io::Error::other("vnfs returned no directory listing")),
-            },
+        let result = ctx
+            .backend
+            .read_dirs(&[&vpath], attr_mask(config))
+            .and_then(|mut rows| {
+                rows.pop()
+                    .ok_or_else(|| io::Error::other("vnfs returned no directory listing"))?
+                    .map_err(vnfs::error::OpError::into_cause)
+            });
+        let listing = match result {
+            Ok(listing) => listing,
             Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Ok(None),
             Err(error) => return Err(error),
         };
@@ -156,9 +161,7 @@ pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Op
 }
 
 /// List several directories in one vectorized batch and map the entries back
-/// to kernel paths. A failed vector request may have emitted only part of a
-/// directory before stopping, so all operands fall back to ordinary listings.
-/// No partial directory is presented to `ls` as complete.
+/// to kernel paths. Only complete roots are used; failed roots fall back.
 fn ctx_open_many(
     ctx: &mut VfContext,
     kernel_dirs: &[&Path],
@@ -176,8 +179,6 @@ fn ctx_open_many(
         return out;
     }
     let Ok(listings) = ctx.backend.read_dirs(&refs, masks) else {
-        // A backend error does not prove which interleaved streams completed.
-        // Only mapping failures can be isolated without replaying reads.
         return out;
     };
     if listings.len() != refs.len() {
@@ -188,6 +189,7 @@ fn ctx_open_many(
         .enumerate()
         .filter_map(|(index, path)| path.is_some().then_some(index));
     for (index, listing) in indices.zip(listings) {
+        let Ok(listing) = listing else { continue };
         let mut list = Vec::with_capacity(listing.entries.len());
         for entry in listing.entries {
             let name = entry
@@ -535,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn open_many_discards_partial_listings_after_failing_dir() {
+    fn open_many_keeps_completed_siblings_after_failing_dir() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("d0")).unwrap();
         std::fs::write(root.path().join("d0/a.txt"), b"a").unwrap();
@@ -551,8 +553,10 @@ mod tests {
         ];
         let paths: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
         let masks = Attributes::MODE | Attributes::SIZE;
-        let out = ctx_open_many(&mut ctx, &paths, masks);
-        assert!(out.iter().all(Option::is_none));
+        let mut out = ctx_open_many(&mut ctx, &paths, masks);
+        assert_eq!(names(out[0].as_mut()), ["a.txt"]);
+        assert!(out[1].is_none());
+        assert_eq!(names(out[2].as_mut()), ["b.txt"]);
     }
 
     #[test]
