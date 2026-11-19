@@ -97,6 +97,19 @@ ifneq ($(findstring stdbuf,$(UTILS)),)
 	CARGOFLAGS += --features feat_external_libstdbuf
 endif
 
+# Build the preload library as a selected package so Cargo puts it beside the
+# binaries, regardless of the layout of transitive build artifacts.
+ifneq (,$(and $(filter stdbuf,$(UTILS)),$(findstring feat_external_libstdbuf,$(CARGOFLAGS))))
+ifeq (,$(findstring windows,$(OS)))
+	STDBUF_PACKAGE := -p uu_stdbuf_libstdbuf
+endif
+endif
+ifneq (,$(findstring apple,$(OS)))
+	STDBUF_LIB := libstdbuf.dylib
+else
+	STDBUF_LIB := libstdbuf.so
+endif
+
 # Programs with usable tests
 
 TESTS       := \
@@ -132,14 +145,14 @@ all: build
 build-pkgs:
 ifneq (${MULTICALL}, y)
 ifdef BUILD_SPEC_FEATURE
-	${CARGO} build ${CARGOFLAGS} --features "$(BUILD_SPEC_FEATURE)" ${PROFILE_CMD} $(foreach pkg,$(EXES),-p uu_$(pkg))
+	${CARGO} build ${CARGOFLAGS} --features "$(BUILD_SPEC_FEATURE)" ${PROFILE_CMD} $(foreach pkg,$(EXES),-p uu_$(pkg)) $(STDBUF_PACKAGE)
 else
-	${CARGO} build ${CARGOFLAGS} ${PROFILE_CMD} $(foreach pkg,$(EXES),-p uu_$(pkg))
+	${CARGO} build ${CARGOFLAGS} ${PROFILE_CMD} $(foreach pkg,$(EXES),-p uu_$(pkg)) $(STDBUF_PACKAGE)
 endif
 endif
 
 build-coreutils:
-	${CARGO} build ${CARGOFLAGS} --features "${EXES} $(BUILD_SPEC_FEATURE)" ${PROFILE_CMD} --no-default-features
+	${CARGO} build ${CARGOFLAGS} --features "${EXES} $(BUILD_SPEC_FEATURE)" ${PROFILE_CMD} --no-default-features -p coreutils $(STDBUF_PACKAGE)
 
 ifeq (${MULTICALL}, y)
 build: build-coreutils locales
@@ -299,12 +312,12 @@ install: build install-manpages install-completions install-locales
 ifneq (,$(and $(findstring stdbuf,$(UTILS)),$(findstring feat_external_libstdbuf,$(CARGOFLAGS))))
 ifneq (,$(findstring cygwin,$(OS)))
 	$(INSTALL) -d $(DESTDIR)$(LIBSTDBUF_DIR)
-	$(INSTALL) -m 755 $(BUILDDIR)/deps/stdbuf.dll $(DESTDIR)$(LIBSTDBUF_DIR)/libstdbuf.dll
+	$(INSTALL) -m 755 $(BUILDDIR)/stdbuf.dll $(DESTDIR)$(LIBSTDBUF_DIR)/libstdbuf.dll
 else ifneq (,$(findstring windows,$(OS)))
 	@echo "NOTE: Windows stdbuf depends on Cygwin's libstdbuf.dll"
 else
 	$(INSTALL) -d $(DESTDIR)$(LIBSTDBUF_DIR)
-	$(INSTALL) -m 755 $(BUILDDIR)/deps/libstdbuf.* $(DESTDIR)$(LIBSTDBUF_DIR)/
+	$(INSTALL) -m 755 $(BUILDDIR)/$(STDBUF_LIB) $(DESTDIR)$(LIBSTDBUF_DIR)/
 endif
 endif
 ifeq (${MULTICALL}, y)
