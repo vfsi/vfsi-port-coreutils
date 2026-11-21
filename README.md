@@ -40,7 +40,7 @@ Minimal compatible glibc version is same with ubuntu-latest runner. Use `coreuti
 
 ## VFSI port
 
-The optional dependency uses the published `vnfs` 0.0.39 crate from crates.io.
+The optional dependency uses the published `vnfs` 0.0.40 crate from crates.io.
 
 This branch adds opt-in mounted-NFS acceleration with the `vnfs` feature and
 `VNFS_IMPL=nfs`. The Rust ports use the high-level vNFS API and retain mount
@@ -66,7 +66,7 @@ metadata-sensitive options keep the established path. The default is disabled
 multiple partial outputs; it is never replayed. `VNFS_PROFILE=1` reports
 `cp_vfsi_method=round_robin` when this path succeeds.
 
-This experiment uses the published vnfs 0.0.39 helper; no local Cargo override
+This experiment uses the published vnfs 0.0.40 helper; no local Cargo override
 is needed.
 
 ## Goals
