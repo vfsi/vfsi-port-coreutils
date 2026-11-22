@@ -48,6 +48,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Try to detect if we're building for a specific utility by checking build configuration
     // This attempts to identify individual utility builds vs multicall binary builds
     let target_utility = detect_target_utility();
+    println!("cargo:rerun-if-env-changed=LANG");
     let locales_to_embed = get_locales_to_embed(env::var("LANG").ok());
 
     match target_utility {

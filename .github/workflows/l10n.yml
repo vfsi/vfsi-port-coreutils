@@ -1157,15 +1157,9 @@ jobs:
         key: cat-locale-embedding
     - name: Install prerequisites
       run: sudo apt-get -y update && sudo apt-get -y install libselinux1-dev
-    - name: Build cat with targeted locale embedding
-      run: UUCORE_TARGET_UTIL=cat cargo build -p uu_cat --release
-    - name: Verify cat locale count
+    - name: Build cat and verify targeted locale embedding
       run: |
-        locale_file=$(find target/release/build -name "embedded_locales.rs" | head -1)
-        if [ -z "$locale_file" ]; then
-          echo "ERROR: Could not find embedded_locales.rs"
-          exit 1
-        fi
+        locale_file=$(UUCORE_TARGET_UTIL=cat bash util/build-embedded-locales.sh -p uu_cat --release)
         locale_count=$(grep -c '/en-US\.ftl' "$locale_file")
         echo "Cat binary has $locale_count embedded locales"
         if [ "$locale_count" -le 5 ]; then
@@ -1188,15 +1182,9 @@ jobs:
         key: ls-locale-embedding
     - name: Install prerequisites
       run: sudo apt-get -y update && sudo apt-get -y install libselinux1-dev
-    - name: Build ls with targeted locale embedding
-      run: UUCORE_TARGET_UTIL=ls cargo build -p uu_ls --release
-    - name: Verify ls locale count
+    - name: Build ls and verify targeted locale embedding
       run: |
-        locale_file=$(find target/release/build -name "embedded_locales.rs" | head -1)
-        if [ -z "$locale_file" ]; then
-          echo "ERROR: Could not find embedded_locales.rs"
-          exit 1
-        fi
+        locale_file=$(UUCORE_TARGET_UTIL=ls bash util/build-embedded-locales.sh -p uu_ls --release)
         locale_count=$(grep -c '/en-US\.ftl' "$locale_file")
         echo "Ls binary has $locale_count embedded locales"
         if [ "$locale_count" -le 5 ]; then
@@ -1219,19 +1207,13 @@ jobs:
         key: multicall-locale-embedding
     - name: Install prerequisites
       run: sudo apt-get -y update && sudo apt-get -y install libselinux1-dev
-    - name: Build multicall binary with all locales
-      run: cargo build --release
-    - name: Verify multicall locale count
+    - name: Build multicall binary and verify locale count
       run: |
-        locale_file=$(find target/release/build -name "embedded_locales.rs" | head -1)
-        if [ -z "$locale_file" ]; then
-          echo "ERROR: Could not find embedded_locales.rs"
-          exit 1
-        fi
+        locale_file=$(bash util/build-embedded-locales.sh --release)
         locale_count=$(grep -c '/en-US\.ftl' "$locale_file")
         echo "Multicall binary has $locale_count embedded locales"
         echo "First 10 locales:"
-        grep -o '[a-z_][a-z_0-9]*/en-US\.ftl' "$locale_file" | head -10
+        grep -o '[a-z_][a-z_0-9]*/en-US\.ftl' "$locale_file" | awk 'NR <= 10'
         if [ "$locale_count" -ge 80 ]; then
           echo "✓ SUCCESS: Multicall has all locales ($locale_count files)"
         else
@@ -1272,14 +1254,7 @@ jobs:
         export LC_ALL=en_US.UTF-8
 
         echo "Building uu_yes with LANG=$LANG"
-        cargo build --package uu_yes --release
-
-        # Find the generated embedded_locales.rs
-        locale_file=$(find target/release/build -path "*/uucore*/out/embedded_locales.rs" | head -1)
-        if [ -z "$locale_file" ]; then
-          echo "ERROR: Could not find embedded_locales.rs"
-          exit 1
-        fi
+        locale_file=$(UUCORE_TARGET_UTIL=yes bash util/build-embedded-locales.sh -p uu_yes --release)
 
         echo "Found embedded_locales.rs at: $locale_file"
         echo "Checking embedded locales..."
@@ -1307,19 +1282,8 @@ jobs:
         export LANG=fr_FR.UTF-8
         export LC_ALL=fr_FR.UTF-8
 
-        # Clean previous build to ensure fresh compile
-        cargo clean -p uu_yes
-        cargo clean -p uucore
-
         echo "Building uu_yes with LANG=$LANG"
-        cargo build --package uu_yes --release
-
-        # Find the generated embedded_locales.rs
-        locale_file=$(find target/release/build -path "*/uucore*/out/embedded_locales.rs" | head -1)
-        if [ -z "$locale_file" ]; then
-          echo "ERROR: Could not find embedded_locales.rs"
-          exit 1
-        fi
+        locale_file=$(UUCORE_TARGET_UTIL=yes bash util/build-embedded-locales.sh -p uu_yes --release)
 
         echo "Found embedded_locales.rs at: $locale_file"
         echo "Checking embedded locales..."
@@ -1345,14 +1309,7 @@ jobs:
     - name: Test locale count is reasonable
       run: |
         export LANG=fr_FR.UTF-8
-        cargo clean -p uu_yes
-        cargo build --package uu_yes --release
-
-        locale_file=$(find target/release/build -path "*/uucore*/out/embedded_locales.rs" | head -1)
-        if [ -z "$locale_file" ]; then
-          echo "ERROR: Could not find uucore embedded_locales.rs"
-          exit 1
-        fi
+        locale_file=$(UUCORE_TARGET_UTIL=yes bash util/build-embedded-locales.sh -p uu_yes --release)
 
         # Count embedded locales (should be en-US + system locale, not all locales)
         locale_count=$(grep -c '/en-US\.ftl\|/fr-FR\.ftl' "$locale_file" || echo "0")
@@ -1360,7 +1317,7 @@ jobs:
 
         # For a single utility build, should have minimal locales (en-US + optionally system locale)
         # Not the full multicall set
-        total_match_count=$(grep -c '=> Some(r###' "$locale_file" || echo "0")
+        total_match_count=$(grep -c '=> Some(' "$locale_file" || echo "0")
         echo "Total embedded entries: $total_match_count"
 
         if [ "$total_match_count" -le 10 ]; then
