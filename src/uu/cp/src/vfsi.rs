@@ -958,7 +958,7 @@ mod tests {
         assert_eq!(cached[&sources[2]], b"defg");
         assert!(!cached.contains_key(&sources[1]));
         // An oversized input leaves budget available for its small siblings.
-        let mixed = [&sources[3], &sources[0], &sources[2]].map(|path| path.to_path_buf());
+        let mixed = [&sources[3], &sources[0], &sources[2]].map(PathBuf::clone);
         assert_eq!(
             prefetch_regular_files(
                 &backend,

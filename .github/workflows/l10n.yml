@@ -1159,7 +1159,7 @@ jobs:
       run: sudo apt-get -y update && sudo apt-get -y install libselinux1-dev
     - name: Build cat and verify targeted locale embedding
       run: |
-        locale_file=$(UUCORE_TARGET_UTIL=cat bash util/build-embedded-locales.sh -p uu_cat --release)
+        locale_file=$(UUCORE_TARGET_UTIL=cat ./util/build-embedded-locales.sh -p uu_cat --release)
         locale_count=$(grep -c '/en-US\.ftl' "$locale_file")
         echo "Cat binary has $locale_count embedded locales"
         if [ "$locale_count" -le 5 ]; then
@@ -1184,7 +1184,7 @@ jobs:
       run: sudo apt-get -y update && sudo apt-get -y install libselinux1-dev
     - name: Build ls and verify targeted locale embedding
       run: |
-        locale_file=$(UUCORE_TARGET_UTIL=ls bash util/build-embedded-locales.sh -p uu_ls --release)
+        locale_file=$(UUCORE_TARGET_UTIL=ls ./util/build-embedded-locales.sh -p uu_ls --release)
         locale_count=$(grep -c '/en-US\.ftl' "$locale_file")
         echo "Ls binary has $locale_count embedded locales"
         if [ "$locale_count" -le 5 ]; then
@@ -1209,7 +1209,7 @@ jobs:
       run: sudo apt-get -y update && sudo apt-get -y install libselinux1-dev
     - name: Build multicall binary and verify locale count
       run: |
-        locale_file=$(bash util/build-embedded-locales.sh --release)
+        locale_file=$(./util/build-embedded-locales.sh --release)
         locale_count=$(grep -c '/en-US\.ftl' "$locale_file")
         echo "Multicall binary has $locale_count embedded locales"
         echo "First 10 locales:"
@@ -1254,7 +1254,7 @@ jobs:
         export LC_ALL=en_US.UTF-8
 
         echo "Building uu_yes with LANG=$LANG"
-        locale_file=$(UUCORE_TARGET_UTIL=yes bash util/build-embedded-locales.sh -p uu_yes --release)
+        locale_file=$(UUCORE_TARGET_UTIL=yes ./util/build-embedded-locales.sh -p uu_yes --release)
 
         echo "Found embedded_locales.rs at: $locale_file"
         echo "Checking embedded locales..."
@@ -1283,7 +1283,7 @@ jobs:
         export LC_ALL=fr_FR.UTF-8
 
         echo "Building uu_yes with LANG=$LANG"
-        locale_file=$(UUCORE_TARGET_UTIL=yes bash util/build-embedded-locales.sh -p uu_yes --release)
+        locale_file=$(UUCORE_TARGET_UTIL=yes ./util/build-embedded-locales.sh -p uu_yes --release)
 
         echo "Found embedded_locales.rs at: $locale_file"
         echo "Checking embedded locales..."
@@ -1309,7 +1309,7 @@ jobs:
     - name: Test locale count is reasonable
       run: |
         export LANG=fr_FR.UTF-8
-        locale_file=$(UUCORE_TARGET_UTIL=yes bash util/build-embedded-locales.sh -p uu_yes --release)
+        locale_file=$(UUCORE_TARGET_UTIL=yes ./util/build-embedded-locales.sh -p uu_yes --release)
 
         # Count embedded locales (should be en-US + system locale, not all locales)
         locale_count=$(grep -c '/en-US\.ftl\|/fr-FR\.ftl' "$locale_file" || echo "0")

@@ -104,19 +104,52 @@ fn main() {
     } else {
         format!("libstdbuf{dylib_ext}")
     };
-    let mut source_path = build_dir.clone();
-    source_path.push(&target);
-    source_path.push(profile);
-    source_path.push(&lib_name);
-    // align name for simplicity
-    let lib_name = format!("libstdbuf{dylib_ext}");
-    // This path contains hash
-    let dest_path = Path::new(&out_dir).join(&lib_name);
-    fs::copy(&source_path, &dest_path).expect("Failed to copy libstdbuf");
-    // copy to the main target directory (e.g., target/debug) too.
-    let target_dir = profile_dir.expect("Failed to get target directory");
-    let easy_dest_path = target_dir.join(lib_name);
-    let _ = fs::remove_file(&easy_dest_path);
-    fs::copy(&source_path, &easy_dest_path)
-        .expect("Failed to copy libstdbuf library to target profile root");
+    let dest_path = Path::new(&out_dir).join(format!("libstdbuf{dylib_ext}"));
+
+    // Check multiple possible locations for the built library
+    let possible_paths = if !target.is_empty() && target != "unknown" {
+        vec![
+            build_dir.join(&target).join(profile).join(&lib_name),
+            build_dir
+                .join(&target)
+                .join(profile)
+                .join("deps")
+                .join(&lib_name),
+        ]
+    } else {
+        vec![
+            build_dir.join(profile).join(&lib_name),
+            build_dir.join(profile).join("deps").join(&lib_name),
+        ]
+    };
+
+    // Try to find the library in any of the possible locations
+    let mut found = false;
+    for source_path in &possible_paths {
+        if source_path.exists() {
+            fs::copy(source_path, &dest_path).expect("Failed to copy libstdbuf library");
+            found = true;
+            break;
+        }
+    }
+
+    assert!(
+        found,
+        "Could not find built libstdbuf library. Searched in: {possible_paths:?}."
+    );
+
+    // Allow running an external-libstdbuf build from the target directory.
+    // Leave any artifact Cargo already placed there intact.
+    #[cfg(all(unix, feature = "feat_external_libstdbuf"))]
+    if let Some(target_dir) = profile_dir {
+        let lib_filename = format!("libstdbuf{dylib_ext}");
+        let source = Path::new("deps").join(&lib_filename);
+        let dest = target_dir.join(&lib_filename);
+        if target_dir.join(&source).is_file()
+            && let Err(error) = std::os::unix::fs::symlink(source, dest)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            eprintln!("Warning: Failed to create symlink for libstdbuf: {error}");
+        }
+    }
 }
