@@ -22,8 +22,6 @@ use std::ffi::OsString;
 #[cfg(not(target_os = "linux"))]
 use walkdir::WalkDir;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use crate::features::fs::FileInformation;
 use crate::features::fs::{metadata_is_root_dir, path_is_root_dir};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::features::safe_traversal::{DirFd, FileInfo, SymlinkBehavior};
@@ -461,16 +459,13 @@ impl ChownExecutor {
         dir_fd: &DirFd,
         dir_path: &Path,
         ret: &mut i32,
-        ancestors: &mut HashSet<FileInformation>,
+        ancestors: &mut HashSet<FileInfo>,
     ) {
         // Cycle detection: identify this directory by (dev, ino) via the already-open
         // fd. Using the fd is TOCTOU-safe (no path re-resolution through symlinks) and
         // avoids a redundant path walk. If it's already on the current path, it's a cycle.
-        let dir_info = FileInformation::from_file(dir_fd).ok();
-        if dir_info
-            .as_ref()
-            .is_some_and(|info| !ancestors.insert(info.clone()))
-        {
+        let dir_info = dir_fd.fstat().ok().map(|stat| FileInfo::from_stat(&stat));
+        if dir_info.is_some_and(|info| !ancestors.insert(info)) {
             return; // cycle detected, stop silently
         }
 
@@ -509,6 +504,25 @@ impl ChownExecutor {
                     continue;
                 }
             };
+
+            // Preserve Android's cycle handling: report the loop before
+            // applying the ownership change to the ancestor again.
+            #[cfg(target_os = "android")]
+            if follow && meta.is_dir() && ancestors.contains(&FileInfo::new(meta.dev(), meta.ino()))
+            {
+                *ret = 1;
+                if self.verbosity.level != VerbosityLevel::Silent {
+                    show_error!(
+                        "{}",
+                        translate!(
+                            "perms-cannot-access",
+                            "file" => entry_path.quote(),
+                            "error" => translate!("error-too-many-symlink-levels")
+                        )
+                    );
+                }
+                continue;
+            }
 
             if self.preserve_root
                 && is_root(&entry_path, self.traverse_symlinks == TraverseSymlinks::All)

@@ -1115,6 +1115,11 @@ fn test_chown_symlink_cycles() {
 
     let result = scene.ucmd().arg("-vRL").arg(&user_name).arg("a").run();
 
+    #[cfg(target_os = "android")]
+    result
+        .failure()
+        .stderr_contains("cannot access 'a/b/c/d': Too many levels of symbolic links");
+
     if cfg!(target_vendor = "apple") || cfg!(target_os = "openbsd") || cfg!(target_os = "android") {
         result
             .stdout_contains(format!("ownership of 'a' retained as {user_name}"))
