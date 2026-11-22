@@ -49,8 +49,12 @@ bounded directory listings incrementally; excluded subtrees are skipped before
 listing. Traversal failures are reported without repeating partial output.
 Unsupported modes, including `du --one-file-system`, use the kernel path.
 
-`cp` batches small-file prefetch under an aggregate memory budget. Direct
-server-side COPY is experimental and disabled by default: enabling
+`cp` prefetches files up to 1 MiB each under an aggregate memory budget. Larger
+sources use the kernel copy path by default. Mixed batches can still prefetch
+their smaller sources. Setting `VNFS_CP_BATCH_BYTES` explicitly selects the
+aggregate-only policy. A zero budget disables prefetch.
+
+Direct server-side COPY is experimental and disabled by default. Enabling
 `VNFS_CP_SERVER_COPY=1` mixes kernel and direct-client access and requires the
 caller to account for cache coherence. This port does not provide filesystem
 identity or a new coherence guarantee.

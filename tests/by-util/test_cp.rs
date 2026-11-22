@@ -9714,6 +9714,22 @@ fn test_cp_source_in_unsearchable_dir() {
     assert!(!at.file_exists("dest"));
 }
 
+#[test]
+#[cfg(all(target_os = "linux", feature = "feat_vnfs"))]
+fn test_vfsi_large_local_source_has_no_nfs_routing_marker() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let data = vec![b'x'; 1024 * 1024 + 1];
+    std_fs::write(at.plus("source"), &data).unwrap();
+    ucmd.env("VNFS_IMPL", "nfs")
+        .env("VNFS_PROFILE", "1")
+        .env("VNFS_CP_BATCH_BYTES", "")
+        .env("VNFS_CP_SERVER_COPY", "0")
+        .args(&["source", "dest"])
+        .succeeds()
+        .stderr_does_not_contain("cp_vfsi_method=kernel_large");
+    assert_eq!(std_fs::read(at.plus("dest")).unwrap(), data);
+}
+
 // Enabling the streaming experiment must not consume small files or bypass
 // ordinary overwrite/symlink policy when the batch is ineligible.
 #[test]

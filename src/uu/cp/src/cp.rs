@@ -3201,7 +3201,7 @@ fn copy_helper(
             && options.sparse_mode != SparseMode::Always
             && !nofollow
         {
-            vfsi::try_copy(source, dest)?
+            vfsi::try_copy(source, dest, source_metadata.len())?
         } else {
             None
         };

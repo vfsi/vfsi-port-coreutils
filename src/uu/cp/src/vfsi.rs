@@ -14,6 +14,8 @@ use vnfs::helpers::{PathMapper, ResolvePath};
 use vnfs::posix::Posix;
 
 const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
+// Whole-file prefetch retains the complete payload until cp reaches each operand.
+const MAX_PREFETCH_FILE_BYTES: usize = 1024 * 1024;
 
 fn impl_choice() -> Option<&'static str> {
     match std::env::var("VNFS_IMPL").as_deref() {
@@ -68,6 +70,10 @@ fn make_context(mount: Mount) -> io::Result<Context> {
         prefetched: HashMap::new(),
         prepared_copies: HashMap::new(),
     })
+}
+
+fn configured_batch_bytes() -> Option<u64> {
+    std::env::var("VNFS_CP_BATCH_BYTES").ok()?.parse().ok()
 }
 
 fn server_copy_enabled() -> bool {
@@ -230,10 +236,13 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
     if prepare_server_copy_batch(sources, target)? {
         return Ok(());
     }
-    let max_bytes = std::env::var("VNFS_CP_BATCH_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_BATCH_BYTES);
+    let configured_budget = configured_batch_bytes();
+    let max_bytes = configured_budget.unwrap_or(DEFAULT_BATCH_BYTES);
+    let max_file_bytes = if configured_budget.is_some() {
+        usize::MAX
+    } else {
+        MAX_PREFETCH_FILE_BYTES
+    };
     if max_bytes == 0 {
         return Ok(());
     }
@@ -274,6 +283,18 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
     if selected.len() < 2 {
         return Ok(());
     }
+    // A pair cannot prefetch if either operand is already known to be
+    // ineligible. Reuse kernel metadata for this check before connecting.
+    if configured_budget.is_none()
+        && selected.len() == 2
+        && selected.iter().any(|path| {
+            path.symlink_metadata().is_ok_and(|metadata| {
+                !metadata.is_file() || metadata.len() > MAX_PREFETCH_FILE_BYTES as u64
+            })
+        })
+    {
+        return Ok(());
+    }
     let Some(mount) = mount_root(selected_mount.expect("selected VFSI sources have a mount"))
     else {
         return Ok(());
@@ -292,17 +313,18 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
             &ctx.backend,
             &selected,
             usize::try_from(max_bytes).unwrap_or(usize::MAX),
+            max_file_bytes,
         ) else {
             return Ok(());
         };
-        let prefetched_bytes = prefetched.values().map(Vec::len).sum::<usize>();
-        ctx.prefetched = prefetched;
-        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-            let selected_files = selected.len();
+        if !prefetched.is_empty() && std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+            let prefetched_files = prefetched.len();
+            let prefetched_bytes = prefetched.values().map(Vec::len).sum::<usize>();
             eprintln!(
-                "[profile] cp_prefetch_files={selected_files} cp_prefetch_bytes={prefetched_bytes}"
+                "[profile] cp_prefetch_files={prefetched_files} cp_prefetch_bytes={prefetched_bytes}"
             );
         }
+        ctx.prefetched = prefetched;
         Ok(())
     })
 }
@@ -311,6 +333,7 @@ fn prefetch_regular_files(
     backend: &Backend,
     sources: &[PathBuf],
     budget: usize,
+    max_file_bytes: usize,
 ) -> vnfs::Result<HashMap<PathBuf, Vec<u8>>> {
     use vnfs::directory::Attributes;
     // No-follow metadata admits only real regular files. Symlinks retain cp's
@@ -334,7 +357,7 @@ fn prefetch_regular_files(
         let Some(size) = attrs.len().and_then(|size| usize::try_from(size).ok()) else {
             continue;
         };
-        if size > remaining {
+        if size > max_file_bytes || size > remaining {
             continue;
         }
         remaining -= size;
@@ -358,7 +381,7 @@ fn prefetch_regular_files(
 /// the destination on one client avoids incoherent kernel/direct-NFS caches.
 /// Returns `None` when the normal kernel path should be used, otherwise the
 /// VFSI method name used for `--debug` output.
-pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> {
+pub fn try_copy(source: &Path, dest: &Path, source_size: u64) -> io::Result<Option<&'static str>> {
     if impl_choice().is_none() {
         return Ok(None);
     }
@@ -376,6 +399,16 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
             .open(dest)?;
         output.write_all(&contents)?;
         return Ok(Some("vfsi-client-read"));
+    }
+    let server_copy = server_copy_enabled();
+    if source_size > MAX_PREFETCH_FILE_BYTES as u64
+        && !server_copy
+        && configured_batch_bytes().is_none()
+    {
+        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") && nfs_mount(source).is_some() {
+            eprintln!("[profile] cp_vfsi_method=kernel_large");
+        }
+        return Ok(None);
     }
     let Some(source_mount) = nfs_mount(source) else {
         return Ok(None);
@@ -403,7 +436,7 @@ pub fn try_copy(source: &Path, dest: &Path) -> io::Result<Option<&'static str>> 
             }
             let _ = std::fs::remove_file(prepared.temp);
         }
-        if server_copy_enabled()
+        if server_copy
             && dest_mount
                 .as_ref()
                 .is_some_and(|mount| same_mount(mount, &source_mount))
@@ -904,6 +937,12 @@ mod tests {
         ] {
             std::fs::write(root.path().join(name), data).unwrap();
         }
+        OpenOptions::new()
+            .write(true)
+            .open(root.path().join("large"))
+            .unwrap()
+            .set_len((MAX_PREFETCH_FILE_BYTES + 1) as u64)
+            .unwrap();
         std::os::unix::fs::symlink("one", root.path().join("link")).unwrap();
         let backend = Backend::Dummy {
             fs: Posix::new(root.path()).unwrap(),
@@ -912,18 +951,36 @@ mod tests {
         let sources: Vec<_> = ["one", "link", "two", "large"]
             .map(|name| root.path().join(name))
             .into();
-        let cached = prefetch_regular_files(&backend, &sources, 7).unwrap();
+        let cached =
+            prefetch_regular_files(&backend, &sources, 7, MAX_PREFETCH_FILE_BYTES).unwrap();
         assert_eq!(cached.len(), 2);
         assert_eq!(cached[&sources[0]], b"abc");
         assert_eq!(cached[&sources[2]], b"defg");
         assert!(!cached.contains_key(&sources[1]));
+        // An oversized input leaves budget available for its small siblings.
+        let mixed = [&sources[3], &sources[0], &sources[2]].map(|path| path.to_path_buf());
+        assert_eq!(
+            prefetch_regular_files(
+                &backend,
+                &mixed,
+                MAX_PREFETCH_FILE_BYTES * 2,
+                MAX_PREFETCH_FILE_BYTES,
+            )
+            .unwrap(),
+            cached
+        );
+        // A configured aggregate-only budget retains the old selection policy.
+        let configured =
+            prefetch_regular_files(&backend, &mixed, MAX_PREFETCH_FILE_BYTES * 2, usize::MAX)
+                .unwrap();
+        assert_eq!(configured[&sources[3]].len(), MAX_PREFETCH_FILE_BYTES + 1);
         assert!(
-            prefetch_regular_files(&backend, &sources, 3)
+            prefetch_regular_files(&backend, &sources, 3, MAX_PREFETCH_FILE_BYTES)
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            prefetch_regular_files(&backend, &sources, 0)
+            prefetch_regular_files(&backend, &sources, 0, MAX_PREFETCH_FILE_BYTES)
                 .unwrap()
                 .is_empty()
         );
