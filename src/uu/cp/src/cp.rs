@@ -1505,7 +1505,7 @@ pub fn copy(sources: &[PathBuf], target: &Path, options: &Options) -> CopyResult
         && options.dereference(true)
     {
         let batch = vfsi::BatchGuard;
-        vfsi::prepare_batch(sources, target, |source| {
+        vfsi::prepare_batch(sources, target, !options.parents, |source| {
             source
                 .symlink_metadata()
                 .is_ok_and(|metadata| vfsi::eligible_file(&metadata, options.sparse_mode))

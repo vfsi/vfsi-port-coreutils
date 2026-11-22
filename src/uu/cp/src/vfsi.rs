@@ -255,6 +255,7 @@ fn prepare_server_copy_batch(
 pub fn prepare_batch(
     sources: &[PathBuf],
     target: &Path,
+    flat_destinations: bool,
     is_independent: impl Fn(&Path) -> bool,
 ) -> io::Result<()> {
     const DEFAULT_BATCH_BYTES: u64 = 64 * 1024 * 1024;
@@ -267,7 +268,11 @@ pub fn prepare_batch(
     let mut independent = None;
     let mut all_sources_independent =
         || *independent.get_or_insert_with(|| sources.iter().all(|source| is_independent(source)));
-    if prepare_server_copy_batch(sources, target, &mut all_sources_independent)? {
+    // Server staging constructs flat paths under target. Prefetch can still
+    // serve the actual destination even when --parents preserves its hierarchy.
+    if flat_destinations
+        && prepare_server_copy_batch(sources, target, &mut all_sources_independent)?
+    {
         return Ok(());
     }
     let configured_budget = configured_batch_bytes();
