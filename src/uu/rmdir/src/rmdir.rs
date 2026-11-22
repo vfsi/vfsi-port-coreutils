@@ -129,16 +129,6 @@ fn remove_single<'a>(
         );
     }
 
-    #[cfg(all(feature = "vnfs", target_os = "linux"))]
-    if !uucore::fs::path_ends_with_terminator(path)
-        && path
-            .symlink_metadata()
-            .is_ok_and(|metadata| metadata.is_dir())
-        && let Some(result) = uucore::vnfs::try_remove(path, false)
-    {
-        return result.map_err(|error| Error { error, path });
-    }
-
     remove_dir(path).map_err(|error| Error { error, path })
 }
 

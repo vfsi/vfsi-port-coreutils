@@ -47,12 +47,18 @@ This branch adds opt-in mounted-NFS acceleration with the `vnfs` feature and
 connection settings through shared discovery. `du` and recursive `ls` process
 bounded directory listings incrementally; excluded subtrees are skipped before
 listing. Traversal failures are reported without repeating partial output.
-Unsupported modes, including `du --one-file-system`, use the kernel path.
+`du` uses the kernel path for `--one-file-system` and for multiple operands
+whose identities must be deduplicated across the whole command. It also uses
+the kernel path for `--all` and verbose exclusions so those modes can emit
+output while continuing past unreadable subdirectories.
+`rm` and `rmdir` use kernel removal to preserve mount boundaries and
+the distinct unlink and directory-removal rules.
 
 `cp` prefetches files up to 1 MiB each under an aggregate memory budget. Larger
 sources use the kernel copy path by default. Mixed batches can still prefetch
 their smaller sources. Setting `VNFS_CP_BATCH_BYTES` explicitly selects the
-aggregate-only policy. A zero budget disables prefetch.
+aggregate-only policy. A zero budget disables prefetch. Sparse sources under
+`--sparse=auto` use the kernel copy path to preserve holes.
 
 Direct server-side COPY is experimental and disabled by default. Enabling
 `VNFS_CP_SERVER_COPY=1` mixes kernel and direct-client access and requires the

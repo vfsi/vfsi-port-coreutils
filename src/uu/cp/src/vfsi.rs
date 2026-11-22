@@ -13,7 +13,7 @@ use vnfs::helpers::{PathMapper, ResolvePath};
 #[cfg(test)]
 use vnfs::posix::Posix;
 
-const MAX_SERVER_COPY_BATCH_FILES: usize = 4096;
+const MAX_BATCH_FILES: usize = 4096;
 // Whole-file prefetch retains the complete payload until cp reaches each operand.
 const MAX_PREFETCH_FILE_BYTES: usize = 1024 * 1024;
 
@@ -51,12 +51,41 @@ struct Context {
     prepared_copies: HashMap<PathBuf, PreparedCopy>,
 }
 
-impl Drop for Context {
-    fn drop(&mut self) {
-        for prepared in self.prepared_copies.values() {
-            let _ = std::fs::remove_file(&prepared.temp);
+impl Context {
+    fn clear_batch(&mut self) {
+        self.prefetched.clear();
+        for (_, prepared) in self.prepared_copies.drain() {
+            let _ = std::fs::remove_file(prepared.temp);
         }
     }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        self.clear_batch();
+    }
+}
+
+/// Clear staged copies when the command returns, including skipped operands.
+pub(super) struct BatchGuard;
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        CTX.with(|slot| {
+            if let Some(context) = slot.borrow_mut().as_mut() {
+                context.clear_batch();
+            }
+        });
+    }
+}
+
+pub(super) fn eligible_file(metadata: &std::fs::Metadata, sparse: super::SparseMode) -> bool {
+    metadata.is_file()
+        && match sparse {
+            super::SparseMode::Never => true,
+            super::SparseMode::Auto => !super::platform::metadata_is_sparse(metadata),
+            super::SparseMode::Always => false,
+        }
 }
 
 thread_local! {
@@ -142,17 +171,20 @@ fn retain_server_copies(
     }
 }
 
-fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<bool> {
-    if !server_copy_enabled()
-        || sources.len() < 2
-        || sources.len() > MAX_SERVER_COPY_BATCH_FILES
-        || !target.is_dir()
-    {
+fn prepare_server_copy_batch(
+    sources: &[PathBuf],
+    target: &Path,
+    all_sources_independent: &mut impl FnMut() -> bool,
+) -> io::Result<bool> {
+    if !server_copy_enabled() || !target.is_dir() {
         return Ok(false);
     }
-    let Some(target_mount) = nfs_mount(target) else {
+    let Some(target_mount) = nfs_mount(target).and_then(mount_root) else {
         return Ok(false);
     };
+    if !all_sources_independent() {
+        return Ok(false);
+    }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -160,7 +192,9 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
     let mut seen_destinations = HashSet::new();
     let mut plans = Vec::with_capacity(sources.len());
     let mut pairs = Vec::with_capacity(sources.len());
-    let paths = PathMapper::new(target_mount.mount_point())?;
+    let Ok(paths) = PathMapper::new(target_mount.mount_point()) else {
+        return Ok(false);
+    };
     for (i, source) in sources.iter().enumerate() {
         if !source.metadata().is_ok_and(|metadata| metadata.is_file()) {
             return Ok(false);
@@ -179,23 +213,23 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
             return Ok(false);
         }
         let temp = target.join(format!(".vfsi-cp-{}-{nonce}-{i}", std::process::id()));
-        pairs.push((
-            paths.map(source, ResolvePath::Follow)?,
-            paths.map(&temp, ResolvePath::NoFollow)?,
-        ));
+        let (Ok(mapped_source), Ok(mapped_temp)) = (
+            paths.map(source, ResolvePath::Follow),
+            paths.map(&temp, ResolvePath::NoFollow),
+        ) else {
+            return Ok(false);
+        };
+        pairs.push((mapped_source, mapped_temp));
         plans.push((source.clone(), PreparedCopy { dest, temp }));
     }
 
     CTX.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(source_mount) = mount_root(target_mount) else {
-            return Ok(false);
-        };
         if slot
             .as_ref()
-            .is_none_or(|ctx| !ctx.backend.matches(&source_mount))
+            .is_none_or(|ctx| !ctx.backend.matches(&target_mount))
         {
-            let Ok(context) = make_context(source_mount) else {
+            let Ok(context) = make_context(target_mount) else {
                 return Ok(false);
             };
             *slot = Some(context);
@@ -218,22 +252,22 @@ fn prepare_server_copy_batch(sources: &[PathBuf], target: &Path) -> io::Result<b
 /// Prefetch a bounded group of command-line sources in a vectorized read.
 /// Large files stay on the streaming path so batching cannot consume
 /// unbounded memory.
-pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
+pub fn prepare_batch(
+    sources: &[PathBuf],
+    target: &Path,
+    is_independent: impl Fn(&Path) -> bool,
+) -> io::Result<()> {
     const DEFAULT_BATCH_BYTES: u64 = 64 * 1024 * 1024;
-    const MAX_BATCH_FILES: usize = 4096;
 
-    CTX.with(|slot| {
-        if let Some(context) = slot.borrow_mut().as_mut() {
-            context.prefetched.clear();
-            for (_, copy) in context.prepared_copies.drain() {
-                let _ = std::fs::remove_file(copy.temp);
-            }
-        }
-    });
-    if impl_choice().is_none() || sources.len() < 2 {
+    if impl_choice().is_none() || !(2..=MAX_BATCH_FILES).contains(&sources.len()) {
         return Ok(());
     }
-    if prepare_server_copy_batch(sources, target)? {
+    // An earlier overwrite can modify a later source through a hard link.
+    // Check all operands, even if only some are selected for prefetch.
+    let mut independent = None;
+    let mut all_sources_independent =
+        || *independent.get_or_insert_with(|| sources.iter().all(|source| is_independent(source)));
+    if prepare_server_copy_batch(sources, target, &mut all_sources_independent)? {
         return Ok(());
     }
     let configured_budget = configured_batch_bytes();
@@ -276,9 +310,6 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
         }
         selected_mount.get_or_insert_with(|| mount.clone());
         selected.push(source.clone());
-        if selected.len() == MAX_BATCH_FILES {
-            break;
-        }
     }
     if selected.len() < 2 {
         return Ok(());
@@ -299,6 +330,9 @@ pub fn prepare_batch(sources: &[PathBuf], target: &Path) -> io::Result<()> {
     else {
         return Ok(());
     };
+    if !all_sources_independent() {
+        return Ok(());
+    }
 
     CTX.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -423,12 +457,18 @@ pub fn try_copy(source: &Path, dest: &Path, source_size: u64) -> io::Result<Opti
             .as_ref()
             .is_none_or(|ctx| !ctx.backend.matches(&source_mount))
         {
-            *slot = Some(make_context(source_mount.clone())?);
+            let Ok(context) = make_context(source_mount.clone()) else {
+                return Ok(None);
+            };
+            *slot = Some(context);
         }
         let ctx = slot.as_mut().expect("VFSI context initialized");
         if let Some(prepared) = ctx.prepared_copies.remove(source) {
             if prepared.dest == dest {
-                std::fs::rename(&prepared.temp, dest)?;
+                if let Err(error) = std::fs::rename(&prepared.temp, dest) {
+                    let _ = std::fs::remove_file(&prepared.temp);
+                    return Err(error);
+                }
                 if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
                     eprintln!("[profile] cp_vfsi_method=batched_server_copy");
                 }
@@ -436,24 +476,27 @@ pub fn try_copy(source: &Path, dest: &Path, source_size: u64) -> io::Result<Opti
             }
             let _ = std::fs::remove_file(prepared.temp);
         }
+        let Ok(source_path) = ctx.backend.map(source, ResolvePath::Follow) else {
+            return Ok(None);
+        };
         if server_copy
             && dest_mount
                 .as_ref()
                 .is_some_and(|mount| same_mount(mount, &source_mount))
+            && dest.metadata().is_ok_and(|metadata| metadata.is_file())
+            && let Ok(dest_path) = ctx.backend.map(dest, ResolvePath::Follow)
         {
-            // Create/truncate through the kernel first so cp retains its normal
-            // destination-creation semantics and the mount has no stale tail.
+            // Truncate through the kernel first so the mount has no stale tail.
+            // Keep special files on the single-open kernel write path.
             OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
                 .open(dest)?;
-            let pair = (
-                ctx.backend.map(source, ResolvePath::Follow)?,
-                ctx.backend.map(dest, ResolvePath::Follow)?,
-            );
-            if let Some(Ok(mut outcomes)) = ctx.backend.try_server_copy(std::slice::from_ref(&pair))
+            if let Some(Ok(mut outcomes)) = ctx
+                .backend
+                .try_server_copy(&[(source_path.clone(), dest_path)])
             {
                 if outcomes.len() != 1 {
                     return Err(io::Error::new(
@@ -469,7 +512,6 @@ pub fn try_copy(source: &Path, dest: &Path, source_size: u64) -> io::Result<Opti
                 }
             }
         }
-        let source_path = ctx.backend.map(source, ResolvePath::Follow)?;
         let mut output = OpenOptions::new()
             .write(true)
             .create(true)
@@ -503,14 +545,8 @@ pub fn try_round_robin(
     // Admission requires one identical parent and rejects source symlinks.
     // Resolve that directory once instead of rediscovering it for every file.
     let mount = mount_root(nfs_mount(stream_parent(&sources[0]))?)?;
-    let backend = match Backend::open(&mount) {
-        Ok(backend) => backend,
-        Err(error) => return Some(Err(error)),
-    };
-    let paths = match backend.map_many(sources, ResolvePath::Follow) {
-        Ok(paths) => paths,
-        Err(error) => return Some(Err(error)),
-    };
+    let backend = Backend::open(&mount).ok()?;
+    let paths = backend.map_many(sources, ResolvePath::Follow).ok()?;
     Some(copy_stream_entries(&backend, &paths, &entries, budget))
 }
 
@@ -562,7 +598,7 @@ fn stream_entries(
         .map(|source| {
             let metadata = source.symlink_metadata().ok()?;
             if stream_parent(source) != parent
-                || !metadata.is_file()
+                || !eligible_file(&metadata, options.sparse_mode)
                 || metadata.len() <= 64 * 1024 * 1024
             {
                 return None;
@@ -623,6 +659,41 @@ fn copy_stream_entries(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn command_scope_cleans_unclaimed_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let temp = root.path().join("staged");
+        std::fs::write(&temp, b"staged contents").unwrap();
+        {
+            let _batch = BatchGuard;
+            CTX.with(|slot| {
+                *slot.borrow_mut() = Some(Context {
+                    backend: Backend::Dummy {
+                        fs: Posix::new(root.path()).unwrap(),
+                        paths: PathMapper::new(root.path()).unwrap(),
+                    },
+                    prefetched: HashMap::from([(PathBuf::from("source"), b"contents".to_vec())]),
+                    prepared_copies: HashMap::from([(
+                        PathBuf::from("source"),
+                        PreparedCopy {
+                            dest: root.path().join("destination"),
+                            temp: temp.clone(),
+                        },
+                    )]),
+                });
+            });
+            assert!(temp.exists());
+        }
+        assert!(!temp.exists());
+        assert!(!root.path().join("destination").exists());
+        CTX.with(|slot| {
+            let slot = slot.borrow();
+            let context = slot.as_ref().unwrap();
+            assert!(context.prefetched.is_empty());
+            assert!(context.prepared_copies.is_empty());
+        });
+    }
 
     #[test]
     fn malformed_server_copy_reply_cleans_staging_without_publishing_or_fallback() {
@@ -759,6 +830,7 @@ mod tests {
     fn stream_options() -> super::super::Options {
         super::super::Options {
             reflink_mode: super::super::ReflinkMode::Never,
+            sparse_mode: super::super::SparseMode::Never,
             cli_dereference: true,
             ..Default::default()
         }
@@ -809,6 +881,9 @@ mod tests {
             .unwrap();
         let sources = [one.clone(), two.clone()];
         assert!(stream_entries(&sources, dest.path(), &stream_options()).is_some());
+        let mut auto_sparse = stream_options();
+        auto_sparse.sparse_mode = super::super::SparseMode::Auto;
+        assert!(stream_entries(&sources, dest.path(), &auto_sparse).is_none());
         assert!(
             stream_entries(&[one.clone(), one.clone()], dest.path(), &stream_options()).is_none()
         );

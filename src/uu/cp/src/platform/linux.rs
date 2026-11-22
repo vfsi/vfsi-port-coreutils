@@ -143,11 +143,11 @@ fn check_for_data(src_file: &mut File) -> io::Result<(bool, u64, u64)> {
 /// Checks whether a file is sparse i.e. it contains holes, uses the crude heuristic blocks < size / 512
 /// Reference:`<https://doc.rust-lang.org/std/os/unix/fs/trait.MetadataExt.html#tymethod.blocks>`
 fn check_sparse_detection(src_file: &File) -> io::Result<bool> {
-    let metadata = src_file.metadata()?;
-    let size = metadata.size();
-    let blocks = metadata.blocks();
+    Ok(metadata_is_sparse(&src_file.metadata()?))
+}
 
-    Ok(blocks < size / 512)
+pub(crate) fn metadata_is_sparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.blocks() < metadata.size() / 512
 }
 
 /// Optimized [`sparse_copy_fd`] doesn't create holes for large sequences of zeros in non `sparse_files`

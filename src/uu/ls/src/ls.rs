@@ -1454,14 +1454,8 @@ impl DirId {
     }
 }
 
-/// Recursively traverse directories using an explicit stack.
-///
-/// This avoids deep recursive call chains while preserving GNU-style
-/// directory traversal order and ancestor detection.
-/// Vectorized recursive fast path: walk the subtree with `vnfs` (few
-/// large compounds, directories already in ls -R pre-order) and render each
-/// directory in sequence. Returns `Ok(false)` when the vectorized backend is
-/// not applicable (falls back to the normal path).
+/// Walk the subtree through VFSI and render each directory in ls -R order.
+/// A failed walk can fall back to the normal path before it emits output.
 #[cfg(all(feature = "vnfs", target_os = "linux"))]
 fn list_recursive_vf<O: LsOutput>(
     root: &PathData,
@@ -1470,16 +1464,10 @@ fn list_recursive_vf<O: LsOutput>(
     pos: usize,
     files_is_empty: bool,
 ) -> UResult<bool> {
-    // Time sort has no tie-break in `sort_entries`, so equal timestamps resolve
-    // from the full input array (including "." and ".."); that cannot be
-    // reproduced by the walk, so fall back to the (correct) normal path.
-    if config.sort == Sort::Time {
-        return Ok(false);
-    }
     let t0 = std::time::Instant::now();
     let mut entries = Vec::new();
     let mut i = 0usize;
-    let used = nfs::try_visit_walk_vf(root.path(), config, |w| {
+    let outcome = nfs::try_visit_walk_vf(root.path(), config, |w| {
         let path = PathBuf::from(&w.path);
         let path_data = PathData::new(path.clone().into(), None, None, config, false, false);
         output.write_dir_header(&path_data, config, i == 0 && pos == 0 && files_is_empty)?;
@@ -1529,9 +1517,77 @@ fn list_recursive_vf<O: LsOutput>(
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
-    Ok(used)
+    match outcome {
+        nfs::WalkOutcome::Fallback => Ok(false),
+        nfs::WalkOutcome::Complete => Ok(true),
+        nfs::WalkOutcome::Resume(pending) => {
+            for path in pending.into_iter().rev() {
+                let directory =
+                    PathData::new(path.clone().into(), None, None, config, false, false);
+                let (read_dir, id) = match open_pending_recursive_dir(&path) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        output.flush()?;
+                        show!(LsError::IOErrorContext(path, error, false));
+                        continue;
+                    }
+                };
+                output.write_dir_header(&directory, config, false)?;
+                let mut ancestors = FxHashSet::default();
+                ancestors.insert(id);
+                enter_directory(
+                    &directory,
+                    read_dir,
+                    config,
+                    Some(id),
+                    &mut ancestors,
+                    output,
+                    &mut entries,
+                )?;
+            }
+            Ok(true)
+        }
+    }
 }
 
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+fn open_pending_recursive_dir(path: &Path) -> std::io::Result<(LsReadDir, DirId)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
+
+    let observed = fs::symlink_metadata(path)?;
+    if !observed.is_dir() {
+        return Err(Error::from(ErrorKind::NotADirectory));
+    }
+    let listing = fs::read_dir(path)?;
+    let current = fs::symlink_metadata(path)?;
+    let id = DirId(observed.dev(), observed.ino());
+    if !current.is_dir() || DirId(current.dev(), current.ino()) != id {
+        return Err(Error::other("directory changed while opening"));
+    }
+    Ok((LsReadDir::from_std(listing), id))
+}
+
+#[cfg(all(test, feature = "vnfs", target_os = "linux"))]
+#[test]
+fn recursive_resume_rejects_a_replaced_directory_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let child = root.path().join("pending");
+    fs::create_dir(&child).unwrap();
+    assert!(open_pending_recursive_dir(&child).is_ok());
+
+    fs::remove_dir(&child).unwrap();
+    std::os::unix::fs::symlink(root.path(), &child).unwrap();
+    assert_eq!(
+        open_pending_recursive_dir(&child).err().unwrap().kind(),
+        ErrorKind::NotADirectory
+    );
+}
+
+/// Recursively traverse directories using an explicit stack.
+///
+/// This avoids deep recursive call chains while preserving GNU-style
+/// directory traversal order and ancestor detection.
 fn enter_directory<O: LsOutput>(
     path_data: &PathData,
     read_dir: LsReadDir,
@@ -1864,7 +1920,7 @@ fn ls_time(md: &LsMeta, md_time: uucore::fsext::MetadataTimeField) -> Option<Sys
 )]
 fn open_dir(path: &Path, config: &Config) -> std::io::Result<LsReadDir> {
     #[cfg(all(feature = "vnfs", target_os = "linux"))]
-    if let Some(rd) = nfs::try_open_vf(path, config)? {
+    if let Ok(Some(rd)) = nfs::try_open_vf(path, config) {
         return Ok(rd);
     }
     fs::read_dir(path).map(LsReadDir::from_std)

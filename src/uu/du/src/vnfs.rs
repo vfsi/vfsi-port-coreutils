@@ -12,8 +12,9 @@
 //! preserves post-order directory totals, hard-link deduplication,
 //! `--exclude`, `-S`, `-a`, `--time`, `--inodes`, and `--apparent-size`
 //! handling. Unsupported modes and connection setup failures use the standard
-//! traversal. Errors after traversal starts are reported without replaying
-//! already emitted output. Excluded directories are pruned before listing.
+//! traversal. Backend failures can retry before any output. An error after
+//! output begins is reported without replay. Excluded directories are pruned
+//! before listing.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,9 +48,15 @@ pub fn is_enabled() -> bool {
 /// Whether this traversal can reproduce `du` semantics for these options.
 ///
 /// `-L`/`--dereference-args` follow symbolic links and need the cycle-safe
-/// logic in the standard traversal, so they are left to `std::fs`.
-pub fn supports(options: &TraversalOptions) -> bool {
-    matches!(options.dereference, Deref::None) && !options.one_file_system
+/// logic in the standard traversal. Multiple operands with deduplication
+/// need a single kernel inode set across every operand. The native walker
+/// also streams file rows and exclusion notices while reporting child errors.
+pub fn supports(options: &TraversalOptions, operands: usize) -> bool {
+    matches!(options.dereference, Deref::None)
+        && !options.one_file_system
+        && (operands == 1 || options.count_links)
+        && !options.all
+        && !(options.verbose && !options.excludes.is_empty())
 }
 
 fn attr_mask(options: &TraversalOptions) -> Attributes {
@@ -99,10 +106,8 @@ fn usage_from_attrs(
     })
 }
 
-/// Identities are comparable only within one backend/server namespace.
 #[derive(Default)]
 pub struct Context {
-    seen: HashMap<String, HashSet<FsObjId>>,
     sessions: HashMap<(String, PathBuf, PathBuf), Session>,
 }
 
@@ -125,14 +130,30 @@ fn accumulate(total: &mut Usage, usage: &Usage) {
     total.latest_time = max_time(total.latest_time, usage.latest_time);
 }
 
-fn send(
-    print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
-    usage: Usage,
-    depth: usize,
-) -> io::Result<()> {
-    print_tx
-        .send(Ok(StatPrintInfo { usage, depth }))
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "du printer stopped"))
+struct Output<'a> {
+    tx: &'a mpsc::Sender<UResult<StatPrintInfo>>,
+    started: bool,
+}
+
+impl<'a> Output<'a> {
+    fn new(tx: &'a mpsc::Sender<UResult<StatPrintInfo>>) -> Self {
+        Self { tx, started: false }
+    }
+
+    fn send(&mut self, usage: Usage, depth: usize) -> io::Result<()> {
+        // A printer failure terminates the command, even on the first send.
+        self.started = true;
+        self.tx
+            .send(Ok(StatPrintInfo { usage, depth }))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "du printer stopped"))
+    }
+
+    fn finish(self, result: io::Result<Usage>) -> io::Result<Option<Usage>> {
+        match result {
+            Err(_) if !self.started => Ok(None),
+            result => result.map(Some),
+        }
+    }
 }
 
 /// Traverse `path` through `backend` and emit each entry, returning the root's
@@ -143,7 +164,7 @@ fn traverse<F: Vfsi>(
     path: &Path,
     vroot: &Path,
     options: &TraversalOptions,
-    print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
+    output: &mut Output<'_>,
     counted: &mut HashSet<FsObjId>,
 ) -> io::Result<Usage> {
     let masks = attr_mask(options);
@@ -184,7 +205,7 @@ fn traverse<F: Vfsi>(
         vroot,
         &root_attrs,
         options,
-        print_tx,
+        output,
         counted,
         |visitor| {
             backend
@@ -213,7 +234,7 @@ fn traverse_pages(
     vroot: &Path,
     root_attrs: &Metadata,
     options: &TraversalOptions,
-    print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
+    output: &mut Output<'_>,
     counted: &mut HashSet<FsObjId>,
     visit: impl FnOnce(
         &mut dyn FnMut(usize, DirectoryListing) -> vnfs::Result<ListDirControl>,
@@ -277,6 +298,7 @@ fn traverse_pages(
             });
             if excluded {
                 if options.verbose {
+                    output.started = true;
                     println!(
                         "{}",
                         translate!("du-verbose-ignored", "path" => rendered.quote())
@@ -358,7 +380,8 @@ fn traverse_pages(
                 }
                 accumulate(&mut directories[parent].usage, &usage);
                 if options.all {
-                    send(print_tx, usage, depth)
+                    output
+                        .send(usage, depth)
                         .map_err(|_| io::Error::from_raw_os_error(libc::EPIPE))?;
                 }
             }
@@ -375,7 +398,7 @@ fn traverse_pages(
         counted.insert(id);
         accumulate(&mut directories[file.parent].usage, &file.usage);
         if options.all {
-            send(print_tx, file.usage, file.depth)?;
+            output.send(file.usage, file.depth)?;
         }
     }
     // Discovery always precedes descendants. Reverse reduction therefore emits
@@ -387,7 +410,7 @@ fn traverse_pages(
         if !options.separate_dirs {
             accumulate(&mut directories[child.parent].usage, &child.usage);
         }
-        send(print_tx, child.usage, child.depth)?;
+        output.send(child.usage, child.depth)?;
     }
     Ok(directories.pop().unwrap().usage)
 }
@@ -395,7 +418,7 @@ fn traverse_pages(
 /// Compute `du` for `path` through VFSI.
 ///
 /// Returns `Ok(None)` when the path is not on an NFS mount or the backend is
-/// disabled. Traversal errors are returned without restarting the walk.
+/// disabled, or when a backend fails before any output.
 pub fn try_du(
     context: &mut Context,
     path: &Path,
@@ -404,27 +427,27 @@ pub fn try_du(
 ) -> io::Result<Option<Usage>> {
     // Canonicalizing a no-follow symlink operand would walk its target.
     // Keep that uncommon case on the existing kernel implementation.
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+    if !std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_symlink()) {
         return Ok(None);
     }
     let Some(mount) = uucore::vnfs::nfs_mount(path).and_then(uucore::vnfs::mount_root) else {
         return Ok(None);
     };
-    let resolved = path.canonicalize().map_err(io::Error::other)?;
+    let Ok(resolved) = path.canonicalize() else {
+        return Ok(None);
+    };
     let Ok(relative) = resolved.strip_prefix(mount.mount_point()) else {
         return Ok(None);
     };
     // Path inside the export namespace the backend resolves against.
     let vroot = Path::new("/").join(relative);
 
-    // Kernel st_dev IDs and direct NFS FSIDs are different identity domains.
-    // Keep them apart; direct sessions on the same server share FSID/FILEID.
+    // Session reuse requires the same backend and mounted namespace.
     let namespace = if std::env::var("VNFS_IMPL").as_deref() == Ok("dummy") {
         "kernel".to_owned()
     } else {
         format!("nfs:{}", mount.host())
     };
-    let counted = context.seen.entry(namespace.clone()).or_default();
     let key = (
         namespace,
         mount.export_root().to_path_buf(),
@@ -440,11 +463,18 @@ pub fn try_du(
         };
         context.sessions.insert(key.clone(), session);
     }
+    let mut output = Output::new(print_tx);
+    let mut counted = HashSet::default();
     let result = match &context.sessions[&key] {
-        Session::Dummy { fs, .. } => traverse(fs, path, &vroot, options, print_tx, counted),
-        Session::Nfs { session, .. } => {
-            traverse(session.fs(), path, &vroot, options, print_tx, counted)
-        }
+        Session::Dummy { fs, .. } => traverse(fs, path, &vroot, options, &mut output, &mut counted),
+        Session::Nfs { session, .. } => traverse(
+            session.fs(),
+            path,
+            &vroot,
+            options,
+            &mut output,
+            &mut counted,
+        ),
     };
 
     print_stats();
@@ -453,7 +483,7 @@ pub fn try_du(
     {
         eprintln!("[vnfs] traversal failed: {error}");
     }
-    result.map(Some)
+    output.finish(result)
 }
 
 /// Emit process-wide compound/RPC counts when `VNFS_STATS=1`.
@@ -514,9 +544,78 @@ mod tests {
     #[test]
     fn device_boundary_and_follow_modes_keep_kernel_semantics() {
         let mut options = options();
-        assert!(supports(&options));
+        assert!(supports(&options, 1));
         options.one_file_system = true;
-        assert!(!supports(&options), "filesystem identity is not available");
+        assert!(
+            !supports(&options, 1),
+            "filesystem identity is not available"
+        );
+    }
+
+    #[test]
+    fn multiple_operands_use_kernel_identity_unless_counting_links() {
+        let mut options = options();
+        assert!(supports(&options, 1));
+        assert!(!supports(&options, 2));
+        options.count_links = true;
+        assert!(supports(&options, 2));
+    }
+
+    #[test]
+    fn output_during_discovery_uses_the_native_walker() {
+        let mut options = options();
+        options.all = true;
+        assert!(!supports(&options, 1));
+
+        options.all = false;
+        options.verbose = true;
+        assert!(supports(&options, 1));
+        options
+            .excludes
+            .push(glob::Pattern::new("excluded").unwrap());
+        assert!(!supports(&options, 1));
+    }
+
+    #[test]
+    fn native_retry_is_allowed_only_before_output() {
+        let root = tempfile::tempdir().unwrap();
+        let fs = Posix::new(root.path()).unwrap();
+        let options = options();
+        let attrs = fs
+            .attrs_with_options("/", AttrsOptions::new().with_fields(attr_mask(&options)))
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut output = Output::new(&tx);
+        let result = traverse_pages(
+            root.path(),
+            Path::new("/"),
+            &attrs,
+            &options,
+            &mut output,
+            &mut HashSet::default(),
+            |_| Err(io::ErrorKind::PermissionDenied.into()),
+        );
+        assert!(output.finish(result).unwrap().is_none());
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        let mut output = Output::new(&tx);
+        output
+            .send(usage_from_attrs(root.path(), &attrs, &options).unwrap(), 0)
+            .unwrap();
+        assert!(matches!(
+            output.finish(Err(io::ErrorKind::PermissionDenied.into())),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        drop(rx);
+
+        let mut output = Output::new(&tx);
+        let error = output
+            .send(usage_from_attrs(root.path(), &attrs, &options).unwrap(), 0)
+            .unwrap_err();
+        assert!(matches!(
+            output.finish(Err(error)),
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe
+        ));
     }
 
     /// Run the VFSI traversal over `root` with given options and return
@@ -530,7 +629,7 @@ mod tests {
             root,
             Path::new("/"),
             options,
-            &tx,
+            &mut Output::new(&tx),
             &mut HashSet::default(),
         )
         .expect("traverse");
@@ -706,7 +805,7 @@ mod tests {
                     Path::new("/"),
                     &root,
                     &opts,
-                    &tx,
+                    &mut Output::new(&tx),
                     &mut HashSet::default(),
                     |visitor| {
                         for page in pages {
@@ -767,7 +866,7 @@ mod tests {
             Path::new("a"),
             Path::new("/a"),
             &options(),
-            &tx,
+            &mut Output::new(&tx),
             &mut seen,
         )
         .unwrap();
@@ -776,7 +875,7 @@ mod tests {
             Path::new("b"),
             Path::new("/b"),
             &options(),
-            &tx,
+            &mut Output::new(&tx),
             &mut seen,
         )
         .unwrap();
@@ -788,7 +887,7 @@ mod tests {
             Path::new("a/file"),
             Path::new("/a/file"),
             &options(),
-            &tx,
+            &mut Output::new(&tx),
             &mut seen,
         )
         .unwrap();
@@ -796,8 +895,15 @@ mod tests {
 
         let mut opts = options();
         opts.count_links = true;
-        let repeated =
-            traverse(&fs, Path::new("b"), Path::new("/b"), &opts, &tx, &mut seen).unwrap();
+        let repeated = traverse(
+            &fs,
+            Path::new("b"),
+            Path::new("/b"),
+            &opts,
+            &mut Output::new(&tx),
+            &mut seen,
+        )
+        .unwrap();
         assert_eq!(repeated.size, 5);
     }
 

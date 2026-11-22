@@ -1005,17 +1005,7 @@ fn display_item_long(
             target_os = "macos",
             target_os = "netbsd"
         ))]
-        // Vf-backed entries carry the per-object FATTR4_NAMED_ATTR boolean
-        // fetched inline in the READDIR, so use it instead of probing the
-        // mount one xattr RPC per file. Only trust it when it was actually
-        // requested and returned; otherwise probe locally.
-        let is_acl_set = match item.metadata() {
-            #[cfg(all(feature = "vnfs", target_os = "linux"))]
-            Some(LsMeta::Vf(a)) if a.has_named_attributes().is_some() => {
-                a.has_named_attributes().unwrap_or(false)
-            }
-            _ => has_acl(item.path(), item.must_dereference),
-        };
+        let is_acl_set = has_acl(item.path(), item.must_dereference);
         let permissions = match md {
             LsMeta::Std(metadata) => display_permissions(metadata, true),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
@@ -1448,13 +1438,7 @@ fn calculate_padding_collection(
                     target_os = "macos",
                     target_os = "netbsd"
                 ))]
-                let is_acl_set = match item.metadata() {
-                    #[cfg(all(feature = "vnfs", target_os = "linux"))]
-                    Some(LsMeta::Vf(a)) if a.has_named_attributes().is_some() => {
-                        a.has_named_attributes().unwrap_or(false)
-                    }
-                    _ => has_acl(item.path(), item.must_dereference),
-                };
+                let is_acl_set = has_acl(item.path(), item.must_dereference);
                 if context_len > 1 || is_acl_set {
                     padding_collections.permissions = PERMISSIONS_WIDTH + 1;
                 }

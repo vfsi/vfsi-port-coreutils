@@ -1498,14 +1498,26 @@ pub fn copy(sources: &[PathBuf], target: &Path, options: &Options) -> CopyResult
     };
 
     #[cfg(all(feature = "vnfs", target_os = "linux"))]
-    if !options.attributes_only
+    let _vfsi_batch = if !options.attributes_only
         && matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
         && options.reflink_mode != ReflinkMode::Always
         && options.sparse_mode != SparseMode::Always
         && options.dereference(true)
     {
-        vfsi::prepare_batch(sources, target)?;
-    }
+        let batch = vfsi::BatchGuard;
+        vfsi::prepare_batch(sources, target, |source| {
+            source
+                .symlink_metadata()
+                .is_ok_and(|metadata| vfsi::eligible_file(&metadata, options.sparse_mode))
+                && construct_dest_path(source, target, target_type, options).is_ok_and(|dest| {
+                    matches!(dest.symlink_metadata(),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound)
+                })
+        })?;
+        Some(batch)
+    } else {
+        None
+    };
 
     for source in sources {
         let normalized_source = normalize_path(source);
@@ -3196,9 +3208,9 @@ fn copy_helper(
         #[cfg(unix)]
         let nofollow = !options.dereference(source_in_command_line);
         #[cfg(all(feature = "vnfs", target_os = "linux"))]
-        let vfsi_method = if !options.attributes_only
+        let vfsi_method = if vfsi::eligible_file(source_metadata, options.sparse_mode)
+            && !options.attributes_only
             && options.reflink_mode != ReflinkMode::Always
-            && options.sparse_mode != SparseMode::Always
             && !nofollow
         {
             vfsi::try_copy(source, dest, source_metadata.len())?

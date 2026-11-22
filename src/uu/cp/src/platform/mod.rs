@@ -23,6 +23,8 @@ pub(crate) use self::macos::copy_on_write;
 mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use self::linux::copy_on_write;
+#[cfg(all(feature = "vnfs", target_os = "linux"))]
+pub(crate) use self::linux::metadata_is_sparse;
 
 #[cfg(windows)]
 mod windows;

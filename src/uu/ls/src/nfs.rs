@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::config::{Config, Dereference, Sort};
 use crate::meta::{LsDirEntry, LsReadDir};
 use uucore::vnfs::NfsMount;
 use uucore::vnfs::Session as Backend;
@@ -40,16 +41,12 @@ fn impl_choice() -> Option<&'static str> {
 
 /// Request metadata consumed by the selected rendering and sorting modes.
 /// `Session::read_dirs` validates required fields before exposing any listing.
-fn attr_mask(config: &crate::config::Config) -> Attributes {
-    use crate::{config::Sort, display::Format};
+fn attr_mask(config: &Config) -> Attributes {
+    use crate::display::Format;
     use uucore::fsext::MetadataTimeField;
     let mut mask = Attributes::MODE;
     if config.format == Format::Long {
-        mask |= Attributes::SIZE
-            | Attributes::NLINK
-            | Attributes::BLOCKS
-            | Attributes::RDEV
-            | Attributes::NAMED_ATTR;
+        mask |= Attributes::SIZE | Attributes::NLINK | Attributes::BLOCKS | Attributes::RDEV;
         if config.long.owner || config.long.author {
             mask |= Attributes::UID;
         }
@@ -108,7 +105,7 @@ fn make_ctx(mount: NfsMount) -> io::Result<VfContext> {
 
 /// Open `path` for listing through the vectorized backend when applicable.
 /// Returns `Ok(None)` when the path is not NFS-mounted or the backend is off.
-pub fn try_open_vf(path: &Path, config: &crate::config::Config) -> io::Result<Option<LsReadDir>> {
+pub fn try_open_vf(path: &Path, config: &Config) -> io::Result<Option<LsReadDir>> {
     if impl_choice().is_none() {
         return Ok(None);
     }
@@ -213,7 +210,7 @@ fn ctx_open_many(
 /// otherwise (entries, or `None` where the caller must fall back).
 pub fn try_open_many_vf(
     dirs: &[&Path],
-    config: &crate::config::Config,
+    config: &Config,
 ) -> io::Result<Option<Vec<Option<LsReadDir>>>> {
     if impl_choice().is_none() || dirs.len() < 2 {
         return Ok(None);
@@ -267,28 +264,42 @@ fn group_mounts<M>(
     groups
 }
 
-/// Walk the whole subtree rooted at `path` through the vectorized backend,
-/// returning each directory with its entries, ordered exactly as `ls` would
-/// list them (via [`sort_entries`] semantics, so it is correct under any
-/// locale and sort mode). Paths in the result are mapped back to kernel paths
-/// (under the mountpoint).
-pub fn try_visit_walk_vf(
-    path: &Path,
-    config: &crate::config::Config,
-    mut callback: impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
-) -> uucore::error::UResult<bool> {
+pub(crate) enum WalkOutcome {
+    Fallback,
+    Complete,
+    Resume(Vec<PathBuf>),
+}
+
+fn supports_ordered_walk(config: &Config) -> bool {
+    // The VFSI walk does not descend through directory symlinks. Time sort
+    // needs the native input order for tied timestamps, including "." and "..".
     // A comparator cannot reverse the server's unsorted enumeration order.
-    if impl_choice().is_none() || (config.sort == crate::config::Sort::None && config.reverse) {
-        return Ok(false);
+    !matches!(config.dereference, Dereference::All)
+        && config.sort != Sort::Time
+        && !(config.sort == Sort::None && config.reverse)
+}
+
+/// Visit directories in recursive listing order and map them back to operand
+/// paths. The caller can retry through the kernel before any listing is emitted.
+pub(crate) fn try_visit_walk_vf(
+    path: &Path,
+    config: &Config,
+    mut callback: impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
+) -> uucore::error::UResult<WalkOutcome> {
+    if impl_choice().is_none() || !supports_ordered_walk(config) {
+        return Ok(WalkOutcome::Fallback);
     }
     let Some(mount) = nfs_mountpoint(path).and_then(uucore::vnfs::mount_root) else {
-        return Ok(false);
+        return Ok(WalkOutcome::Fallback);
     };
     CTX.with(|c| {
         let mut ctx = c.borrow_mut();
         if ctx.as_ref().is_none_or(|ctx| !ctx.backend.matches(&mount)) {
             let t0 = std::time::Instant::now();
-            *ctx = Some(make_ctx(mount)?);
+            let Ok(connected) = make_ctx(mount) else {
+                return Ok(WalkOutcome::Fallback);
+            };
+            *ctx = Some(connected);
             if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
                 eprintln!(
                     "[profile] connect_ms={:.1}",
@@ -299,20 +310,18 @@ pub fn try_visit_walk_vf(
         let ctx = ctx.as_mut().unwrap();
 
         let t0 = std::time::Instant::now();
-        match &ctx.backend {
+        let outcome = match &ctx.backend {
             Backend::Dummy { fs, .. } => {
-                visit_ordered(fs, ctx.backend.local_root(), path, config, &mut callback)?;
+                visit_ordered(fs, ctx.backend.local_root(), path, config, &mut callback)?
             }
-            Backend::Nfs { session, .. } => {
-                visit_ordered(
-                    session.fs(),
-                    ctx.backend.local_root(),
-                    path,
-                    config,
-                    &mut callback,
-                )?;
-            }
-        }
+            Backend::Nfs { session, .. } => visit_ordered(
+                session.fs(),
+                ctx.backend.local_root(),
+                path,
+                config,
+                &mut callback,
+            )?,
+        };
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
             eprintln!(
                 "[profile] walk_ms={:.1}",
@@ -320,7 +329,7 @@ pub fn try_visit_walk_vf(
             );
         }
 
-        Ok(true)
+        Ok(outcome)
     })
 }
 
@@ -328,22 +337,30 @@ fn visit_ordered<F: vnfs::Vfsi>(
     fs: &F,
     mount: &Path,
     path: &Path,
-    config: &crate::config::Config,
+    config: &Config,
     callback: &mut impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
-) -> uucore::error::UResult<()> {
+) -> uucore::error::UResult<WalkOutcome> {
     use vnfs::directory::WalkControl;
-    let session = PathMapper::new(mount)?;
-    let root = session.map(path, ResolvePath::Follow)?;
+    let Ok(session) = PathMapper::new(mount) else {
+        return Ok(WalkOutcome::Fallback);
+    };
+    let Ok(root) = session.map(path, ResolvePath::Follow) else {
+        return Ok(WalkOutcome::Fallback);
+    };
+    let mut pending = vec![path.to_path_buf()];
+    let fields = attr_mask(config);
+    let descend = |entry: &DirEntry| {
+        entry
+            .file_name()
+            .is_some_and(|name| crate::display::should_display(name, config))
+    };
+    let mut delivered = false;
     let mut output_error = None;
     let result = fs.visit_dirs_ordered(
         &root,
-        fs.limits().walk_options().with_fields(attr_mask(config)),
+        fs.limits().walk_options().with_fields(fields),
         crate::vf_entry_order(config, &session),
-        |entry| {
-            entry
-                .file_name()
-                .is_some_and(|name| crate::display::should_display(name, config))
-        },
+        descend,
         |listing, _| {
             let relative = listing
                 .path
@@ -360,6 +377,26 @@ fn visit_ordered<F: vnfs::Vfsi>(
             } else {
                 path.join(relative)
             };
+            if pending.last() != Some(&rendered) {
+                return Err(io::Error::other("unexpected VFSI directory visit order"));
+            }
+            for entry in &listing.entries {
+                entry.attrs().require(fields)?;
+            }
+            // Remember only the unrendered frontier, in the same DFS order
+            // as the SDK. On a listing or budget failure each pending subtree
+            // can be handed to the kernel without replaying any headings.
+            pending.pop();
+            pending.extend(
+                listing
+                    .entries
+                    .iter()
+                    .rev()
+                    .filter(|entry| entry.attrs().is_dir() && descend(entry))
+                    .filter_map(|entry| entry.file_name())
+                    .map(|name| rendered.join(name)),
+            );
+            delivered = true;
             if let Err(error) = callback(WalkEntry {
                 path: rendered,
                 entries: listing.entries,
@@ -373,8 +410,11 @@ fn visit_ordered<F: vnfs::Vfsi>(
     if let Some(error) = output_error {
         return Err(error);
     }
-    result?;
-    Ok(())
+    match result {
+        Ok(_) => Ok(WalkOutcome::Complete),
+        Err(_) if delivered => Ok(WalkOutcome::Resume(pending)),
+        Err(_) => Ok(WalkOutcome::Fallback),
+    }
 }
 
 #[cfg(all(test, all(feature = "vnfs", target_os = "linux")))]
@@ -462,7 +502,7 @@ mod tests {
             ),
         ] {
             let matches = crate::uu_app().get_matches_from(args);
-            let config = crate::config::Config::from(&matches, None).unwrap();
+            let config = Config::from(&matches, None).unwrap();
             let mask = attr_mask(&config);
             assert!(mask.contains(required), "missing {required:?} in {mask:?}");
             assert!(!mask.intersects(absent), "unneeded attributes in {mask:?}");
@@ -604,6 +644,55 @@ mod tests {
     }
 
     #[test]
+    fn ordered_walk_defers_to_native_recursion_for_dereference_and_unsupported_sorts() {
+        for (args, expected) in [
+            (["ls", "-R"], true),
+            (["ls", "-RL"], false),
+            (["ls", "-Rt"], false),
+            (["ls", "-RUr"], false),
+        ] {
+            let config = Config::from(&crate::uu_app().get_matches_from(args), None).unwrap();
+            assert_eq!(supports_ordered_walk(&config), expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn ordered_walk_distinguishes_backend_and_output_failures() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        let config = Config::from(&crate::uu_app().get_matches_from(["ls", "-R"]), None).unwrap();
+        let limits = vnfs::files::ResourceLimits::new()
+            .with_max_walk_depth(vnfs::directory::DepthLimit::new(0).unwrap());
+        let backend = Posix::new(root.path()).unwrap().with_limits(limits);
+        let file = root.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(matches!(
+            visit_ordered(&backend, root.path(), &file, &config, &mut |_| {
+                panic!("a non-directory cannot emit a listing")
+            })
+            .unwrap(),
+            WalkOutcome::Fallback
+        ));
+
+        let mut paths = Vec::new();
+        let outcome = visit_ordered(&backend, root.path(), root.path(), &config, &mut |entry| {
+            paths.push(entry.path);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WalkOutcome::Resume(paths) if paths == [root.path().join("child")]
+        ));
+        assert_eq!(paths, [root.path()]);
+
+        let result = visit_ordered(&backend, root.path(), root.path(), &config, &mut |_| {
+            Err(uucore::error::USimpleError::new(1, "test output failure"))
+        });
+        assert!(matches!(result, Err(error) if error.to_string() == "test output failure"));
+    }
+
+    #[test]
     fn ordered_walk_renders_the_operand_spelling_and_prunes_hidden_children() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".hidden/tree/child")).unwrap();
@@ -611,15 +700,16 @@ mod tests {
         let alias = root.path().join("alias");
         std::os::unix::fs::symlink(".hidden/tree", &alias).unwrap();
         let backend = Posix::new(root.path()).unwrap();
-        let config =
-            crate::config::Config::from(&crate::uu_app().get_matches_from(["ls", "-R"]), None)
-                .unwrap();
+        let config = Config::from(&crate::uu_app().get_matches_from(["ls", "-R"]), None).unwrap();
         let mut paths = Vec::new();
-        visit_ordered(&backend, root.path(), &alias, &config, &mut |entry| {
-            paths.push(entry.path);
-            Ok(())
-        })
-        .unwrap();
+        assert!(matches!(
+            visit_ordered(&backend, root.path(), &alias, &config, &mut |entry| {
+                paths.push(entry.path);
+                Ok(())
+            })
+            .unwrap(),
+            WalkOutcome::Complete
+        ));
         assert_eq!(paths, [alias.clone(), alias.join("child")]);
     }
 
@@ -644,7 +734,7 @@ mod tests {
                 .find(|entry| entry.file_name().unwrap() == name)
                 .unwrap()
         };
-        let config = crate::config::Config::from(
+        let config = Config::from(
             &crate::uu_app().get_matches_from(["ls", "--group-directories-first"]),
             None,
         )
@@ -677,7 +767,7 @@ mod tests {
         let entries = fs.read_dir("/").unwrap();
         let mapper = PathMapper::new(root.path()).unwrap();
         let matches = crate::uu_app().get_matches_from(["ls"]);
-        let mut config = crate::config::Config::from(&matches, None).unwrap();
+        let mut config = Config::from(&matches, None).unwrap();
         for sort in [
             "time",
             "size",
@@ -693,13 +783,13 @@ mod tests {
                 }
                 for group in [false, true] {
                     config.sort = match sort {
-                        "time" => crate::config::Sort::Time,
-                        "size" => crate::config::Sort::Size,
-                        "name" => crate::config::Sort::Name,
-                        "version" => crate::config::Sort::Version,
-                        "extension" => crate::config::Sort::Extension,
-                        "width" => crate::config::Sort::Width,
-                        _ => crate::config::Sort::None,
+                        "time" => Sort::Time,
+                        "size" => Sort::Size,
+                        "name" => Sort::Name,
+                        "version" => Sort::Version,
+                        "extension" => Sort::Extension,
+                        "width" => Sort::Width,
+                        _ => Sort::None,
                     };
                     config.reverse = reverse;
                     config.group_directories_first = group;

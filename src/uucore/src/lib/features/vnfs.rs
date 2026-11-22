@@ -3,13 +3,12 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-//! Opt-in VNFS removal support for paths on Linux NFS mounts.
+//! Shared VFSI operations for Linux NFS mounts.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use vnfs::Result as VfResult;
 use vnfs::directory::{Attributes, DirectoryListing, ListDirOptions};
-use vnfs::directory::{RemoveMode, RemoveOptions};
 use vnfs::files::{Capabilities, CopyOptions, ReadOptions, StreamOptions, Vfsi, VfsiExt};
 use vnfs::helpers::{PathMapper, ResolvePath};
 use vnfs::nfs::Nfs;
@@ -38,7 +37,9 @@ pub fn same_mount(a: &NfsMount, b: &NfsMount) -> bool {
 }
 
 /// Resolve one selected group's root once, retaining the complete discovery
-/// snapshot for connection validation and later session reuse.
+/// snapshot for connection validation and later session reuse. Discovering
+/// the root also rejects a direct backend when the kernel has a nested mount
+/// anywhere below that root.
 pub fn mount_root(mount: NfsMount) -> Option<NfsMount> {
     if mount.local_path() == mount.mount_point() {
         return Some(mount);
@@ -249,86 +250,6 @@ impl Session {
             .contains(Capabilities::SERVER_COPY)
             .then(|| session.fs().vcopy(pairs, CopyOptions::default()))
     }
-    fn remove(&self, path: &Path, recursive: bool) -> VfResult<()> {
-        let mode = if recursive {
-            RemoveMode::Tree
-        } else {
-            RemoveMode::Entry
-        };
-        match self {
-            Self::Dummy { fs, .. } => fs
-                .removes_all(&[path], mode, RemoveOptions::default())
-                .map_err(vnfs::error::IndexedError::into_cause),
-            Self::Nfs { session, .. } => session
-                .fs()
-                .removes_all(&[path], mode, RemoveOptions::default())
-                .map_err(vnfs::error::IndexedError::into_cause),
-        }
-    }
-}
-
-fn remove_paths(path: &Path) -> Option<(NfsMount, PathBuf)> {
-    let Component::Normal(name) = path.components().next_back()? else {
-        return None;
-    };
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let parent = parent.unwrap_or_else(|| Path::new("."));
-    let parent = parent.canonicalize().ok()?;
-    let info = Nfs::discover_mount(&parent).ok()?;
-    let point = info.mount_point().to_path_buf();
-    let mount = info;
-    let absolute = parent.join(name);
-
-    // Removing an export's mount point through its server-side path would
-    // target the export root instead of the local mount point.
-    if absolute == point {
-        return None;
-    }
-
-    let session = PathMapper::new(mount.local_path()).ok()?;
-    let dummy_path = session.map(path, ResolvePath::NoFollow).ok()?;
-    Some((mount, dummy_path))
-}
-
-thread_local! {
-    static REMOVE_SESSION: std::cell::RefCell<Option<(String, NfsMount, Session)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Try to remove `path` through VNFS.
-///
-/// `None` means no operation was submitted and the kernel path may be used.
-/// Once submitted, return its result even on failure: a direct recursive
-/// removal can have partial effects and must not be replayed via the kernel.
-pub fn try_remove(path: &Path, recursive: bool) -> Option<std::io::Result<()>> {
-    let (mount, relative_path) = remove_paths(path)?;
-
-    let implementation = std::env::var("VNFS_IMPL").ok()?;
-    if implementation != "dummy" && implementation != "nfs" {
-        return None;
-    }
-    REMOVE_SESSION.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot
-            .as_ref()
-            .is_none_or(|(mode, config, _)| mode != &implementation || config != &mount)
-        {
-            let backend = if implementation == "dummy" {
-                Session::Dummy {
-                    fs: Posix::new(mount.local_path()).ok()?,
-                    paths: PathMapper::new(mount.local_path()).ok()?,
-                }
-            } else {
-                let session = NfsMountSession::from_discovered(mount.clone()).ok()?;
-                Session::Nfs {
-                    session: Box::new(session),
-                    copy_capabilities: std::cell::OnceCell::new(),
-                }
-            };
-            *slot = Some((implementation, mount, backend));
-        }
-        Some(slot.as_ref()?.2.remove(&relative_path, recursive))
-    })
 }
 
 #[cfg(test)]
@@ -369,49 +290,6 @@ mod tests {
         assert!(backend.read_dirs(&[], Attributes::MODE).unwrap().is_empty());
     }
 
-    #[test]
-    fn removes_empty_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let empty = root.path().join("empty");
-        std::fs::create_dir(&empty).unwrap();
-        let fs = Posix::new(root.path()).unwrap();
-
-        fs.removes_all(&["/empty"], RemoveMode::Entry, RemoveOptions::default())
-            .map_err(vnfs::error::IndexedError::into_cause)
-            .unwrap();
-
-        assert!(!empty.exists());
-    }
-
-    #[test]
-    fn removes_tree_recursively() {
-        let root = tempfile::tempdir().unwrap();
-        let tree = root.path().join("tree");
-        std::fs::create_dir_all(tree.join("child")).unwrap();
-        std::fs::write(tree.join("child/file"), b"data").unwrap();
-        let fs = Posix::new(root.path()).unwrap();
-
-        fs.removes_all(&["/tree"], RemoveMode::Tree, RemoveOptions::default())
-            .map_err(vnfs::error::IndexedError::into_cause)
-            .unwrap();
-
-        assert!(!tree.exists());
-    }
-
-    #[test]
-    fn non_recursive_remove_keeps_nonempty_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("dir");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("file"), b"data").unwrap();
-        let fs = Posix::new(root.path()).unwrap();
-
-        assert!(
-            fs.removes_all(&["/dir"], RemoveMode::Entry, RemoveOptions::default())
-                .is_err()
-        );
-        assert!(dir.exists());
-    }
     #[test]
     #[ignore = "requires VFSI_TEST_MOUNT pointing at a writable NFS fixture"]
     fn copy_capabilities_are_lazy_and_cached_after_a_successful_query() {
