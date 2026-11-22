@@ -30,6 +30,8 @@ uucore = { workspace = true, features = [
   "parser-glob",
   "time",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 vnfs = { workspace = true, optional = true }
 
 [target.'cfg(all(unix, not(target_os = "redox")))'.dependencies]

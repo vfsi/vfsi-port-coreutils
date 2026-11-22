@@ -73,7 +73,7 @@ jobs:
         job:
           # Build and lint the bundled ntirpc backend on Linux.
           - { os: ubuntu-26.04   , arg: "--all-features --workspace --all-targets --tests --benches -p uucore" }
-          - { os: macos-latest   , arg: "--features=feat_os_unix,feat_diagnostics --workspace --all-targets --tests --benches -p uucore" }
+          - { os: macos-latest   , arg: "--all-features --workspace --all-targets --tests --benches -p uucore" }
           - { os: windows-latest , uu: feat_os_windows , arg: "--features=feat_os_windows,feat_diagnostics --all-targets --tests --benches -p coreutils -p uucore" }
           - { os: ubuntu-latest  , arg: "--features=feat_os_unix_redox" , target: x86_64-unknown-redox }
           - { os: ubuntu-latest  , arg: "--features=feat_wasm" , target: wasm32-wasip1 }

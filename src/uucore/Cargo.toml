@@ -41,7 +41,6 @@ rustc-hash = { workspace = true }
 unicode-width = { workspace = true }
 unit-prefix = { workspace = true, optional = true }
 uucore_procs = { workspace = true }
-vnfs = { workspace = true, optional = true }
 z85 = { workspace = true, optional = true }
 
 # Benchmark dependencies (optional)
@@ -122,6 +121,7 @@ walkdir = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { workspace = true, optional = true }
+vnfs = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wild = { workspace = true }
