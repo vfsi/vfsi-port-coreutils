@@ -848,7 +848,7 @@ impl<'a> PathData<'a> {
             )
         };
 
-        let md: OnceCell<Option<Metadata>> = OnceCell::new();
+        let md: OnceCell<Option<LsMeta>> = OnceCell::new();
         let must_dereference = match &config.dereference {
             Dereference::All => true,
             Dereference::Args => command_line,
@@ -857,7 +857,7 @@ impl<'a> PathData<'a> {
                     && let Ok(metadata) = p_buf.metadata()
                     && metadata.is_dir()
                 {
-                    md.get_or_init(|| Some(metadata));
+                    md.get_or_init(|| Some(LsMeta::Std(metadata)));
                     true
                 } else {
                     false
@@ -873,7 +873,6 @@ impl<'a> PathData<'a> {
         // Why prefer to check the DirEntry file_type()?  B/c the call is
         // nearly free compared to a metadata() call on a Path
         let ft: OnceCell<Option<LsFileType>> = OnceCell::new();
-        let md: OnceCell<Option<LsMeta>> = OnceCell::new();
         let security_context: OnceCell<Box<str>> = OnceCell::new();
 
         let de: RefCell<Option<DirEntry>> = if let Some(de) = dir_entry {

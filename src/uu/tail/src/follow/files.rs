@@ -264,7 +264,7 @@ mod tests {
         files.insert(
             path,
             PathData::new(
-                Some(Box::new(BufReader::new(File::open(path).unwrap()))),
+                Some(Box::new(BufReader::new(std::fs::File::open(path).unwrap()))),
                 Some(file.as_file().metadata().unwrap()),
                 "log",
                 false,
