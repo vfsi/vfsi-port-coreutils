@@ -39,6 +39,15 @@ fn impl_choice() -> Option<&'static str> {
     }
 }
 
+fn can_read_vf_metadata(config: &Config) -> bool {
+    use crate::display::Format;
+    use uucore::fsext::MetadataTimeField;
+
+    // VFSI entries cannot supply creation times to the ls formatter or sorter.
+    !matches!(config.time, MetadataTimeField::Birth)
+        || (config.format != Format::Long && config.sort != Sort::Time)
+}
+
 /// Request metadata consumed by the selected rendering and sorting modes.
 /// `Session::read_dirs` validates required fields before exposing any listing.
 fn attr_mask(config: &Config) -> Attributes {
@@ -106,7 +115,7 @@ fn make_ctx(mount: NfsMount) -> io::Result<VfContext> {
 /// Open `path` for listing through the vectorized backend when applicable.
 /// Returns `Ok(None)` when the path is not NFS-mounted or the backend is off.
 pub fn try_open_vf(path: &Path, config: &Config) -> io::Result<Option<LsReadDir>> {
-    if impl_choice().is_none() {
+    if impl_choice().is_none() || !can_read_vf_metadata(config) {
         return Ok(None);
     }
     let Some(mount) = nfs_mountpoint(path).and_then(uucore::vnfs::mount_root) else {
@@ -212,7 +221,7 @@ pub fn try_open_many_vf(
     dirs: &[&Path],
     config: &Config,
 ) -> io::Result<Option<Vec<Option<LsReadDir>>>> {
-    if impl_choice().is_none() || dirs.len() < 2 {
+    if impl_choice().is_none() || dirs.len() < 2 || !can_read_vf_metadata(config) {
         return Ok(None);
     }
     let groups = group_mounts(
@@ -286,7 +295,7 @@ pub(crate) fn try_visit_walk_vf(
     config: &Config,
     mut callback: impl FnMut(WalkEntry) -> uucore::error::UResult<()>,
 ) -> uucore::error::UResult<WalkOutcome> {
-    if impl_choice().is_none() || !supports_ordered_walk(config) {
+    if impl_choice().is_none() || !can_read_vf_metadata(config) || !supports_ordered_walk(config) {
         return Ok(WalkOutcome::Fallback);
     }
     let Some(mount) = nfs_mountpoint(path).and_then(uucore::vnfs::mount_root) else {
@@ -443,6 +452,20 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn birth_time_consumers_keep_native_metadata() {
+        for (args, expected) in [
+            (["ls", "--time=birth", "-1U"], true),
+            (["ls", "--time=birth", "-l"], false),
+            (["ls", "--time=birth", "-t"], false),
+            (["ls", "--time=birth", "-lR"], false),
+            (["ls", "--time=ctime", "-l"], true),
+        ] {
+            let config = Config::from(&crate::uu_app().get_matches_from(args), None).unwrap();
+            assert_eq!(can_read_vf_metadata(&config), expected, "{args:?}");
+        }
     }
 
     #[test]

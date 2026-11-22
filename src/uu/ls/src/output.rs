@@ -46,8 +46,9 @@
 //! Alternatively, use [`StreamingOutput`] when you want a reusable streaming sink
 //! that collects `EntryInfo` objects as they arrive.
 
-use crate::{Config, PathData, meta::LsFileType, meta::LsMeta};
+use crate::{Config, PathData};
 use std::ffi::OsString;
+use std::fs::{FileType, Metadata};
 use std::path::PathBuf;
 use uucore::error::UResult;
 
@@ -62,9 +63,9 @@ pub struct EntryInfo {
     /// The display name (file name portion, may differ from path for . and ..)
     pub display_name: OsString,
     /// The file type (file, directory, symlink, etc.)
-    pub file_type: Option<LsFileType>,
+    pub file_type: Option<FileType>,
     /// File metadata (size, permissions, timestamps, etc.)
-    pub metadata: Option<LsMeta>,
+    pub metadata: Option<Metadata>,
     /// Security context (SELinux) if available
     pub security_context: String,
     /// Whether this entry was specified on the command line
@@ -76,28 +77,22 @@ pub struct EntryInfo {
 impl EntryInfo {
     /// Returns true if this entry represents a directory
     pub fn is_dir(&self) -> bool {
-        self.file_type
-            .as_ref()
-            .is_some_and(|file_type| file_type.is_dir())
+        self.file_type.as_ref().is_some_and(FileType::is_dir)
     }
 
     /// Returns true if this entry represents a regular file
     pub fn is_file(&self) -> bool {
-        self.file_type
-            .as_ref()
-            .is_some_and(|file_type| file_type.is_file())
+        self.file_type.as_ref().is_some_and(FileType::is_file)
     }
 
     /// Returns true if this entry represents a symbolic link
     pub fn is_symlink(&self) -> bool {
-        self.file_type
-            .as_ref()
-            .is_some_and(|file_type| file_type.is_symlink())
+        self.file_type.as_ref().is_some_and(FileType::is_symlink)
     }
 
     /// Returns the file size in bytes, if metadata is available
     pub fn size(&self) -> Option<u64> {
-        self.metadata.as_ref().and_then(LsMeta::len)
+        self.metadata.as_ref().map(Metadata::len)
     }
 
     /// Returns the file name as a string slice, if valid UTF-8

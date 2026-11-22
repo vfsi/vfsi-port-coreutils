@@ -785,6 +785,21 @@ enum PathDataDisplayName<'a> {
     Custom(Cow<'a, OsStr>),
 }
 
+#[derive(Debug)]
+struct CachedFileType {
+    display: LsFileType,
+    native: Option<FileType>,
+}
+
+impl CachedFileType {
+    fn from_std(file_type: FileType) -> Self {
+        Self {
+            display: LsFileType::from_std(file_type),
+            native: Some(file_type),
+        }
+    }
+}
+
 /// Represents a Path along with it's associated data.
 /// Any data that will be reused several times makes sense to be added to this structure.
 /// Caching data here helps eliminate redundant syscalls to fetch same information.
@@ -796,7 +811,7 @@ enum PathDataDisplayName<'a> {
 pub struct PathData<'a> {
     // Result<MetaData> got from symlink_metadata() or metadata() based on config
     md: OnceCell<Option<LsMeta>>,
-    ft: OnceCell<Option<LsFileType>>,
+    ft: OnceCell<Option<CachedFileType>>,
     // can be used to avoid reading the filetype. Can be also called d_type:
     // https://www.gnu.org/software/libc/manual/html_node/Directory-Entries.html
     de: RefCell<Option<DirEntry>>,
@@ -813,11 +828,20 @@ pub struct PathData<'a> {
 impl<'a> PathData<'a> {
     /// Convert this [`PathData`] to an [`EntryInfo`] for programmatic access
     pub fn to_entry_info(&self, config: &Config) -> EntryInfo {
+        let native_file_type = self.cached_file_type().and_then(|kind| kind.native);
+        let metadata = match self.metadata() {
+            Some(LsMeta::Std(metadata)) => Some(metadata.clone()),
+            // Programmatic callers expect complete std metadata. The text
+            // formatter uses the cached VFSI fields through write_entries.
+            #[cfg(all(feature = "vnfs", target_os = "linux"))]
+            Some(LsMeta::Vf(_)) => self.read_native_metadata(),
+            None => None,
+        };
         EntryInfo {
             path: self.p_buf.clone().into_owned(),
             display_name: self.display_name().to_os_string(),
-            file_type: self.file_type().copied(),
-            metadata: self.metadata().cloned(),
+            file_type: native_file_type.or_else(|| metadata.as_ref().map(Metadata::file_type)),
+            metadata,
             security_context: self.security_context(config).to_string(),
             command_line: self.command_line,
             must_dereference: self.must_dereference,
@@ -872,17 +896,17 @@ impl<'a> PathData<'a> {
 
         // Why prefer to check the DirEntry file_type()?  B/c the call is
         // nearly free compared to a metadata() call on a Path
-        let ft: OnceCell<Option<LsFileType>> = OnceCell::new();
+        let ft: OnceCell<Option<CachedFileType>> = OnceCell::new();
         let security_context: OnceCell<Box<str>> = OnceCell::new();
 
         let de: RefCell<Option<DirEntry>> = if let Some(de) = dir_entry {
             if must_dereference && let Ok(md_pb) = p_buf.metadata() {
-                ft.get_or_init(|| Some(LsFileType::from_std(md_pb.file_type())));
+                ft.get_or_init(|| Some(CachedFileType::from_std(md_pb.file_type())));
                 md.get_or_init(|| Some(LsMeta::Std(md_pb)));
             }
 
             if let Ok(ft_de) = de.file_type() {
-                ft.get_or_init(|| Some(LsFileType::from_std(ft_de)));
+                ft.get_or_init(|| Some(CachedFileType::from_std(ft_de)));
             }
 
             RefCell::new(Some(de))
@@ -915,7 +939,10 @@ impl<'a> PathData<'a> {
         let security_context = OnceCell::new();
         if !must_dereference {
             let _ = md.set(Some(LsMeta::Vf(entry.attrs().clone())));
-            let _ = ft.set(Some(LsFileType::from_vf_type(ftype)));
+            let _ = ft.set(Some(CachedFileType {
+                display: LsFileType::from_vf_type(ftype),
+                native: None,
+            }));
         }
         Self {
             md,
@@ -930,53 +957,56 @@ impl<'a> PathData<'a> {
         }
     }
 
+    fn read_native_metadata(&self) -> Option<Metadata> {
+        // DirEntry's cached path metadata avoids a new lookup when possible.
+        let metadata = if self.must_dereference {
+            self.path().metadata()
+        } else if let Some(dir_entry) = RefCell::take(&self.de) {
+            dir_entry.metadata()
+        } else {
+            self.path().symlink_metadata()
+        };
+
+        match metadata {
+            Ok(metadata) => Some(metadata),
+            Err(err) => {
+                let _ = stdout().lock().flush();
+                // Match GNU's handling of dangling file descriptors.
+                if self.must_dereference
+                    && err.raw_os_error() == Some(9)
+                    && let Ok(file) = self.path().read_link()
+                {
+                    return file.symlink_metadata().ok();
+                }
+                show!(LsError::IOErrorContext(
+                    self.path().to_path_buf(),
+                    err,
+                    self.command_line
+                ));
+                None
+            }
+        }
+    }
+
     fn metadata(&self) -> Option<&LsMeta> {
         self.md
-            .get_or_init(|| {
-                // Prefer the metadata cached by `read_dir` when we don't have to
-                // dereference: it is cheaper than a fresh `stat()` call. Errors are
-                // reported below, just like for the non-cached path.
-                let md = if !self.must_dereference
-                    && let Some(dir_entry) = RefCell::take(&self.de)
-                {
-                    dir_entry.metadata().map(LsMeta::Std)
-                } else {
-                    get_metadata_with_deref_opt(self.path(), self.must_dereference)
-                };
+            .get_or_init(|| self.read_native_metadata().map(LsMeta::Std))
+            .as_ref()
+    }
 
-                match md {
-                    Err(err) => {
-                        // FIXME: A bit tricky to propagate the result here
-                        let mut out: std::io::StdoutLock<'static> = stdout().lock();
-                        let _ = out.flush();
-                        let errno = err.raw_os_error().unwrap_or(1i32);
-                        // a bad fd will throw an error when dereferenced,
-                        // but GNU will not throw an error until a bad fd "dir"
-                        // is entered, here we match that GNU behavior, by handing
-                        // back the non-dereferenced metadata upon an EBADF
-                        if self.must_dereference
-                            && errno == 9i32
-                            && let Ok(file) = self.path().read_link()
-                        {
-                            return file.symlink_metadata().ok().map(LsMeta::Std);
-                        }
-                        show!(LsError::IOErrorContext(
-                            self.path().to_path_buf(),
-                            err,
-                            self.command_line
-                        ));
-                        None
-                    }
-                    Ok(md) => Some(md),
-                }
+    fn cached_file_type(&self) -> Option<&CachedFileType> {
+        self.ft
+            .get_or_init(|| {
+                self.metadata().map(|metadata| CachedFileType {
+                    display: metadata.file_type(),
+                    native: metadata.as_std_metadata().map(Metadata::file_type),
+                })
             })
             .as_ref()
     }
 
     fn file_type(&self) -> Option<&LsFileType> {
-        self.ft
-            .get_or_init(|| self.metadata().map(LsMeta::file_type))
-            .as_ref()
+        self.cached_file_type().map(|kind| &kind.display)
     }
 
     fn is_dangling_link(&self) -> bool {
@@ -1849,7 +1879,11 @@ fn sort_entries(entries: &mut [PathData], config: &Config) {
             let kind = if entry.must_dereference {
                 entry.file_type()
             } else {
-                entry.ft.get().and_then(Option::as_ref)
+                entry
+                    .ft
+                    .get()
+                    .and_then(Option::as_ref)
+                    .map(|kind| &kind.display)
             };
             !match kind {
                 Some(kind) if entry.must_dereference || !kind.is_symlink() => kind.is_dir(),
@@ -2102,5 +2136,40 @@ mod shared_order_tests {
             entries.sort_by(entry_order(&config));
             assert_eq!(entries.map(|entry| entry.0), expected);
         }
+    }
+}
+
+#[cfg(all(test, feature = "vnfs", target_os = "linux"))]
+mod vfsi_output_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use vnfs::directory::{Attributes, ListDirOptions};
+    use vnfs::files::VfsiExt;
+
+    #[test]
+    fn streaming_output_preserves_standard_full_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, b"fixture").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let fs = vnfs::posix::Posix::new(root.path()).unwrap();
+        let attrs = fs
+            .read_dir_with_options("/", ListDirOptions::new().with_fields(Attributes::MODE))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(attrs.attrs().len(), None);
+        let matches = uu_app().get_matches_from(["ls"]);
+        let config = Config::from(&matches, None).unwrap();
+        let data = PathData::from_vf(path, "file".into(), attrs, &config);
+        let mut output = StreamingOutput::new();
+        write_directory_entries(&[data], &config, &mut output).unwrap();
+
+        let entry = &output.entries()[0];
+        let file_type: FileType = entry.file_type.unwrap();
+        let metadata: &Metadata = entry.metadata.as_ref().unwrap();
+        assert!(file_type.is_file());
+        assert_eq!(entry.size(), Some(7));
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
     }
 }
