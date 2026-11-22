@@ -1186,7 +1186,10 @@ mod tests {
             rlim_max: 24,
         };
         // Only this child process uses the reduced descriptor limit.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+            0
+        );
 
         let tree = tempdir().unwrap();
         let root = tree.path();

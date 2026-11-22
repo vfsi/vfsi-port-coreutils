@@ -67,76 +67,6 @@ fn is_socket(_: std::fs::FileType) -> bool {
 }
 
 #[cfg(unix)]
-fn std_nlink(metadata: &std::fs::Metadata) -> u64 {
-    metadata.nlink()
-}
-
-#[cfg(not(unix))]
-fn std_nlink(_: &std::fs::Metadata) -> u64 {
-    1
-}
-
-#[cfg(unix)]
-fn std_uid(metadata: &std::fs::Metadata) -> u32 {
-    metadata.uid()
-}
-
-#[cfg(not(unix))]
-fn std_uid(_: &std::fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(unix)]
-fn std_gid(metadata: &std::fs::Metadata) -> u32 {
-    metadata.gid()
-}
-
-#[cfg(not(unix))]
-fn std_gid(_: &std::fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(unix)]
-fn std_rdev(metadata: &std::fs::Metadata) -> u64 {
-    metadata.rdev()
-}
-
-#[cfg(not(unix))]
-fn std_rdev(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
-fn std_ino(metadata: &std::fs::Metadata) -> u64 {
-    metadata.ino()
-}
-
-#[cfg(not(unix))]
-fn std_ino(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
-fn std_blocks(metadata: &std::fs::Metadata) -> u64 {
-    metadata.blocks()
-}
-
-#[cfg(not(unix))]
-fn std_blocks(metadata: &std::fs::Metadata) -> u64 {
-    metadata.len().div_ceil(512)
-}
-
-#[cfg(unix)]
-fn std_mode(metadata: &std::fs::Metadata) -> u32 {
-    metadata.mode()
-}
-
-#[cfg(not(unix))]
-fn std_mode(_: &std::fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(unix)]
 #[allow(clippy::unnecessary_wraps)]
 fn std_ctime(metadata: &std::fs::Metadata) -> Option<SystemTime> {
     Some(LsMeta::secs_nsecs(
@@ -208,15 +138,19 @@ impl LsFileType {
     pub fn is_symlink(self) -> bool {
         matches!(self, Self::Symlink)
     }
+    #[cfg(unix)]
     pub fn is_block_device(self) -> bool {
         matches!(self, Self::BlockDevice)
     }
+    #[cfg(unix)]
     pub fn is_char_device(self) -> bool {
         matches!(self, Self::CharDevice)
     }
+    #[cfg(unix)]
     pub fn is_fifo(self) -> bool {
         matches!(self, Self::Fifo)
     }
+    #[cfg(unix)]
     pub fn is_socket(self) -> bool {
         matches!(self, Self::Socket)
     }
@@ -255,57 +189,64 @@ impl LsMeta {
         }
     }
 
+    #[cfg(unix)]
     pub fn nlink(&self) -> u64 {
         match self {
-            Self::Std(m) => std_nlink(m),
+            Self::Std(m) => m.nlink(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => v.nlink().map_or(1, u64::from),
         }
     }
 
+    #[cfg(unix)]
     pub fn uid(&self) -> u32 {
         match self {
-            Self::Std(m) => std_uid(m),
+            Self::Std(m) => m.uid(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => v.uid().unwrap_or(0),
         }
     }
 
+    #[cfg(unix)]
     pub fn gid(&self) -> u32 {
         match self {
-            Self::Std(m) => std_gid(m),
+            Self::Std(m) => m.gid(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => v.gid().unwrap_or(0),
         }
     }
 
+    #[cfg(all(unix, not(target_os = "illumos")))]
     pub fn rdev(&self) -> u64 {
         match self {
-            Self::Std(m) => std_rdev(m),
+            Self::Std(m) => m.rdev(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => v.device_id().unwrap_or(0),
         }
     }
 
+    #[cfg(unix)]
     pub fn ino(&self) -> u64 {
         match self {
-            Self::Std(m) => std_ino(m),
+            Self::Std(m) => m.ino(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => v.file_id().unwrap_or(0),
         }
     }
 
+    #[cfg(unix)]
     pub fn blocks(&self) -> u64 {
         match self {
-            Self::Std(m) => std_blocks(m),
+            Self::Std(m) => m.blocks(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => v.blocks().unwrap_or(0),
         }
     }
 
+    #[cfg(unix)]
     pub fn mode(&self) -> u32 {
         match self {
-            Self::Std(m) => std_mode(m),
+            Self::Std(m) => m.mode(),
             #[cfg(all(feature = "vnfs", target_os = "linux"))]
             Self::Vf(v) => v.mode().unwrap_or(0),
         }

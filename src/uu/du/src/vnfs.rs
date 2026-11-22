@@ -56,7 +56,7 @@ pub fn supports(options: &TraversalOptions, operands: usize) -> bool {
         && !options.one_file_system
         && (operands == 1 || options.count_links)
         && !options.all
-        && !(options.verbose && !options.excludes.is_empty())
+        && (!options.verbose || options.excludes.is_empty())
 }
 
 fn attr_mask(options: &TraversalOptions) -> Attributes {

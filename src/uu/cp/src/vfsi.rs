@@ -1030,7 +1030,7 @@ mod tests {
         let dest = root.path().join("dest");
         std::fs::write(&source, b"source data").unwrap();
         std::fs::write(&dest, b"keep destination").unwrap();
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o0)).unwrap();
         if File::open(&source).is_ok() {
             return; // A privileged test runner can read mode-000 files.
         }
@@ -1069,7 +1069,7 @@ mod tests {
             paths: PathMapper::new(root.path()).unwrap(),
         };
         assert!(stream_source_paths(&backend, &sources).is_some());
-        std::fs::set_permissions(&sources[1], std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&sources[1], std::fs::Permissions::from_mode(0o0)).unwrap();
         if File::open(&sources[1]).is_err() {
             assert!(stream_source_paths(&backend, &sources).is_none());
         }
