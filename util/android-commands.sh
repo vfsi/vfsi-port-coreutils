@@ -566,13 +566,34 @@ sync_host() {
 
     echo "Running sync host -> image: ${repo}"
 
-    # Keep the on-device checkout name stable even when the GitHub repository
-    # is named something other than upstream's `coreutils`.
-    run_command_via_ssh "rm -rf '$repo_dest'" || return
-    copy_file_or_dir_to_device_via_ssh "$repo" "$repo_dest" || return
-    if [[ -e "$cache_home" ]]; then
-        copy_file_or_dir_to_device_via_ssh "$cache_home" "$cache_dest" || return
+    # Transfer to a sibling directory so a failed copy leaves the active checkout usable.
+    local repo_stage="$dev_home_dir/.coreutils-sync-$$-$RANDOM"
+    run_command_via_ssh "mkdir -- '$repo_stage'" || return
+    if ! copy_file_or_dir_to_device_via_ssh "$repo" "$repo_stage/checkout" ||
+        { [[ -e "$cache_home" ]] && ! copy_file_or_dir_to_device_via_ssh "$cache_home" "$cache_dest"; }; then
+        run_command_via_ssh "rm -rf -- '$repo_stage'"
+        return 1
     fi
+
+    # Preserve an existing checkout, including any local edits.
+    run_command_via_ssh "
+        if [ -e '$repo_dest' ] || [ -L '$repo_dest' ]; then
+            mv -T -- '$repo_dest' '$repo_stage/previous' || exit 1
+        fi
+        if mv -T -- '$repo_stage/checkout' '$repo_dest'; then
+            if [ -e '$repo_stage/previous' ] || [ -L '$repo_stage/previous' ]; then
+                printf 'Previous checkout preserved at %s\n' '$repo_stage/previous'
+            else
+                rmdir -- '$repo_stage'
+            fi
+        else
+            if [ ! -e '$repo_dest' ] && [ ! -L '$repo_dest' ] &&
+                { [ -e '$repo_stage/previous' ] || [ -L '$repo_stage/previous' ]; }; then
+                mv -T -- '$repo_stage/previous' '$repo_dest'
+            fi
+            exit 1
+        fi
+    " || return
 
     echo "Finished sync host -> image: ${repo}"
 }

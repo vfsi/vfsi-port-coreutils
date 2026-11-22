@@ -449,14 +449,19 @@ impl ChownExecutor {
 
         let mut ancestors = HashSet::new();
         let mut ret = 0;
-        self.safe_traverse_dir(&dir_fd, root, &mut ret, &mut ancestors);
+        self.safe_traverse_dir::<{ cfg!(target_os = "android") }>(
+            dir_fd,
+            root,
+            &mut ret,
+            &mut ancestors,
+        );
         ret
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn safe_traverse_dir(
+    fn safe_traverse_dir<const RELEASE_PARENT: bool>(
         &self,
-        dir_fd: &DirFd,
+        dir_fd: DirFd,
         dir_path: &Path,
         ret: &mut i32,
         ancestors: &mut HashSet<FileInfo>,
@@ -481,11 +486,17 @@ impl ChownExecutor {
                         strip_errno(&e)
                     );
                 }
+                if let Some(info) = dir_info {
+                    ancestors.remove(&info);
+                }
                 return;
             }
         };
 
-        for entry_name in entries {
+        let mut active_dir = Some(dir_fd);
+        let mut entries = entries.into_iter().peekable();
+        while let Some(entry_name) = entries.next() {
+            let dir_fd = active_dir.as_ref().expect("current directory descriptor");
             let entry_path = dir_path.join(&entry_name);
 
             // Get metadata for the entry
@@ -528,7 +539,7 @@ impl ChownExecutor {
                 && is_root(&entry_path, self.traverse_symlinks == TraverseSymlinks::All)
             {
                 *ret = 1;
-                return;
+                break;
             }
 
             // Check if we should chown this entry
@@ -580,7 +591,40 @@ impl ChownExecutor {
             if meta.is_dir() && (follow || !meta.file_type().is_symlink()) {
                 match dir_fd.open_subdir(&entry_name, follow.into()) {
                     Ok(subdir_fd) => {
-                        self.safe_traverse_dir(&subdir_fd, &entry_path, ret, ancestors);
+                        if RELEASE_PARENT {
+                            // Android apps can have small descriptor limits.
+                            drop(active_dir.take());
+                        }
+                        self.safe_traverse_dir::<RELEASE_PARENT>(
+                            subdir_fd,
+                            &entry_path,
+                            ret,
+                            ancestors,
+                        );
+                        if RELEASE_PARENT && entries.peek().is_some() {
+                            let Some(reopened) = self.try_open_dir(dir_path) else {
+                                *ret = 1;
+                                break;
+                            };
+                            if !dir_info.is_some_and(|info| {
+                                reopened
+                                    .fstat()
+                                    .is_ok_and(|stat| FileInfo::from_stat(&stat) == info)
+                            }) {
+                                *ret = 1;
+                                if self.verbosity.level != VerbosityLevel::Silent {
+                                    show_error!(
+                                        "{}",
+                                        translate!(
+                                            "perms-cannot-access-replaced",
+                                            "file" => dir_path.quote()
+                                        )
+                                    );
+                                }
+                                break;
+                            }
+                            active_dir = Some(reopened);
+                        }
                     }
                     Err(e) => {
                         *ret = 1;
@@ -1111,6 +1155,67 @@ mod tests {
         unix::fs::symlink(&dir, temp_dir.path().join("link")).unwrap();
         let link_fd = DirFd::open(&temp_dir.path().join("link"), SymlinkBehavior::Follow).unwrap();
         assert!(fd_is(&link_fd, &meta).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_directory_walk_visits_deep_tree_and_siblings() {
+        const CHILD: &str = "UUTILS_TEST_BOUNDED_OWNERSHIP_WALK";
+        if std::env::var_os(CHILD).is_none() {
+            let (_, module) = module_path!().split_once("::").unwrap();
+            let test = format!("{module}::bounded_directory_walk_visits_deep_tree_and_siblings");
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let output = String::from_utf8_lossy(&result.stdout);
+            assert!(output.contains("deep-leaf"), "{output}");
+            assert!(output.contains("root-sibling"), "{output}");
+            return;
+        }
+
+        let limit = libc::rlimit {
+            rlim_cur: 24,
+            rlim_max: 24,
+        };
+        // Only this child process uses the reduced descriptor limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        let tree = tempdir().unwrap();
+        let root = tree.path();
+        std::fs::write(root.join("root-sibling"), b"").unwrap();
+        let deep = (0..40).fold(root.to_path_buf(), |path, _| path.join("d"));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep-leaf"), b"").unwrap();
+
+        let executor = ChownExecutor {
+            dest_uid: None,
+            dest_gid: None,
+            raw_owner: String::new(),
+            traverse_symlinks: TraverseSymlinks::All,
+            verbosity: Verbosity {
+                level: VerbosityLevel::Verbose,
+                groups_only: true,
+            },
+            filter: IfFrom::User(u32::MAX),
+            files: Vec::new(),
+            recursive: true,
+            preserve_root: false,
+            dereference: true,
+        };
+        let dir_fd = DirFd::open(root, SymlinkBehavior::Follow).unwrap();
+        let mut ret = 0;
+        let mut ancestors = HashSet::new();
+        executor.safe_traverse_dir::<true>(dir_fd, root, &mut ret, &mut ancestors);
+        assert_eq!(ret, 0);
+        assert!(ancestors.is_empty());
     }
 
     #[test]

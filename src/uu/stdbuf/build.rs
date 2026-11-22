@@ -123,33 +123,21 @@ fn main() {
         ]
     };
 
-    // Try to find the library in any of the possible locations
-    let mut found = false;
-    for source_path in &possible_paths {
-        if source_path.exists() {
-            fs::copy(source_path, &dest_path).expect("Failed to copy libstdbuf library");
-            found = true;
-            break;
-        }
-    }
+    let source = possible_paths
+        .iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!("Could not find built libstdbuf library. Searched in: {possible_paths:?}.")
+        });
+    fs::copy(source, &dest_path).expect("Failed to copy libstdbuf library");
 
-    assert!(
-        found,
-        "Could not find built libstdbuf library. Searched in: {possible_paths:?}."
-    );
-
-    // Allow running an external-libstdbuf build from the target directory.
-    // Leave any artifact Cargo already placed there intact.
+    // Publish a completed library even when Cargo has not built the normal
+    // dependency yet. Refresh older profile artifacts on a new fingerprint.
     #[cfg(all(unix, feature = "feat_external_libstdbuf"))]
     if let Some(target_dir) = profile_dir {
-        let lib_filename = format!("libstdbuf{dylib_ext}");
-        let source = Path::new("deps").join(&lib_filename);
-        let dest = target_dir.join(&lib_filename);
-        if target_dir.join(&source).is_file()
-            && let Err(error) = std::os::unix::fs::symlink(source, dest)
-            && error.kind() != std::io::ErrorKind::AlreadyExists
-        {
-            eprintln!("Warning: Failed to create symlink for libstdbuf: {error}");
-        }
+        let dest = target_dir.join(format!("libstdbuf{dylib_ext}"));
+        let staged = Path::new(&out_dir).join("libstdbuf-publish");
+        fs::copy(source, &staged).expect("Failed to stage libstdbuf library");
+        fs::rename(&staged, dest).expect("Failed to publish libstdbuf library");
     }
 }

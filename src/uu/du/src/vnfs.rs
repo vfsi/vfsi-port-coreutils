@@ -108,7 +108,7 @@ fn usage_from_attrs(
 
 #[derive(Default)]
 pub struct Context {
-    sessions: HashMap<(String, PathBuf, PathBuf), Session>,
+    session: Option<Session>,
 }
 
 fn file_info(attrs: &Metadata) -> Option<FsObjId> {
@@ -442,30 +442,21 @@ pub fn try_du(
     // Path inside the export namespace the backend resolves against.
     let vroot = Path::new("/").join(relative);
 
-    // Session reuse requires the same backend and mounted namespace.
-    let namespace = if std::env::var("VNFS_IMPL").as_deref() == Ok("dummy") {
-        "kernel".to_owned()
-    } else {
-        format!("nfs:{}", mount.host())
-    };
-    let key = (
-        namespace,
-        mount.export_root().to_path_buf(),
-        mount.mount_point().to_path_buf(),
-    );
+    // Retain only the last session, even for an arbitrarily long operand list.
     if context
-        .sessions
-        .get(&key)
+        .session
+        .as_ref()
         .is_none_or(|session| !session.matches(&mount))
     {
         let Ok(session) = Session::open(&mount) else {
             return Ok(None);
         };
-        context.sessions.insert(key.clone(), session);
+        context.session = Some(session);
     }
+    let session = context.session.as_ref().expect("VFSI session initialized");
     let mut output = Output::new(print_tx);
     let mut counted = HashSet::default();
-    let result = match &context.sessions[&key] {
+    let result = match session {
         Session::Dummy { fs, .. } => traverse(fs, path, &vroot, options, &mut output, &mut counted),
         Session::Nfs { session, .. } => traverse(
             session.fs(),
