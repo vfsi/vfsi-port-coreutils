@@ -372,9 +372,17 @@ fn test_subdir_permission_denied() {
     }
 }
 
-#[test]
+#[rstest::rstest]
+#[case::default(&[], false, false)]
+#[case::command_line(&["-H"], true, false)]
+#[case::never(&["-P"], false, false)]
+#[case::all(&["-L"], true, true)]
 #[cfg(not(target_vendor = "apple"))]
-fn test_traverse_symlinks() {
+fn test_traverse_symlinks(
+    #[case] args: &[&str],
+    #[case] traverse_first: bool,
+    #[case] traverse_second: bool,
+) {
     use std::os::unix::prelude::MetadataExt;
     let groups = getgroups().unwrap();
     if groups.len() < 2 {
@@ -382,65 +390,58 @@ fn test_traverse_symlinks() {
     }
     let (first_group, second_group) = (groups[0], groups[1]);
 
-    for (args, traverse_first, traverse_second) in [
-        (&[][..] as &[&str], false, false),
-        (&["-H"][..], true, false),
-        (&["-P"][..], false, false),
-        (&["-L"][..], true, true),
-    ] {
-        let scenario = TestScenario::new(util_name!());
+    let scenario = TestScenario::new(util_name!());
 
-        let (at, mut ucmd) = (scenario.fixtures.clone(), scenario.ucmd());
+    let (at, mut ucmd) = (scenario.fixtures.clone(), scenario.ucmd());
 
-        at.mkdir("dir");
-        at.mkdir("dir2");
-        at.touch("dir2/file");
-        at.mkdir("dir3");
-        at.touch("dir3/file");
-        at.symlink_dir("dir2", "dir/dir2_ln");
-        at.symlink_dir("dir3", "dir3_ln");
+    at.mkdir("dir");
+    at.mkdir("dir2");
+    at.touch("dir2/file");
+    at.mkdir("dir3");
+    at.touch("dir3/file");
+    at.relative_symlink_dir("../dir2", "dir/dir2_ln");
+    at.relative_symlink_dir("dir3", "dir3_ln");
 
-        scenario
-            .ccmd("chgrp")
-            .arg(first_group.to_string())
-            .arg("dir2/file")
-            .arg("dir3/file")
-            .succeeds();
+    scenario
+        .ccmd("chgrp")
+        .arg(first_group.to_string())
+        .arg("dir2/file")
+        .arg("dir3/file")
+        .succeeds();
 
-        assert_eq!(
-            at.plus("dir2/file").metadata().unwrap().gid(),
+    assert_eq!(
+        at.plus("dir2/file").metadata().unwrap().gid(),
+        first_group.as_raw()
+    );
+    assert_eq!(
+        at.plus("dir3/file").metadata().unwrap().gid(),
+        first_group.as_raw()
+    );
+
+    ucmd.arg("-R")
+        .args(args)
+        .arg(second_group.to_string())
+        .arg("dir")
+        .arg("dir3_ln")
+        .succeeds()
+        .no_stderr();
+
+    assert_eq!(
+        at.plus("dir2/file").metadata().unwrap().gid(),
+        if traverse_second {
+            second_group.as_raw()
+        } else {
             first_group.as_raw()
-        );
-        assert_eq!(
-            at.plus("dir3/file").metadata().unwrap().gid(),
+        }
+    );
+    assert_eq!(
+        at.plus("dir3/file").metadata().unwrap().gid(),
+        if traverse_first {
+            second_group.as_raw()
+        } else {
             first_group.as_raw()
-        );
-
-        ucmd.arg("-R")
-            .args(args)
-            .arg(second_group.to_string())
-            .arg("dir")
-            .arg("dir3_ln")
-            .succeeds()
-            .no_stderr();
-
-        assert_eq!(
-            at.plus("dir2/file").metadata().unwrap().gid(),
-            if traverse_second {
-                second_group.as_raw()
-            } else {
-                first_group.as_raw()
-            }
-        );
-        assert_eq!(
-            at.plus("dir3/file").metadata().unwrap().gid(),
-            if traverse_first {
-                second_group.as_raw()
-            } else {
-                first_group.as_raw()
-            }
-        );
-    }
+        }
+    );
 }
 
 #[test]
