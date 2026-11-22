@@ -23,7 +23,7 @@ libc = { workspace = true }
 uucore = { workspace = true, features = ["fs"] }
 
 [features]
-vnfs = ["uucore/vnfs"]
+vnfs = []
 
 [lints]
 workspace = true

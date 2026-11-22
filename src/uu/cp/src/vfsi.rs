@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -202,7 +202,7 @@ fn prepare_server_copy_batch(
         let Some(source_mount) = nfs_mount(source) else {
             return Ok(false);
         };
-        if !same_mount(&source_mount, &target_mount) {
+        if !same_mount(&source_mount, &target_mount) || !readable_regular_file(source) {
             return Ok(false);
         }
         let Some(name) = source.file_name() else {
@@ -411,6 +411,72 @@ fn prefetch_regular_files(
     Ok(selected.into_iter().zip(data).collect())
 }
 
+fn readable_regular_file(path: &Path) -> bool {
+    OpenOptions::new()
+        .read(true)
+        // A regular path can be replaced with a FIFO after the initial stat.
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|file| file.metadata())
+        .is_ok_and(|metadata| metadata.is_file())
+}
+
+struct DeferredOutput<'a> {
+    path: &'a Path,
+    file: Option<File>,
+    create_new: bool,
+    attempted: bool,
+}
+
+impl<'a> DeferredOutput<'a> {
+    fn new(path: &'a Path, create_new: bool) -> Self {
+        Self {
+            path,
+            file: None,
+            create_new,
+            attempted: false,
+        }
+    }
+
+    fn open(&mut self) -> io::Result<&mut File> {
+        self.attempted = true;
+        if self.file.is_none() {
+            let mut options = OpenOptions::new();
+            options.write(true).mode(0o600);
+            if self.create_new {
+                options.create_new(true);
+            } else {
+                options.create(true).truncate(true);
+            }
+            self.file = Some(options.open(self.path)?);
+        }
+        Ok(self.file.as_mut().expect("copy destination is open"))
+    }
+}
+
+impl Write for DeferredOutput<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.open()?.write(data)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.as_mut().map_or(Ok(()), Write::flush)
+    }
+}
+
+fn copy_to_destination(backend: &Backend, source: &Path, dest: &Path) -> io::Result<bool> {
+    let mut output = DeferredOutput::new(dest, false);
+    match backend.copy_to_writer(source, &mut output) {
+        Ok(_) => {
+            // A readable empty source still creates or truncates its destination.
+            output.open()?;
+            Ok(true)
+        }
+        Err(_) if !output.attempted => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Read a regular file through VFSI and write it through the kernel. Keeping
 /// the destination on one client avoids incoherent kernel/direct-NFS caches.
 /// Returns `None` when the normal kernel path should be used, otherwise the
@@ -434,10 +500,13 @@ pub fn try_copy(source: &Path, dest: &Path, source_size: u64) -> io::Result<Opti
         output.write_all(&contents)?;
         return Ok(Some("vfsi-client-read"));
     }
-    let server_copy = server_copy_enabled();
     if source_size > MAX_PREFETCH_FILE_BYTES as u64
-        && !server_copy
         && configured_batch_bytes().is_none()
+        && !CTX.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|context| context.prepared_copies.contains_key(source))
+        })
     {
         if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") && nfs_mount(source).is_some() {
             eprintln!("[profile] cp_vfsi_method=kernel_large");
@@ -447,7 +516,6 @@ pub fn try_copy(source: &Path, dest: &Path, source_size: u64) -> io::Result<Opti
     let Some(source_mount) = nfs_mount(source) else {
         return Ok(None);
     };
-    let dest_mount = nfs_mount(dest);
     let Some(source_mount) = mount_root(source_mount) else {
         return Ok(None);
     };
@@ -479,50 +547,14 @@ pub fn try_copy(source: &Path, dest: &Path, source_size: u64) -> io::Result<Opti
         let Ok(source_path) = ctx.backend.map(source, ResolvePath::Follow) else {
             return Ok(None);
         };
-        if server_copy
-            && dest_mount
-                .as_ref()
-                .is_some_and(|mount| same_mount(mount, &source_mount))
-            && dest.metadata().is_ok_and(|metadata| metadata.is_file())
-            && let Ok(dest_path) = ctx.backend.map(dest, ResolvePath::Follow)
-        {
-            // Truncate through the kernel first so the mount has no stale tail.
-            // Keep special files on the single-open kernel write path.
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(dest)?;
-            if let Some(Ok(mut outcomes)) = ctx
-                .backend
-                .try_server_copy(&[(source_path.clone(), dest_path)])
-            {
-                if outcomes.len() != 1 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid server-copy outcome count",
-                    ));
-                }
-                if server_copy_completed(outcomes.pop().unwrap())? {
-                    if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-                        eprintln!("[profile] cp_vfsi_method=server_copy");
-                    }
-                    return Ok(Some("vfsi-server-copy"));
-                }
+        if copy_to_destination(&ctx.backend, &source_path, dest)? {
+            if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+                eprintln!("[profile] cp_vfsi_method=client_read");
             }
+            Ok(Some("vfsi-client-read"))
+        } else {
+            Ok(None)
         }
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(dest)?;
-        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-            eprintln!("[profile] cp_vfsi_method=client_read");
-        }
-        ctx.backend.copy_to_writer(&source_path, &mut output)?;
-        Ok(Some("vfsi-client-read"))
     })
 }
 
@@ -546,8 +578,17 @@ pub fn try_round_robin(
     // Resolve that directory once instead of rediscovering it for every file.
     let mount = mount_root(nfs_mount(stream_parent(&sources[0]))?)?;
     let backend = Backend::open(&mount).ok()?;
-    let paths = backend.map_many(sources, ResolvePath::Follow).ok()?;
-    Some(copy_stream_entries(&backend, &paths, &entries, budget))
+    let paths = stream_source_paths(&backend, sources)?;
+    copy_stream_entries(&backend, &paths, &entries, budget)
+}
+
+fn stream_source_paths(backend: &Backend, sources: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    // Check the whole operand list before the first chunk can create outputs.
+    // A failed preflight leaves the native loop free to copy all readable files.
+    if !sources.iter().all(|source| readable_regular_file(source)) {
+        return None;
+    }
+    backend.map_many(sources, ResolvePath::Follow).ok()
 }
 
 fn plain_stream_options(options: &super::Options) -> bool {
@@ -625,36 +666,38 @@ fn copy_stream_entries(
     paths: &[PathBuf],
     entries: &[(PathBuf, std::fs::Permissions)],
     budget: std::num::NonZeroUsize,
-) -> io::Result<()> {
+) -> Option<io::Result<()>> {
     // Bound open destinations as well as read storage.
     let capacity = (budget.get() / (1024 * 1024)).clamp(1, 32);
     let options = vnfs::helpers::WriterCopyOptions::new().with_round_robin(budget);
-    for (paths, entries) in paths.chunks(capacity).zip(entries.chunks(capacity)) {
-        let mut outputs = Vec::with_capacity(entries.len());
-        for (dest, _) in entries {
-            // Atomic refusal of a destination created after preflight. Never
-            // truncate a competing file or follow a competing symlink.
-            outputs.push(
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(dest)?,
-            );
+    let mut attempted = false;
+    let result = (|| {
+        for (paths, entries) in paths.chunks(capacity).zip(entries.chunks(capacity)) {
+            let mut outputs: Vec<_> = entries
+                .iter()
+                .map(|(dest, _)| DeferredOutput::new(dest, true))
+                .collect();
+            let copied = backend.copy_to_writers(paths, &mut outputs, options);
+            attempted |= outputs.iter().any(|output| output.attempted);
+            copied?;
+            for (output, (_, permissions)) in outputs.iter_mut().zip(entries) {
+                // A successful empty source still needs a destination. Use the
+                // owned descriptor for cp's best-effort chmod.
+                attempted = true;
+                output.open()?.set_permissions(permissions.clone()).ok();
+            }
+            if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
+                eprintln!(
+                    "[profile] cp_vfsi_method=round_robin cp_stream_files={} cp_stream_bytes={budget}",
+                    paths.len()
+                );
+            }
         }
-        backend.copy_to_writers(paths, &mut outputs, options)?;
-        for (output, (_, permissions)) in outputs.iter().zip(entries) {
-            // Match cp's best-effort chmod, through the owned descriptor.
-            output.set_permissions(permissions.clone()).ok();
-        }
-        if std::env::var("VNFS_PROFILE").as_deref() == Ok("1") {
-            eprintln!(
-                "[profile] cp_vfsi_method=round_robin cp_stream_files={} cp_stream_bytes={budget}",
-                paths.len()
-            );
-        }
-    }
-    Ok(())
+        Ok(())
+    })();
+    // A source failure before any destination open can use the ordinary
+    // operand loop, including processing earlier readable and later operands.
+    (attempted || result.is_ok()).then_some(result)
 }
 
 #[cfg(test)]
@@ -871,11 +914,11 @@ mod tests {
         let dest = tempfile::tempdir().unwrap();
         let one = root.path().join("one");
         let two = root.path().join("two");
-        std::fs::File::create(&one)
+        File::create(&one)
             .unwrap()
             .set_len(65 * 1024 * 1024)
             .unwrap();
-        std::fs::File::create(&two)
+        File::create(&two)
             .unwrap()
             .set_len(65 * 1024 * 1024)
             .unwrap();
@@ -900,7 +943,7 @@ mod tests {
         std::fs::write(&two, b"small").unwrap();
         assert!(stream_entries(&sources, dest.path(), &stream_options()).is_none());
         let other = dest.path().join("another");
-        std::fs::File::create(&other)
+        File::create(&other)
             .unwrap()
             .set_len(65 * 1024 * 1024)
             .unwrap();
@@ -935,6 +978,7 @@ mod tests {
             &entries,
             std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
         )
+        .unwrap()
         .unwrap();
         assert_eq!(std::fs::read(&entries[0].0).unwrap(), b"first");
         assert_eq!(std::fs::read(&entries[1].0).unwrap(), b"second");
@@ -953,6 +997,7 @@ mod tests {
                 &entries,
                 std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap()
             )
+            .unwrap()
             .is_err()
         );
         assert_eq!(std::fs::read(&entries[0].0).unwrap(), b"first");
@@ -965,13 +1010,85 @@ mod tests {
                 &entries,
                 std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap()
             )
+            .unwrap()
             .is_err()
         );
         assert_eq!(std::fs::read(&entries[1].0).unwrap(), b"second");
     }
 
     #[test]
-    fn streaming_source_failure_is_returned_without_scalar_replay() {
+    fn unreadable_source_preserves_existing_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::write(&source, b"source data").unwrap();
+        std::fs::write(&dest, b"keep destination").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0)).unwrap();
+        if File::open(&source).is_ok() {
+            return; // A privileged test runner can read mode-000 files.
+        }
+        let backend = Backend::Dummy {
+            fs: Posix::new(root.path()).unwrap(),
+            paths: PathMapper::new(root.path()).unwrap(),
+        };
+        assert!(!copy_to_destination(&backend, Path::new("/source"), &dest).unwrap());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep destination");
+
+        let fresh = root.path().join("new");
+        let entries = [(fresh.clone(), std::fs::Permissions::from_mode(0o644))];
+        assert!(
+            copy_stream_entries(
+                &backend,
+                &[PathBuf::from("/source")],
+                &entries,
+                std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
+            )
+            .is_none()
+        );
+        assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn round_robin_preflight_declines_late_unreadable_input() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let sources = ["first", "unreadable", "last"].map(|name| root.path().join(name));
+        for source in &sources {
+            std::fs::write(source, b"source").unwrap();
+        }
+        let backend = Backend::Dummy {
+            fs: Posix::new(root.path()).unwrap(),
+            paths: PathMapper::new(root.path()).unwrap(),
+        };
+        assert!(stream_source_paths(&backend, &sources).is_some());
+        std::fs::set_permissions(&sources[1], std::fs::Permissions::from_mode(0)).unwrap();
+        if File::open(&sources[1]).is_err() {
+            assert!(stream_source_paths(&backend, &sources).is_none());
+        }
+        std::fs::remove_file(&sources[1]).unwrap();
+        nix::unistd::mkfifo(&sources[1], nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert!(stream_source_paths(&backend, &sources).is_none());
+    }
+
+    #[test]
+    fn readable_empty_source_truncates_destination() {
+        let root = tempfile::tempdir().unwrap();
+        File::create(root.path().join("source")).unwrap();
+        let dest = root.path().join("dest");
+        std::fs::write(&dest, b"old destination").unwrap();
+        let backend = Backend::Dummy {
+            fs: Posix::new(root.path()).unwrap(),
+            paths: PathMapper::new(root.path()).unwrap(),
+        };
+        assert!(copy_to_destination(&backend, Path::new("/source"), &dest).unwrap());
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn streaming_source_failure_before_output_allows_native_fallback() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
@@ -983,23 +1100,16 @@ mod tests {
             dest.path().join("missing"),
             std::fs::Permissions::from_mode(0o644),
         )];
-        let error = copy_stream_entries(
-            &backend,
-            &[PathBuf::from("/missing")],
-            &entries,
-            std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert_eq!(std::fs::read(&entries[0].0).unwrap(), b"");
-        assert_eq!(
-            std::fs::metadata(&entries[0].0)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
+        assert!(
+            copy_stream_entries(
+                &backend,
+                &[PathBuf::from("/missing")],
+                &entries,
+                std::num::NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
+            )
+            .is_none()
         );
+        assert!(!entries[0].0.exists());
     }
 
     #[test]

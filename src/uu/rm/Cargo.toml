@@ -39,7 +39,7 @@ path = "src/main.rs"
 required-features = ["uucore/default"]
 
 [features]
-vnfs = ["uucore/vnfs"]
+vnfs = []
 
 [lints]
 workspace = true

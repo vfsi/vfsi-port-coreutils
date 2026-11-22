@@ -60,10 +60,11 @@ their smaller sources. Setting `VNFS_CP_BATCH_BYTES` explicitly selects the
 aggregate-only policy. A zero budget disables prefetch. Sparse sources under
 `--sparse=auto` use the kernel copy path to preserve holes.
 
-Direct server-side COPY is experimental and disabled by default. Enabling
-`VNFS_CP_SERVER_COPY=1` mixes kernel and direct-client access and requires the
-caller to account for cache coherence. This port does not provide filesystem
-identity or a new coherence guarantee.
+Direct server-side COPY is experimental and disabled by default.
+`VNFS_CP_SERVER_COPY=1` enables staging for independent batches with fresh
+destinations. Existing destinations are written through the kernel client.
+Staged COPY still mixes kernel and direct-client access, so callers must
+account for cache coherence.
 
 For large, independent sources, experimental round-robin client reads can be
 selected with `VNFS_CP_STREAM_BYTES=2097152` and `cp --reflink=never`.
